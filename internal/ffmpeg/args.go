@@ -25,6 +25,10 @@ type Spec struct {
 	HasVideo      bool
 	HasAudio      bool
 	VAAPIDevice   string
+	// MaxOutputBytes, when > 0, is passed as -fs so FFmpeg itself stops writing at the cap.
+	// A run that stops at the cap yields a truncated file; callers must treat
+	// size >= MaxOutputBytes as over-limit.
+	MaxOutputBytes int64
 }
 
 var x26xPresets = []string{"veryslow", "slower", "slow", "medium", "medium", "fast", "fast", "faster", "veryfast", "superfast", "ultrafast"}
@@ -81,6 +85,9 @@ func BuildArgs(s Spec) ([]string, error) {
 	}
 	if s.HasAudio {
 		a = append(a, audioArgs(s.Cand.Audio, s.Opts)...)
+	}
+	if s.MaxOutputBytes > 0 {
+		a = append(a, "-fs", strconv.FormatInt(s.MaxOutputBytes, 10))
 	}
 	a = append(a, "-f", s.Preset.Container, "-progress", "pipe:1", "-nostats", s.Output)
 	return a, nil

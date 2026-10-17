@@ -42,7 +42,11 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	outDir := filepath.Join(cfg.DataDir, "out")
+	dataDir, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	outDir := filepath.Join(dataDir, "out")
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return err
 	}
@@ -51,6 +55,9 @@ func run() error {
 		return err
 	}
 	defer os.RemoveAll(scratch)
+	if scratch, err = filepath.Abs(scratch); err != nil {
+		return err
+	}
 	host, _ := os.Hostname()
 	w := &worker.Worker{
 		ID: fmt.Sprintf("%s-%s", host, uuid.NewString()[:8]), Store: jobs.NewStore(pool), Audit: audit.New(os.Stdout),

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -317,5 +318,159 @@ func TestWatchStopsWhenLeaseLost(t *testing.T) {
 	}
 	if canceled.Load() || cctx.Err() == nil {
 		t.Fatal("lease loss must cancel the context without marking user cancel")
+	}
+}
+
+// longClip makes a clip that takes a while to encode with video-vp9.
+func longClip(t *testing.T, secs int) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "long.mkv")
+	if b, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+		"testsrc=duration="+strconv.Itoa(secs)+":size=1280x720:rate=25", "-c:v", "mpeg4", p).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, b)
+	}
+	return p
+}
+
+func (e env) waitStatus(t *testing.T, id string, st jobs.Status) {
+	t.Helper()
+	for i := 0; i < 1000; i++ {
+		if j, err := e.store.Get(context.Background(), id); err == nil && j.Status == st {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("job never reached %s", st)
+}
+
+func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+func TestProcessOneUserCancelRemovesInputAndOutput(t *testing.T) {
+	e := setup(t, defaultLimits)
+	id := e.enqueue(t, longClip(t, 60), "video-vp9")
+	ctx := context.Background()
+	go func() {
+		e.waitStatus(t, id, jobs.StatusRunning)
+		_ = e.store.RequestCancel(ctx, id)
+	}()
+	if ok, err := e.w.ProcessOne(ctx); !ok || err != nil {
+		t.Fatalf("%v %v", ok, err)
+	}
+	j, _ := e.store.Get(ctx, id)
+	if j.Status != jobs.StatusCanceled {
+		t.Fatalf("want canceled, got %+v", j)
+	}
+	if exists(j.InputPath) || len(e.outFiles(t)) != 0 {
+		t.Fatalf("input/output must be removed; out=%v", e.outFiles(t))
+	}
+}
+
+func TestProcessOneShutdownLeavesJobAndInput(t *testing.T) {
+	e := setup(t, defaultLimits)
+	id := e.enqueue(t, longClip(t, 60), "video-vp9")
+	ctx, stop := context.WithCancel(context.Background())
+	go func() {
+		e.waitStatus(t, id, jobs.StatusRunning)
+		time.Sleep(300 * time.Millisecond)
+		stop()
+	}()
+	if _, err := e.w.ProcessOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusRunning || j.Error != "" {
+		t.Fatalf("job must be left in place, got %+v", j)
+	}
+	if !exists(j.InputPath) {
+		t.Fatal("input must be kept for requeue")
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("partial output must be removed")
+	}
+}
+
+func TestProcessOneOutputCapKillsMidRun(t *testing.T) {
+	e := setup(t, defaultLimits)
+	e.w.MaxOutputBytes = 20000
+	id := e.enqueue(t, longClip(t, 120), "video-vp9")
+	start := time.Now()
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || j.Error != "output exceeds size limit" {
+		t.Fatalf("bad job %+v", j)
+	}
+	if time.Since(start) > 30*time.Second {
+		t.Fatal("run was not cut short")
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("oversize output must be removed")
+	}
+}
+
+// blockTerminal installs a trigger that intercepts writes setting the job to done.
+func (e env) blockTerminal(t *testing.T, action string) {
+	t.Helper()
+	ctx := context.Background()
+	body := "RETURN NULL;"
+	if action == "error" {
+		body = "RAISE EXCEPTION 'boom';"
+	}
+	for _, q := range []string{
+		`CREATE FUNCTION cf_block() RETURNS trigger AS $$ BEGIN IF NEW.status = 'done' THEN ` + body + ` END IF; RETURN NEW; END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER cf_block BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION cf_block()`,
+	} {
+		if _, err := e.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestTerminalWriteLeaseLostKeepsInput(t *testing.T) {
+	e := setup(t, defaultLimits)
+	e.blockTerminal(t, "skip") // Complete matches no row => ErrNotFound
+	id := e.enqueue(t, testutil.MakeClip(t, t.TempDir(), "a.wav", "audio"), "audio-wav")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusRunning {
+		t.Fatalf("status should be untouched, got %+v", j)
+	}
+	if !exists(j.InputPath) {
+		t.Fatal("input must be kept when the terminal write is rejected")
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("own output must be removed")
+	}
+}
+
+func TestTerminalWriteErrorKeepsInput(t *testing.T) {
+	e := setup(t, defaultLimits)
+	e.blockTerminal(t, "error")
+	id := e.enqueue(t, testutil.MakeClip(t, t.TempDir(), "a.wav", "audio"), "audio-wav")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusRunning || !exists(j.InputPath) || len(e.outFiles(t)) != 0 {
+		t.Fatalf("input kept, output removed expected: %+v out=%v", j, e.outFiles(t))
+	}
+}
+
+func TestPerAttemptOutputNamesDiffer(t *testing.T) {
+	e := setup(t, defaultLimits)
+	ctx := context.Background()
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-wav")
+	_, _ = e.w.ProcessOne(ctx)
+	j1, _ := e.store.Get(ctx, id)
+	b, _ := os.ReadFile(src)
+	_ = os.WriteFile(j1.InputPath, b, 0o600)
+	if _, err := e.pool.Exec(ctx, `UPDATE jobs SET status='queued', worker_id='', finished_at=NULL WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = e.w.ProcessOne(ctx)
+	j2, _ := e.store.Get(ctx, id)
+	if j1.Status != jobs.StatusDone || j2.Status != jobs.StatusDone || j1.OutputPath == j2.OutputPath {
+		t.Fatalf("outputs must differ: %q vs %q", j1.OutputPath, j2.OutputPath)
+	}
+	if !exists(j1.OutputPath) || !exists(j2.OutputPath) {
+		t.Fatal("both attempts' outputs should exist (cleanup is the janitor's job)")
 	}
 }

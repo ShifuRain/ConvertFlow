@@ -217,3 +217,19 @@ func TestBuildArgsVideoPresetNeedsVideoEncoder(t *testing.T) {
 		t.Error("video preset without a video encoder must be rejected")
 	}
 }
+
+func TestBuildArgsFileSizeCap(t *testing.T) {
+	s := spec(t, "audio-flac", presets.Candidate{Audio: "flac"}, jobs.Options{}, false, true)
+	if a := build(t, s); slices.Contains(a, "-fs") {
+		t.Errorf("no cap configured, -fs must be absent: %v", a)
+	}
+	s.MaxOutputBytes = 12345
+	a := build(t, s)
+	if !hasSeq(a, "-fs", "12345") {
+		t.Fatalf("missing -fs: %v", a)
+	}
+	// -fs is an output option: it must come after -i and before the output path.
+	if slices.Index(a, "-fs") < slices.Index(a, "-i") || slices.Index(a, "-fs") > len(a)-2 {
+		t.Errorf("-fs misplaced: %v", a)
+	}
+}

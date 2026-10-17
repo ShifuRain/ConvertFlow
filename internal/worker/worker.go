@@ -141,35 +141,70 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 	cancel()
 	<-watchDone
 
-	if outPath != "" && (err != nil || st.lost.Load() || st.canceled.Load() || ctx.Err() != nil) {
-		_ = os.Remove(outPath)
-	}
 	if ctx.Err() != nil { // worker shutting down: leave the job (and its input) for requeue
+		removeIf(outPath)
 		return
 	}
 	if st.lost.Load() { // requeued, canceled or deleted behind our back: abort quietly
+		removeIf(outPath)
 		w.Audit.System("job_lease_lost", j.ID, "worker", w.ID)
 		return
 	}
 	bg, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer bgCancel()
-	_ = os.Remove(j.InputPath)
+
+	// The input is deleted only after the fenced terminal write succeeds; if that write
+	// fails (lease lost or store error) the input is kept, because the job may be requeued,
+	// and only this attempt's own output is removed.
+	var werr error
 	switch {
 	case st.canceled.Load():
-		if e := w.Store.MarkCanceled(bg, j.ID); e == nil {
+		removeIf(outPath)
+		werr = w.Store.MarkCanceled(bg, j.ID)
+		w.logStoreErr("mark_canceled", j.ID, werr)
+		if werr == nil {
 			w.Audit.System("job_canceled", j.ID, "worker", w.ID)
 		}
 	case err != nil:
+		removeIf(outPath)
 		msg := ffmpeg.Sanitize(err.Error(), filepath.Dir(j.InputPath), w.OutDir, w.ScratchDir)
-		if e := w.Store.Fail(bg, j.ID, msg); e == nil {
+		werr = w.Store.Fail(bg, j.ID, msg)
+		w.logStoreErr("fail", j.ID, werr)
+		if werr == nil {
 			w.Audit.System("job_failed", j.ID, "worker", w.ID, "error", msg)
 		}
 	default:
-		if e := w.Store.Complete(bg, j.ID, outPath); e != nil {
-			_ = os.Remove(outPath) // job vanished or was requeued: do not leave an orphan
-			return
+		werr = w.Store.Complete(bg, j.ID, outPath)
+		w.logStoreErr("complete", j.ID, werr)
+		if werr == nil {
+			w.Audit.System("job_finished", j.ID, "worker", w.ID, "encoder", j.EncoderUsed)
+		} else {
+			removeIf(outPath)
 		}
-		w.Audit.System("job_finished", j.ID, "worker", w.ID, "encoder", j.EncoderUsed)
+	}
+	if werr == nil {
+		_ = os.Remove(j.InputPath)
+	}
+}
+
+func maxOutBytes(v int64) int64 {
+	if v <= 0 {
+		return defaultMaxOutputBytes
+	}
+	return v
+}
+
+func removeIf(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+// logStoreErr logs unexpected store failures (job id and error only, no job paths).
+// ErrNotFound means the lease was lost and is handled quietly by the callers.
+func (w *Worker) logStoreErr(op, id string, err error) {
+	if err != nil && !errors.Is(err, jobs.ErrNotFound) {
+		slog.Error("store write failed", "op", op, "job_id", id, "worker", w.ID, "err", err)
 	}
 }
 
@@ -217,9 +252,12 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	if err := pr.Validate(w.Limits); err != nil {
 		return "", err
 	}
-	if err := w.Store.SetProbe(ctx, j.ID, raw); errors.Is(err, jobs.ErrNotFound) {
-		st.lost.Store(true)
-		return "", errLeaseLost
+	if err := w.Store.SetProbe(ctx, j.ID, raw); err != nil {
+		if errors.Is(err, jobs.ErrNotFound) {
+			st.lost.Store(true)
+			return "", errLeaseLost
+		}
+		w.logStoreErr("set_probe", j.ID, err)
 	}
 
 	preset, ok := presets.Get(j.Options.Preset)
@@ -245,14 +283,17 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 			st.lost.Store(true)
 			return "", errLeaseLost
 		}
+		w.logStoreErr("set_running", j.ID, err)
 		return "", errInternal
 	}
 	j.EncoderUsed = encoder
 
-	outPath := filepath.Join(w.OutDir, j.ID+"."+preset.Ext)
+	// Per-attempt name: a stale worker's cleanup can never touch a later attempt's output.
+	outPath := filepath.Join(w.OutDir, fmt.Sprintf("%s.%d.%s", j.ID, j.Attempts, preset.Ext))
 	args, err := ffmpeg.BuildArgs(ffmpeg.Spec{
 		Input: j.InputPath, Output: outPath, Preset: preset, Cand: cand, Opts: j.Options,
 		HasVideo: pr.HasVideo(), HasAudio: pr.HasAudio(), VAAPIDevice: w.VAAPIDevice,
+		MaxOutputBytes: maxOutBytes(w.MaxOutputBytes),
 	})
 	if err != nil {
 		return "", err
@@ -262,16 +303,13 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	if timeout <= 0 {
 		timeout = defaultJobTimeout
 	}
-	maxOut := w.MaxOutputBytes
-	if maxOut <= 0 {
-		maxOut = defaultMaxOutputBytes
-	}
+	maxOut := maxOutBytes(w.MaxOutputBytes)
 	runCtx, runCancel := context.WithTimeout(ctx, timeout)
 	defer runCancel()
 
 	var oversize atomic.Bool
 	checkSize := func() {
-		if fi, err := os.Stat(outPath); err == nil && fi.Size() > maxOut {
+		if fi, err := os.Stat(outPath); err == nil && fi.Size() >= maxOut {
 			oversize.Store(true)
 			runCancel()
 		}
@@ -303,9 +341,12 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	tail, err := ffmpeg.Run(runCtx, w.FFmpegBin, args, w.ScratchDir, dur, func(p float64) {
 		if time.Since(last) >= time.Second {
 			last = time.Now()
-			if e := w.Store.UpdateProgress(ctx, j.ID, p); errors.Is(e, jobs.ErrNotFound) {
+			e := w.Store.UpdateProgress(ctx, j.ID, p)
+			if errors.Is(e, jobs.ErrNotFound) {
 				st.lost.Store(true)
 				cancel()
+			} else if ctx.Err() == nil {
+				w.logStoreErr("update_progress", j.ID, e)
 			}
 		}
 	})
@@ -323,7 +364,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 		return outPath, ctx.Err()
 	case oversize.Load():
 		return outPath, errOversize
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+	case err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return outPath, errTimeout
 	case err != nil:
 		return outPath, fmt.Errorf("transcode failed: %s", ffmpeg.Sanitize(tail, filepath.Dir(j.InputPath), w.OutDir, w.ScratchDir))
