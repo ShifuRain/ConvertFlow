@@ -64,6 +64,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "403": {
+            "$ref": "#/components/responses/CrossOrigin"
+          },
           "413": {
             "$ref": "#/components/responses/TooLarge"
           },
@@ -142,9 +145,6 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": "Deleted"
-          },
           "202": {
             "description": "Cancellation requested",
             "content": {
@@ -170,6 +170,12 @@
                 }
               }
             }
+          },
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "$ref": "#/components/responses/CrossOrigin"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -516,6 +522,16 @@
       },
       "InsufficientStorage": {
         "description": "The server does not have enough free storage for the upload",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "CrossOrigin": {
+        "description": "Refused: a browser marked the request as cross-origin (Sec-Fetch-Site other than same-origin/none, or an Origin that differs from the Host). Requests without these headers (curl, scripts) are not affected.",
         "content": {
           "application/problem+json": {
             "schema": {

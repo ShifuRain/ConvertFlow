@@ -3,6 +3,7 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -19,6 +20,7 @@ func securityHeaders(hsts bool, next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		if hsts {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
@@ -57,4 +59,49 @@ func recoverer(next http.Handler) http.Handler {
 func validID(id string) bool {
 	u, err := uuid.Parse(id)
 	return err == nil && u.String() == id
+}
+
+// crossOriginAllowed decides whether a state-changing request may proceed. Browsers always send
+// Sec-Fetch-Site (and Origin on cross-origin POST/DELETE); clients that send neither (curl,
+// scripts, automation) are not subject to cross-origin attacks and stay allowed. The Host header
+// is compared, never X-Forwarded-Host (which an attacker page cannot set but a proxy chain might
+// have left attacker-influenced).
+func crossOriginAllowed(r *http.Request) bool {
+	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" {
+		return sfs == "same-origin" || sfs == "none"
+	}
+	vals := r.Header.Values("Origin")
+	if len(vals) == 0 {
+		return true
+	}
+	if len(vals) > 1 {
+		return false
+	}
+	u, err := url.Parse(vals[0])
+	if err != nil || u.Host == "" || r.Host == "" {
+		return false // includes the opaque origin "null"
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func isStateChanging(m string) bool {
+	switch m {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// crossOriginGuard rejects state-changing /api/ requests that a browser marks as cross-origin,
+// before the handler (and so any body read, file write or database access) runs.
+func (s *Server) crossOriginGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isStateChanging(r.Method) && strings.HasPrefix(r.URL.Path, "/api") && !crossOriginAllowed(r) {
+			s.audit.Event(r, "request_rejected", "", "status", http.StatusForbidden, "reason", "cross_origin")
+			w.Header().Set("Connection", "close")
+			WriteProblem(w, http.StatusForbidden, "Forbidden", "Cross-origin requests are not allowed.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

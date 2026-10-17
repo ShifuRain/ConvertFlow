@@ -452,7 +452,7 @@ func TestOpenAPIDocumentsUploadErrors(t *testing.T) {
 		have = append(have, c)
 	}
 	sort.Strings(have)
-	for _, c := range []string{"202", "400", "413", "422", "500", "503", "507"} {
+	for _, c := range []string{"202", "400", "403", "413", "422", "500", "503", "507"} {
 		if !contains(have, c) {
 			t.Errorf("POST /api/v1/jobs missing %s in %v", c, have)
 		}

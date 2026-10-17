@@ -79,7 +79,7 @@ func NewHandler(d Deps) http.Handler {
 	if s.sseMaxLife <= 0 {
 		s.sseMaxLife = defaultSSEMaxLifetime
 	}
-	return recoverer(securityHeaders(d.Cfg.TLSCertFile != "", noStoreAPI(s.rootMux())))
+	return recoverer(securityHeaders(d.Cfg.TLSCertFile != "", noStoreAPI(s.crossOriginGuard(s.rootMux()))))
 }
 
 type route struct {
