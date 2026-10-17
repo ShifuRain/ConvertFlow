@@ -115,6 +115,7 @@ for svc in db api worker; do
   check "$svc has an empty effective capability set (CapEff=0)" "[ \"\$(status $pid CapEff)\" = 0000000000000000 ]"
   check "$svc has an empty bounding set (CapBnd=0)" "[ \"\$(status $pid CapBnd)\" = 0000000000000000 ]"
   check "$svc has core dumps disabled (RLIMIT_CORE 0/0)" "grep -E '^Max core file size' /proc/$pid/limits | awk '{print \$5,\$6}' | grep -qx '0 0'"
+  echo "info: $svc $(grep -E '^Max core file size' /proc/$pid/limits | tr -s ' ') ; HostConfig.Ulimits=$($RT inspect "$id" --format '{{json .HostConfig.Ulimits}}')"
   check "$svc runs with NoNewPrivs=1" "[ \"\$(status $pid NoNewPrivs)\" = 1 ]"
   check "$svc runs under a seccomp filter (Seccomp=2)" "[ \"\$(status $pid Seccomp)\" = 2 ]"
   # /proc/<pid>/status on the host shows the subuid-mapped id under rootless podman, so ask the runtime
@@ -163,13 +164,15 @@ wid=$(cid worker)
 if [ -n "$wid" ]; then
   check "worker: has no outbound connectivity (internal network)" \
     "! $RT exec $wid bash -c 'timeout 4 bash -c \"</dev/tcp/1.1.1.1/53\"' 2>/dev/null"
+  echo "info: worker resolv.conf: $($RT exec $wid cat /etc/resolv.conf | tr '\n' ';')"
+  echo "info: worker getent: $($RT exec $wid bash -c 'timeout 4 getent hosts example.com; echo rc=$?' 2>&1 | tr '\n' ';')"
   check "worker: cannot resolve external names" "! $RT exec $wid bash -c 'timeout 4 getent hosts example.com' >/dev/null 2>&1"
   check "worker: scratch space is tmpfs" "$RT exec $wid sh -c 'grep -E \" /tmp tmpfs \" /proc/mounts' >/dev/null"
 fi
 aid=$(cid api)
 if [ -n "$aid" ]; then
   check "api: published port bound to 127.0.0.1 only" \
-    "[ \"\$($RT inspect $aid --format '{{range \$p,\$b := .NetworkSettings.Ports}}{{range \$b}}{{.HostIp}} {{end}}{{end}}')\" = '127.0.0.1 ' ]"
+    "[ \"\$($RT inspect $aid --format '{{json .NetworkSettings.Ports}}' | jq -r '[.[]? // empty | .[]? | (.HostIp // .HostIP // \"?\")] | join(\" \")')\" = 127.0.0.1 ]"
   check "api: image has no shell" "! $RT exec $aid /bin/sh -c true >/dev/null 2>&1"
 fi
 bn=$($RT network ls --format '{{.Name}}' | grep -E "^${PROJECT}_backend$" | head -n1 || true)
