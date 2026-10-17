@@ -364,7 +364,7 @@ func TestHealthzAndMetrics(t *testing.T) {
 func TestHealthzUnhealthyWhenDBDown(t *testing.T) {
 	pool := dbtest.New(t)
 	store := jobs.NewStore(pool)
-	h := api.NewHandler(api.Deps{Store: store, Cfg: config.Config{DataDir: t.TempDir()}, Audit: audit.New(io.Discard)})
+	h := api.NewHandler(api.Deps{Store: store, Cfg: config.Config{AllowedHosts: []string{"*"}, DataDir: t.TempDir()}, Audit: audit.New(io.Discard)})
 	pool.Close()
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/healthz", nil))

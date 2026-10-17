@@ -122,6 +122,7 @@ Errors are `application/problem+json`:
 | Status | Meaning on `POST /api/v1/jobs` |
 |---|---|
 | `400` | not multipart, wrong field order, duplicate/unknown field, empty file, interrupted upload |
+| `421` | the `Host` header is not `localhost`, an IP literal or listed in `CONVERTFLOW_ALLOWED_HOSTS` (DNS rebinding defense; applies to every route). Reaching the API by DNS name or through a proxy requires that variable |
 | `403` | a browser marked the request as cross-origin (`Sec-Fetch-Site` not `same-origin`/`none`, or `Origin` differs from `Host`); also returned by `DELETE`. Clients that send neither header, such as curl and scripts, are not affected |
 | `413` | file larger than `CONVERTFLOW_MAX_UPLOAD_BYTES` (default 8 GiB) |
 | `422` | invalid options, or the preset is not available on any running worker (for example `video-h264` on the `lgpl` flavor) |

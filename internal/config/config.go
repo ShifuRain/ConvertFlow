@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ShifuRain/convertflow/internal/hostcheck"
 )
 
 type Config struct {
@@ -27,6 +29,9 @@ type Config struct {
 	StaleAfter     time.Duration
 	MaxQueueAge    time.Duration // queued jobs older than this are failed by the janitor
 	WorkerPoll     time.Duration
+	// AllowedHosts extends the default Host allow-list (localhost and IP literals); a single "*"
+	// disables the check. It defends against DNS rebinding.
+	AllowedHosts []string
 
 	// Upload resource bounds (the service has no authentication, so these cap what anyone on the
 	// network can consume).
@@ -98,6 +103,16 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	c.MaxSSEStreams = int(num("CONVERTFLOW_MAX_SSE_STREAMS", 64))
 	// Default: room for one maximum-size upload plus a similarly sized output.
 	c.MinFreeBytes = num("CONVERTFLOW_MIN_FREE_BYTES", 2*c.MaxUploadBytes)
+	if v := getenv("CONVERTFLOW_ALLOWED_HOSTS"); v != "" {
+		for _, h := range strings.Split(v, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				c.AllowedHosts = append(c.AllowedHosts, h)
+			}
+		}
+		if _, err := hostcheck.Parse(c.AllowedHosts); err != nil {
+			fail("CONVERTFLOW_ALLOWED_HOSTS: %v", err)
+		}
+	}
 	if c.Flavor != "lgpl" && c.Flavor != "full" {
 		fail("CONVERTFLOW_FLAVOR must be \"lgpl\" or \"full\", got %q", c.Flavor)
 	}

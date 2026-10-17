@@ -69,6 +69,7 @@ services:
 | `CONVERTFLOW_RETENTION` | `24h` | api (janitor), shared | Finished (done/failed/canceled) jobs, their output files and metadata are deleted this long after finishing. |
 | `CONVERTFLOW_STALE_AFTER` | `60s` | api (janitor), shared | A probing/running job whose worker heartbeat (every 2 s) is older than this is requeued. Keep it well above the 2 s heartbeat, or healthy jobs are requeued. |
 | `CONVERTFLOW_MAX_QUEUE_AGE` | `24h` | api (janitor), shared | A job that has been `queued` this long (counted from the moment it last became queued: creation, or the requeue after a lost worker) **and whose preset no single live worker can run** is failed with "no worker available for this preset" and its input removed. See the section below. |
+| `CONVERTFLOW_ALLOWED_HOSTS` | unset (`localhost` and IP literals only) | api | Extra accepted `Host` header names (comma separated `host` or `host:port`; `*` disables the check). Required when the service is reached by a DNS name or through a proxy. Requests with another Host get `421`. See [DNS rebinding](#dns-rebinding-host-allow-list). |
 | `CONVERTFLOW_WORKER_POLL` | `2s` | worker | Sleep between claim attempts when the queue is empty. |
 | `CONVERTFLOW_MAX_CONCURRENT_UPLOADS` | `4` | api | Simultaneous in-flight upload requests; excess get `503` (`Retry-After: 30`). Each holds one connection and streams to disk. |
 | `CONVERTFLOW_MAX_QUEUED_JOBS` | `100` | api | Maximum active jobs (queued + probing + running); excess uploads get `503`. |
@@ -86,6 +87,18 @@ The age is measured from the **last transition into `queued`** (`updated_at`): t
 **There is no authentication.** Anyone who can reach the port can submit jobs, download any result, and delete or cancel any job. Treat the network path as the access control and complete [risk-acceptance-template.md](risk-acceptance-template.md) first.
 
 Default: `compose.yaml` publishes `127.0.0.1:${CONVERTFLOW_PORT:-8080}:8080`. To serve a network, change the host IP in the `ports:` line of `compose.yaml` to the intended interface address (compose merges `ports:` lists from override files instead of replacing them, so editing the file is the simplest way), restrict access with the host firewall to the allowed source networks, and put TLS in front.
+
+### DNS rebinding: Host allow-list
+
+A malicious web page can make an operator's browser resolve its own domain name to `127.0.0.1` or a LAN address after the page has loaded; the browser then regards the service as same-origin with that page, and the page can read job lists, filenames and downloads. The browser still sends the attacker's name in the `Host` header, so the API refuses **every** request (all routes: `/api`, SSE streams, downloads, the UI, `/healthz`, `/metrics`) whose `Host` it does not recognise, with `421 Misdirected Request` (problem+json, generic message) and the audit event `request_rejected` with `reason=host_not_allowed` (the offending value is never logged).
+
+- **Default (`CONVERTFLOW_ALLOWED_HOSTS` unset):** `localhost` and any IP literal (IPv4 or `[IPv6]`, with or without a port) are accepted, nothing else. This covers `http://127.0.0.1:8080`, the container `healthcheck` and `curl` against the published port.
+- **Using a DNS name, a reverse proxy or an internal service name:** you must list the name, otherwise the service answers `421` (the UI will not load). Set `CONVERTFLOW_ALLOWED_HOSTS=convert.example.org,convert.internal:8443` (comma separated; `host` accepts any port, `host:port` pins the port; hostnames compare case-insensitively; a trailing dot is ignored). Listed names are added to the defaults; they never replace them.
+- **Reverse proxy:** forward the client's `Host` unchanged (see below) and list that name, or have the proxy send a `Host` you list.
+- **Prometheus and other scrapers** that reach the API by service name (for example `http://api:8080/metrics`) send `Host: api:8080`: add `api` to the list.
+- `CONVERTFLOW_ALLOWED_HOSTS=*` turns the check off. Do that only if network access control already makes rebinding irrelevant.
+
+Residual: an attacker who can make the victim's browser use an IP literal that points at the service is not stopped by this check (but also gains nothing, because that is plain cross-origin access, covered by the next section). The check does not protect against non-browser clients. Tests: `TestHostGuardTableAllRoutes` (`internal/api`), `TestRebindingHostRefusedOnEveryRoute` (`internal/e2e`), `internal/hostcheck`.
 
 ### Cross-origin requests from browsers
 
@@ -126,7 +139,7 @@ Terminate TLS in the organization's proxy and forward to the loopback-published 
 - long read/send timeouts for uploads and downloads,
 - no response buffering for `/api/v1/jobs/*/events` (the server sends `X-Accel-Buffering: no`; nginx honors it),
 - preserve `Range` requests for downloads,
-- forward the `Host` header unchanged (nginx: `proxy_set_header Host $http_host;`): the cross-origin check compares the browser's `Origin` with `Host` (see [Cross-origin requests from browsers](#cross-origin-requests-from-browsers)),
+- forward the `Host` header unchanged (nginx: `proxy_set_header Host $http_host;`) and list that name in `CONVERTFLOW_ALLOWED_HOSTS` ([DNS rebinding](#dns-rebinding-host-allow-list)); the cross-origin check also compares the browser's `Origin` with `Host` (see [Cross-origin requests from browsers](#cross-origin-requests-from-browsers)),
 - do not strip the security headers the application sets (CSP, `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, `Cross-Origin-Resource-Policy`). The application emits `Strict-Transport-Security` only when it terminates TLS itself, so add HSTS in the proxy.
 
 **`X-Forwarded-For` and similar headers are not trusted or evaluated.** The `remote_ip` in the audit log is the TCP peer address. Behind a reverse proxy that is the proxy's address, so attribute clients from the proxy's access log, correlated by time. Also with the default rootless-podman published port the peer address is not the client's: a request from `127.0.0.1` was logged as `10.89.1.2` (the container network gateway) in the verified setup. Do not rely on `remote_ip` for attribution without checking what your runtime reports.

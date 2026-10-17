@@ -3,7 +3,7 @@
   "info": {
     "title": "ConvertFlow API",
     "version": "1.0.0",
-    "description": "Transcode video and audio with FFmpeg. There is no authentication: the service is intended for isolated networks. Errors use RFC 9457 application/problem+json. Unknown /api paths answer 404 and unsupported methods 405 (with an Allow header), both as problem+json.",
+    "description": "Transcode video and audio with FFmpeg. There is no authentication: the service is intended for isolated networks. Errors use RFC 9457 application/problem+json. Unknown /api paths answer 404 and unsupported methods 405 (with an Allow header), both as problem+json. Every route answers 421 when the request's Host header is not allowed (default: localhost and IP literals; see CONVERTFLOW_ALLOWED_HOSTS).",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -70,6 +70,9 @@
           "413": {
             "$ref": "#/components/responses/TooLarge"
           },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
           "422": {
             "$ref": "#/components/responses/Unprocessable"
           },
@@ -101,6 +104,9 @@
               }
             }
           },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
           "500": {
             "$ref": "#/components/responses/Internal"
           }
@@ -129,6 +135,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -190,6 +199,9 @@
               }
             }
           },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
           "500": {
             "$ref": "#/components/responses/Internal"
           }
@@ -219,6 +231,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -340,6 +355,9 @@
               }
             }
           },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
           "500": {
             "$ref": "#/components/responses/Internal"
           }
@@ -364,6 +382,9 @@
               }
             }
           },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
           "500": {
             "$ref": "#/components/responses/Internal"
           }
@@ -384,6 +405,9 @@
                 }
               }
             }
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
           }
         }
       }
@@ -402,6 +426,9 @@
                 }
               }
             }
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
           },
           "503": {
             "description": "Database unreachable",
@@ -430,6 +457,9 @@
                 }
               }
             }
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -532,6 +562,16 @@
       },
       "CrossOrigin": {
         "description": "Refused: a browser marked the request as cross-origin (Sec-Fetch-Site other than same-origin/none, or an Origin that differs from the Host). Requests without these headers (curl, scripts) are not affected.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "MisdirectedRequest": {
+        "description": "The Host header is not in the allow-list (DNS rebinding defense, CONVERTFLOW_ALLOWED_HOSTS). Applies to every route.",
         "content": {
           "application/problem+json": {
             "schema": {

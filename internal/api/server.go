@@ -4,6 +4,7 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/ShifuRain/convertflow/internal/audit"
 	"github.com/ShifuRain/convertflow/internal/config"
+	"github.com/ShifuRain/convertflow/internal/hostcheck"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 	"github.com/ShifuRain/convertflow/internal/ui"
 )
@@ -36,6 +38,7 @@ type Server struct {
 	cfg   config.Config
 	audit *audit.Logger
 	every time.Duration
+	hosts hostcheck.Matcher
 
 	sseSlots     chan struct{}
 	sseHeartbeat time.Duration
@@ -51,6 +54,12 @@ const liveWindow = 30 * time.Second // a worker is "live" if it was seen this re
 
 func NewHandler(d Deps) http.Handler {
 	s := &Server{store: d.Store, cfg: d.Cfg, audit: d.Audit, every: d.EventInterval}
+	hosts, err := hostcheck.Parse(d.Cfg.AllowedHosts)
+	if err != nil { // config.Load validates; stay fail-closed (defaults only) if it was bypassed
+		slog.Error("invalid allowed hosts; using the defaults only", "err", err)
+		hosts = hostcheck.Matcher{}
+	}
+	s.hosts = hosts
 	slots := d.Cfg.MaxConcurrentUploads
 	if slots <= 0 {
 		slots = 4
@@ -79,7 +88,7 @@ func NewHandler(d Deps) http.Handler {
 	if s.sseMaxLife <= 0 {
 		s.sseMaxLife = defaultSSEMaxLifetime
 	}
-	return recoverer(securityHeaders(d.Cfg.TLSCertFile != "", noStoreAPI(s.crossOriginGuard(s.rootMux()))))
+	return recoverer(securityHeaders(d.Cfg.TLSCertFile != "", s.hostGuard(noStoreAPI(s.crossOriginGuard(s.rootMux())))))
 }
 
 type route struct {

@@ -127,7 +127,12 @@ func healthcheck() int {
 		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 	// #nosec G704 -- URL is built from our own listen address (loopback probe), never from request input
-	resp, err := client.Get(fmt.Sprintf("%s://%s/healthz", scheme, net.JoinHostPort(host, port)))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s://%s/healthz", scheme, net.JoinHostPort(host, port)), nil)
+	if err != nil {
+		return 1
+	}
+	req.Host = net.JoinHostPort("127.0.0.1", port) // always an allowed Host, whatever CONVERTFLOW_LISTEN names
+	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return 1
 	}

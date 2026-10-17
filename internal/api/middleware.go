@@ -105,3 +105,18 @@ func (s *Server) crossOriginGuard(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// hostGuard answers 421 to every request (API, SSE, downloads, UI, probes) whose Host header is not
+// in the allow-list: the DNS rebinding defense. The audit record carries a fixed reason only,
+// never the attacker-controlled Host value.
+func (s *Server) hostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.hosts.Allowed(r.Host) {
+			s.audit.Event(r, "request_rejected", "", "status", http.StatusMisdirectedRequest, "reason", "host_not_allowed")
+			w.Header().Set("Connection", "close")
+			WriteProblem(w, http.StatusMisdirectedRequest, "Misdirected request", "The Host header is not allowed.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

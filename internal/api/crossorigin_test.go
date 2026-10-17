@@ -80,7 +80,7 @@ func TestCrossOriginTable(t *testing.T) {
 func TestCrossOriginAuditIsGeneric(t *testing.T) {
 	pool := dbtest.New(t)
 	var logs bytes.Buffer
-	h := api.NewHandler(api.Deps{Store: jobs.NewStore(pool), Cfg: config.Config{DataDir: t.TempDir(), Retention: time.Hour}, Audit: audit.New(&logs)})
+	h := api.NewHandler(api.Deps{Store: jobs.NewStore(pool), Cfg: config.Config{AllowedHosts: []string{"*"}, DataDir: t.TempDir(), Retention: time.Hour}, Audit: audit.New(&logs)})
 	r := httptest.NewRequest("DELETE", "/api/v1/jobs/00000000-0000-4000-8000-000000000000", nil)
 	r.Header.Set("Origin", "https://evil-attacker.example")
 	r.RemoteAddr = "192.0.2.7:1"

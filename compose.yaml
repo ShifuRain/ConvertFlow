@@ -63,6 +63,8 @@ services:
       CONVERTFLOW_LISTEN: "0.0.0.0:8080"
       CONVERTFLOW_DATABASE_URL_FILE: /run/secrets/database_url
       CONVERTFLOW_MAX_UPLOAD_BYTES: ${CONVERTFLOW_MAX_UPLOAD_BYTES:-8589934592}
+      # DNS-rebinding defense (API only): extra Host names; localhost and IP literals are always allowed
+      CONVERTFLOW_ALLOWED_HOSTS: ${CONVERTFLOW_ALLOWED_HOSTS:-}
     secrets: [database_url]
     volumes: ["media:/data"]
     tmpfs: ["/tmp:size=64m"]

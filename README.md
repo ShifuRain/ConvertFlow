@@ -30,6 +30,8 @@ CONVERTFLOW_VERSION=<version> FFMPEG_FLAVOR=lgpl \
 
 The bundle's own `AIRGAP-README.txt` repeats these steps with the exact version filled in. `compose.airgap.yaml` points the `db` service at the locally re-tagged PostgreSQL image, because a loaded image archive cannot keep the registry digest that `compose.yaml` pins.
 
+> **Using a DNS name or a reverse proxy?** The API refuses every request whose `Host` header it does not recognise (HTTP `421`) to defeat DNS rebinding. Out of the box only `localhost` and IP addresses are accepted. If you open the service as `https://convert.example.org` or put a proxy in front, list the name: `CONVERTFLOW_ALLOWED_HOSTS=convert.example.org` in `.env` (comma separated; `*` disables the check). See [docs/operations.md](docs/operations.md#dns-rebinding-host-allow-list).
+
 Open <http://127.0.0.1:8080>. The UI is the start page, the API guide is at `/docs.html` and the OpenAPI 3.1 document at `/api/openapi.json`. Check the stack:
 
 ```bash

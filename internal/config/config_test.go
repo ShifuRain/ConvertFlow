@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -146,6 +147,29 @@ func TestMaxQueueAge(t *testing.T) {
 		base["CONVERTFLOW_MAX_QUEUE_AGE"] = bad
 		if _, err := config.Load(env(base), noFile); err == nil {
 			t.Errorf("%q: expected error", bad)
+		}
+	}
+}
+
+func TestAllowedHosts(t *testing.T) {
+	base := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}
+	c, err := config.Load(env(base), noFile)
+	if err != nil || len(c.AllowedHosts) != 0 {
+		t.Fatalf("default: %v %v", c.AllowedHosts, err)
+	}
+	base["CONVERTFLOW_ALLOWED_HOSTS"] = " convert.example.org , files.example:8443,[::1] "
+	c, err = config.Load(env(base), noFile)
+	if err != nil || len(c.AllowedHosts) != 3 || c.AllowedHosts[1] != "files.example:8443" {
+		t.Fatalf("list: %v %v", c.AllowedHosts, err)
+	}
+	base["CONVERTFLOW_ALLOWED_HOSTS"] = "*"
+	if c, err = config.Load(env(base), noFile); err != nil || len(c.AllowedHosts) != 1 {
+		t.Fatalf("star: %v %v", c.AllowedHosts, err)
+	}
+	for _, bad := range []string{"http://x.example", "x.example/path", "a b", "x@y", "*,x.example", "x:port", "::1"} {
+		base["CONVERTFLOW_ALLOWED_HOSTS"] = bad
+		if _, err := config.Load(env(base), noFile); err == nil || !strings.Contains(err.Error(), "CONVERTFLOW_ALLOWED_HOSTS") {
+			t.Errorf("%q: want error naming the variable, got %v", bad, err)
 		}
 	}
 }

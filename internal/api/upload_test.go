@@ -39,7 +39,7 @@ func newFixture(t *testing.T, maxUpload int64) fixture {
 	_ = os.MkdirAll(filepath.Join(dir, "out"), 0o700)
 	store := jobs.NewStore(pool)
 	_ = store.UpsertWorker(context.Background(), "w1", []string{"pcm_s16le", "libopus", "flac"})
-	cfg := config.Config{DataDir: dir, MaxUploadBytes: maxUpload, Retention: time.Hour}
+	cfg := config.Config{AllowedHosts: []string{"*"}, DataDir: dir, MaxUploadBytes: maxUpload, Retention: time.Hour}
 	h := api.NewHandler(api.Deps{Store: store, Cfg: cfg, Audit: audit.New(io.Discard), EventInterval: 20 * time.Millisecond})
 	return fixture{h, store, dir}
 }
@@ -278,7 +278,7 @@ func TestAuditLogOnCreate(t *testing.T) {
 	store := jobs.NewStore(pool)
 	_ = store.UpsertWorker(context.Background(), "w1", []string{"pcm_s16le"})
 	var logBuf bytes.Buffer
-	h := api.NewHandler(api.Deps{Store: store, Cfg: config.Config{DataDir: dir, MaxUploadBytes: 1 << 20}, Audit: audit.New(&logBuf)})
+	h := api.NewHandler(api.Deps{Store: store, Cfg: config.Config{AllowedHosts: []string{"*"}, DataDir: dir, MaxUploadBytes: 1 << 20}, Audit: audit.New(&logBuf)})
 	body, ct := multipartBody(t, []field{{"preset", "audio-wav"}}, "a.wav", []byte("SECRET"))
 	r := httptest.NewRequest("POST", "/api/v1/jobs", body)
 	r.Header.Set("Content-Type", ct)
@@ -526,7 +526,7 @@ func newFixtureWith(t *testing.T, maxUpload int64, mod func(*config.Config, *api
 	_ = os.MkdirAll(filepath.Join(dir, "in"), 0o700)
 	store := jobs.NewStore(pool)
 	_ = store.UpsertWorker(context.Background(), "w1", []string{"pcm_s16le", "libopus", "flac"})
-	cfg := config.Config{DataDir: dir, MaxUploadBytes: maxUpload, Retention: time.Hour}
+	cfg := config.Config{AllowedHosts: []string{"*"}, DataDir: dir, MaxUploadBytes: maxUpload, Retention: time.Hour}
 	var logBuf bytes.Buffer
 	d := api.Deps{Store: store, Audit: audit.New(&logBuf), EventInterval: 20 * time.Millisecond}
 	mod(&cfg, &d)
