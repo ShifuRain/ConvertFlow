@@ -31,7 +31,7 @@ index_digest() {
   "$RT" image inspect "$ref" --format '{{.Digest}}'
 }
 
-files=(Dockerfile.api Dockerfile.worker compose.yaml)
+files=(Dockerfile.api Dockerfile.worker compose.yaml .github/workflows/ci.yml)
 for ref in "${refs[@]}"; do
   digest=$(index_digest "$ref")
   [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "could not resolve a digest for $ref" >&2; exit 1; }

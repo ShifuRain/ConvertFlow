@@ -1,0 +1,9 @@
+# Trivy ignore list for the image scans (scripts/trivy-scan.sh). HIGH/CRITICAL findings fail CI unless listed here.
+# Every entry MUST be preceded (directly, no blank line between) by two comment lines:
+#   # justification: <why this finding is not exploitable / has no fix / is accepted, and who decided>
+#   # expires: YYYY-MM-DD        (at most 90 days ahead; the entry stops being honoured and CI fails after that date)
+# followed by one identifier (CVE-/GHSA-/GO- ...) on its own line. scripts/check-trivyignore.sh enforces this.
+# Prefer fixing (bump base image digest, bump dependency) over ignoring. --ignore-unfixed is already set,
+# so only findings WITH an available fix reach this list.
+#
+# (no entries)
