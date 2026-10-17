@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -507,5 +509,253 @@ func TestUploadRawControlCharsInFilenameRejectedOrSanitized(t *testing.T) {
 		default:
 			t.Fatalf("%q: unexpected status %d", name, w.Code)
 		}
+	}
+}
+
+// ---- resource bounds, write-side errors, strict parsing ----
+
+type auditFixture struct {
+	fixture
+	log *bytes.Buffer
+}
+
+func newFixtureWith(t *testing.T, maxUpload int64, mod func(*config.Config, *api.Deps)) auditFixture {
+	t.Helper()
+	pool := dbtest.New(t)
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "in"), 0o700)
+	store := jobs.NewStore(pool)
+	_ = store.UpsertWorker(context.Background(), "w1", []string{"pcm_s16le", "libopus", "flac"})
+	cfg := config.Config{DataDir: dir, MaxUploadBytes: maxUpload, Retention: time.Hour}
+	var logBuf bytes.Buffer
+	d := api.Deps{Store: store, Audit: audit.New(&logBuf), EventInterval: 20 * time.Millisecond}
+	mod(&cfg, &d)
+	d.Cfg = cfg
+	return auditFixture{fixture{api.NewHandler(d), store, dir}, &logBuf}
+}
+
+func okBody(t *testing.T) (*bytes.Buffer, string) {
+	return multipartBody(t, []field{{"preset", "audio-wav"}}, "a.wav", []byte("data"))
+}
+
+func hasRejectAudit(f auditFixture, status int, reason string) bool {
+	s := f.log.String()
+	return strings.Contains(s, `"event":"upload_rejected"`) && strings.Contains(s, "192.0.2.7") &&
+		strings.Contains(s, `"status":`+strconv.Itoa(status)) && strings.Contains(s, reason)
+}
+
+func TestUploadConcurrencyLimitAndRelease(t *testing.T) {
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) { c.MaxConcurrentUploads = 1 })
+	pr, pw := io.Pipe()
+	body, ct := okBody(t)
+	_ = body
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- post(f.fixture, pr, ct) }()
+	_, _ = pw.Write([]byte("--x\r\n")) // handler is now blocked reading the body
+	var w *httptest.ResponseRecorder
+	for i := 0; i < 200; i++ {
+		b, c := okBody(t)
+		if w = post(f.fixture, b, c); w.Code == 503 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if w.Code != 503 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("want 503 + Retry-After, got %d %v", w.Code, w.Header())
+	}
+	problemOf(t, w)
+	if !hasRejectAudit(f, 503, "too many") {
+		t.Fatalf("missing reject audit: %s", f.log)
+	}
+	_ = pw.CloseWithError(errors.New("client gone"))
+	if r := <-done; r.Code != 400 {
+		t.Fatalf("aborted holder: %d", r.Code)
+	}
+	b, c := okBody(t)
+	if w := post(f.fixture, b, c); w.Code != 202 {
+		t.Fatalf("slot not released after abort: %d", w.Code)
+	}
+}
+
+func TestUploadSemaphoreReleasedOnEveryExitPath(t *testing.T) {
+	panicNext := false
+	f := newFixtureWith(t, 1000, func(c *config.Config, d *api.Deps) {
+		c.MaxConcurrentUploads = 1
+		d.OpenInput = func(p string) (io.WriteCloser, error) {
+			if panicNext {
+				panic("boom")
+			}
+			return api.DefaultOpenInput(p)
+		}
+	})
+	ok := func(step string) {
+		t.Helper()
+		b, c := okBody(t)
+		if w := post(f.fixture, b, c); w.Code != 202 {
+			t.Fatalf("after %s: slot leaked, got %d", step, w.Code)
+		}
+	}
+	ok("start")
+	big, ct := multipartBody(t, []field{{"preset", "audio-wav"}}, "b.wav", bytes.Repeat([]byte("x"), 5000))
+	if w := post(f.fixture, io.MultiReader(big), ct); w.Code != 413 {
+		t.Fatalf("want 413 got %d", w.Code)
+	}
+	ok("413")
+	b, c := okBody(t)
+	if w := post(f.fixture, failingReader{io.LimitReader(b, int64(b.Len()-100))}, c); w.Code != 400 {
+		t.Fatalf("want 400 got %d", w.Code)
+	}
+	ok("abort")
+	panicNext = true
+	b, c = okBody(t)
+	if w := post(f.fixture, b, c); w.Code != 500 {
+		t.Fatalf("want 500 got %d", w.Code)
+	}
+	panicNext = false
+	ok("panic")
+}
+
+func TestUploadQueueCap(t *testing.T) {
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) { c.MaxQueuedJobs = 2 })
+	for i := 0; i < 2; i++ {
+		b, c := okBody(t)
+		if w := post(f.fixture, b, c); w.Code != 202 {
+			t.Fatalf("job %d: %d", i, w.Code)
+		}
+	}
+	b, c := okBody(t)
+	w := post(f.fixture, b, c)
+	if w.Code != 503 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("want 503+Retry-After got %d %v", w.Code, w.Header())
+	}
+	problemOf(t, w)
+	if len(inFiles(t, f.fixture)) != 2 {
+		t.Fatalf("rejected upload wrote bytes: %v", inFiles(t, f.fixture))
+	}
+	if !hasRejectAudit(f, 503, "queue full") {
+		t.Fatalf("missing reject audit: %s", f.log)
+	}
+}
+
+func TestUploadInsufficientDiskSpace(t *testing.T) {
+	free := uint64(100)
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
+		c.MinFreeBytes = 1000
+		d.FreeBytes = func(string) (uint64, error) { return free, nil }
+	})
+	b, c := okBody(t)
+	w := post(f.fixture, b, c)
+	if w.Code != 507 {
+		t.Fatalf("want 507 got %d", w.Code)
+	}
+	problemOf(t, w)
+	if len(inFiles(t, f.fixture)) != 0 || strings.Contains(w.Body.String(), f.dir) {
+		t.Fatal("bytes written or path leaked")
+	}
+	if !hasRejectAudit(f, 507, "insufficient storage") {
+		t.Fatalf("missing reject audit: %s", f.log)
+	}
+	free = 1 << 20
+	b, c = okBody(t)
+	if w := post(f.fixture, b, c); w.Code != 202 {
+		t.Fatalf("enough space: %d", w.Code)
+	}
+}
+
+type failWriter struct {
+	f   *os.File
+	err error
+	n   int
+}
+
+func (w *failWriter) Write(p []byte) (int, error) {
+	if w.n += len(p); w.n > 10 {
+		return 0, w.err
+	}
+	return w.f.Write(p)
+}
+func (w *failWriter) Close() error { return w.f.Close() }
+
+func TestUploadDiskFullAndWriteErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"ENOSPC", &os.PathError{Op: "write", Path: "/secret/data/in/x", Err: syscall.ENOSPC}, 507},
+		{"EIO", &os.PathError{Op: "write", Path: "/secret/data/in/x", Err: syscall.EIO}, 500},
+	}
+	for _, tc := range cases {
+		f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
+			d.OpenInput = func(p string) (io.WriteCloser, error) {
+				file, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+				return &failWriter{f: file, err: tc.err}, err
+			}
+		})
+		body, ct := multipartBody(t, []field{{"preset", "audio-wav"}}, "a.wav", bytes.Repeat([]byte("x"), 5000))
+		w := post(f.fixture, body, ct)
+		if w.Code != tc.want {
+			t.Fatalf("%s: want %d got %d: %s", tc.name, tc.want, w.Code, w.Body)
+		}
+		problemOf(t, w)
+		if strings.Contains(w.Body.String(), "secret") {
+			t.Fatalf("%s: path leaked: %s", tc.name, w.Body)
+		}
+		if len(inFiles(t, f.fixture)) != 0 {
+			t.Fatalf("%s: partial file left: %v", tc.name, inFiles(t, f.fixture))
+		}
+		if l, _ := f.store.List(context.Background(), 10); len(l) != 0 {
+			t.Fatalf("%s: job row created", tc.name)
+		}
+	}
+}
+
+func TestUploadOpenFileFailureIs500(t *testing.T) {
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
+		d.OpenInput = func(string) (io.WriteCloser, error) { return nil, errors.New("open /secret/dir: denied") }
+	})
+	b, c := okBody(t)
+	w := post(f.fixture, b, c)
+	if w.Code != 500 || strings.Contains(w.Body.String(), "secret") {
+		t.Fatalf("got %d %s", w.Code, w.Body)
+	}
+	problemOf(t, w)
+}
+
+func TestUploadStrictFieldParsing(t *testing.T) {
+	cases := map[string][]field{
+		"unknown field":      {{"preset", "audio-wav"}, {"surprise", "1"}},
+		"duplicate preset":   {{"preset", "audio-wav"}, {"preset", "audio-flac"}},
+		"preset and options": {{"preset", "audio-wav"}, {"options", `{"preset":"audio-flac"}`}},
+		"duplicate options":  {{"options", `{"preset":"audio-wav"}`}, {"options", `{"preset":"audio-wav"}`}},
+		"trailing json":      {{"options", `{"preset":"audio-wav"}{"preset":"audio-flac"}`}},
+		"trailing garbage":   {{"options", `{"preset":"audio-wav"} xyz`}},
+	}
+	for name, fields := range cases {
+		f := newFixtureWith(t, 1<<20, func(*config.Config, *api.Deps) {})
+		body, ct := multipartBody(t, fields, "a.wav", []byte("data"))
+		w := post(f.fixture, body, ct)
+		if w.Code != 400 && w.Code != 422 {
+			t.Errorf("%s: want 400/422 got %d", name, w.Code)
+			continue
+		}
+		problemOf(t, w)
+		if len(inFiles(t, f.fixture)) != 0 {
+			t.Errorf("%s: bytes written", name)
+		}
+		if !strings.Contains(f.log.String(), `"event":"upload_rejected"`) {
+			t.Errorf("%s: no reject audit", name)
+		}
+	}
+}
+
+func TestUploadRejectionsAreAudited(t *testing.T) {
+	f := newFixtureWith(t, 1000, func(*config.Config, *api.Deps) {})
+	big, ct := multipartBody(t, []field{{"preset", "audio-wav"}}, "big.wav", bytes.Repeat([]byte("x"), 200_000))
+	post(f.fixture, io.MultiReader(big), ct)
+	b, c := multipartBody(t, []field{{"preset", "nope"}}, "a.wav", []byte("SECRETDATA"))
+	post(f.fixture, b, c)
+	if !hasRejectAudit(f, 413, "too large") || !hasRejectAudit(f, 422, "invalid options") || strings.Contains(f.log.String(), "SECRETDATA") {
+		t.Fatalf("audit: %s", f.log)
 	}
 }

@@ -89,3 +89,30 @@ func TestWorkerBudgets(t *testing.T) {
 		t.Fatal("negative timeout must be rejected")
 	}
 }
+
+func TestUploadResourceBounds(t *testing.T) {
+	base := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}
+	c, err := config.Load(env(base), noFile)
+	if err != nil || c.MaxConcurrentUploads != 4 || c.MaxQueuedJobs != 100 || c.MinFreeBytes != 2*c.MaxUploadBytes {
+		t.Fatalf("bad defaults: %+v %v", c, err)
+	}
+	// The free-space default follows a custom upload limit unless overridden.
+	base["CONVERTFLOW_MAX_UPLOAD_BYTES"] = "1000"
+	c, _ = config.Load(env(base), noFile)
+	if c.MinFreeBytes != 2000 {
+		t.Fatalf("default MinFreeBytes should be 2*MaxUploadBytes, got %d", c.MinFreeBytes)
+	}
+	base["CONVERTFLOW_MAX_CONCURRENT_UPLOADS"] = "9"
+	base["CONVERTFLOW_MAX_QUEUED_JOBS"] = "7"
+	base["CONVERTFLOW_MIN_FREE_BYTES"] = "555"
+	c, err = config.Load(env(base), noFile)
+	if err != nil || c.MaxConcurrentUploads != 9 || c.MaxQueuedJobs != 7 || c.MinFreeBytes != 555 {
+		t.Fatalf("bad overrides: %+v %v", c, err)
+	}
+	for _, k := range []string{"CONVERTFLOW_MAX_CONCURRENT_UPLOADS", "CONVERTFLOW_MAX_QUEUED_JOBS", "CONVERTFLOW_MIN_FREE_BYTES"} {
+		b := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", k: "0"}
+		if _, err := config.Load(env(b), noFile); err == nil {
+			t.Errorf("%s=0 must be rejected", k)
+		}
+	}
+}

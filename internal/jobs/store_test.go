@@ -322,3 +322,43 @@ func TestRequeueStaleCancelRequestedGoesCanceled(t *testing.T) {
 		t.Fatalf("bad %+v", got)
 	}
 }
+
+func TestCountActive(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	if n, err := s.CountActive(ctx); err != nil || n != 0 {
+		t.Fatalf("empty: %d %v", n, err)
+	}
+	var ids []string
+	for i := 0; i < 4; i++ {
+		j := newJob()
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, j.ID)
+	}
+	if n, _ := s.CountActive(ctx); n != 4 {
+		t.Fatalf("queued jobs count: %d", n)
+	}
+	claimed, err := s.Claim(ctx, "w1") // probing still counts
+	if err != nil || claimed == nil {
+		t.Fatal(claimed, err)
+	}
+	if n, _ := s.CountActive(ctx); n != 4 {
+		t.Fatalf("probing must count: %d", n)
+	}
+	for _, id := range ids {
+		if id != claimed.ID {
+			if err := s.RequestCancel(ctx, id); err != nil { // queued -> canceled immediately
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if err := s.Fail(ctx, claimed.ID, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountActive(ctx); n != 2 {
+		t.Fatalf("terminal jobs must not count: %d", n)
+	}
+}

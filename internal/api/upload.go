@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -110,15 +112,72 @@ func readSmall(r io.Reader, max int) ([]byte, error) {
 	return b, nil
 }
 
-func (s *Server) uploadError(w http.ResponseWriter, err error) {
+// srvWriteError marks an error as coming from the destination (server) side of the copy, so it
+// is never mistaken for a client read error.
+type srvWriteError struct{ err error }
+
+func (e srvWriteError) Error() string { return e.err.Error() }
+func (e srvWriteError) Unwrap() error { return e.err }
+
+type tagWriter struct{ w io.Writer }
+
+func (t tagWriter) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		err = srvWriteError{err}
+	}
+	return n, err
+}
+
+// DefaultOpenInput creates a new input file, failing if it already exists.
+func DefaultOpenInput(path string) (io.WriteCloser, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+}
+
+func diskFree(dir string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), nil
+}
+
+// reject answers a refused upload and writes an audit record (client IP, status, reason; never content).
+func (s *Server) reject(w http.ResponseWriter, r *http.Request, status int, title, detail, reason string) {
+	s.audit.Event(r, "upload_rejected", "", "status", status, "reason", reason)
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "30")
+	}
+	WriteProblem(w, status, title, detail)
+}
+
+func isNoSpace(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}
+
+// serverFault logs and answers a server-side failure (5xx) without exposing internals.
+func (s *Server) serverFault(w http.ResponseWriter, r *http.Request, id, class string, err error) {
+	slog.Error("upload failed", "job_id", id, "class", class, "err", err)
+	if isNoSpace(err) {
+		s.reject(w, r, http.StatusInsufficientStorage, "Insufficient storage", "The server has run out of storage space.", "insufficient storage ("+class+")")
+		return
+	}
+	s.audit.Event(r, "upload_failed", id, "status", http.StatusInternalServerError, "class", class)
+	WriteProblem(w, http.StatusInternalServerError, "Internal error", "")
+}
+
+func (s *Server) uploadError(w http.ResponseWriter, r *http.Request, id string, err error) {
 	var mbe *http.MaxBytesError
+	var swe srvWriteError
 	switch {
+	case errors.As(err, &swe):
+		s.serverFault(w, r, id, "write", swe.err)
 	case errors.Is(err, errTooLarge) || errors.As(err, &mbe):
-		WriteProblem(w, http.StatusRequestEntityTooLarge, "Upload too large", "The file exceeds the configured limit.")
+		s.reject(w, r, http.StatusRequestEntityTooLarge, "Upload too large", "The file exceeds the configured limit.", "upload too large")
 	case errors.Is(err, errEmpty):
-		WriteProblem(w, http.StatusBadRequest, "Empty file", "The uploaded file is empty.")
+		s.reject(w, r, http.StatusBadRequest, "Empty file", "The uploaded file is empty.", "empty file")
 	default:
-		WriteProblem(w, http.StatusBadRequest, "Upload failed", "The upload was interrupted or malformed.")
+		s.reject(w, r, http.StatusBadRequest, "Upload failed", "The upload was interrupted or malformed.", "interrupted or malformed upload")
 	}
 }
 
@@ -150,97 +209,145 @@ func (b idleDeadlineBody) Read(p []byte) (int, error) {
 	return b.ReadCloser.Read(p)
 }
 
-// createJob streams a multipart upload to disk. Fields "preset" and/or "options" (JSON) must
-// precede the "file" field so invalid requests are rejected before any bytes are stored.
-// Anything after the file part is ignored.
+// createJob streams a multipart upload to disk. Fields "preset" or "options" (JSON), exactly one
+// of them and once, must precede the "file" field so invalid requests are rejected before any
+// bytes are stored. Unknown field names are rejected. Anything after the file part is ignored.
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
-	limit := s.cfg.MaxUploadBytes + multipartSlack
-	if r.ContentLength > limit {
-		WriteProblem(w, http.StatusRequestEntityTooLarge, "Upload too large", "The file exceeds the configured limit.")
+	// Resource bounds are checked before reading any body bytes.
+	select {
+	case s.uploadSlots <- struct{}{}:
+		defer func() { <-s.uploadSlots }()
+	default:
+		s.reject(w, r, http.StatusServiceUnavailable, "Server busy", "Too many uploads are in progress; retry later.", "too many concurrent uploads")
 		return
 	}
+	limit := s.cfg.MaxUploadBytes + multipartSlack
+	if r.ContentLength > limit {
+		s.reject(w, r, http.StatusRequestEntityTooLarge, "Upload too large", "The file exceeds the configured limit.", "upload too large")
+		return
+	}
+	if s.cfg.MaxQueuedJobs > 0 {
+		n, err := s.store.CountActive(r.Context())
+		if err != nil {
+			s.serverFault(w, r, "", "count_active", err)
+			return
+		}
+		if n >= s.cfg.MaxQueuedJobs {
+			s.reject(w, r, http.StatusServiceUnavailable, "Server busy", "The job queue is full; retry later.", "queue full")
+			return
+		}
+	}
+	if s.cfg.MinFreeBytes > 0 {
+		free, err := s.freeBytes(s.cfg.DataDir)
+		if err != nil {
+			s.serverFault(w, r, "", "statfs", err)
+			return
+		}
+		need := uint64(s.cfg.MinFreeBytes)
+		if r.ContentLength > 0 {
+			need += uint64(r.ContentLength)
+		}
+		if free < need {
+			s.reject(w, r, http.StatusInsufficientStorage, "Insufficient storage", "The server does not have enough free storage.", "insufficient storage")
+			return
+		}
+	}
+
 	r.Body = http.MaxBytesReader(w, idleDeadlineBody{r.Body, http.NewResponseController(w)}, limit)
 	mr, err := r.MultipartReader()
 	if err != nil {
-		WriteProblem(w, http.StatusBadRequest, "Bad request", "expected multipart/form-data")
+		s.reject(w, r, http.StatusBadRequest, "Bad request", "expected multipart/form-data", "not multipart")
 		return
 	}
 	id := uuid.NewString()
 	inPath := filepath.Join(s.cfg.DataDir, "in", id) // server-generated; the client filename is never a path
 	var opts jobs.Options
 	var filename string
-	stored, created := false, false
+	haveOpts := false
+	opened, created := false, false
 	defer func() {
-		if stored && !created {
+		if opened && !created {
 			_ = os.Remove(inPath)
 		}
 	}()
 
+	stored := false
 	for !stored {
 		part, err := mr.NextPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			s.uploadError(w, err)
+			s.uploadError(w, r, id, err)
 			return
 		}
-		switch part.FormName() {
+		name := part.FormName()
+		if (name == "preset" || name == "options") && haveOpts {
+			s.reject(w, r, http.StatusBadRequest, "Bad request", "send exactly one preset or options field", "duplicate options field")
+			return
+		}
+		switch name {
 		case "preset":
 			b, err := readSmall(part, 128)
 			if err != nil {
-				s.uploadError(w, err)
+				s.uploadError(w, r, id, err)
 				return
 			}
+			haveOpts = true
 			opts.Preset = strings.TrimSpace(string(b))
 		case "options":
 			b, err := readSmall(part, 4096)
 			if err != nil {
-				s.uploadError(w, err)
+				s.uploadError(w, r, id, err)
 				return
 			}
+			haveOpts = true
 			dec := json.NewDecoder(bytes.NewReader(b))
 			dec.DisallowUnknownFields()
-			if err := dec.Decode(&opts); err != nil {
-				WriteProblem(w, http.StatusUnprocessableEntity, "Invalid options", "options must be a JSON object with known fields")
+			if err := dec.Decode(&opts); err != nil || dec.Decode(&struct{}{}) != io.EOF {
+				s.reject(w, r, http.StatusUnprocessableEntity, "Invalid options", "options must be a single JSON object with known fields", "invalid options json")
 				return
 			}
 		case "file":
 			if opts.Preset == "" {
-				WriteProblem(w, http.StatusBadRequest, "Bad request", "send the preset (or options) field before the file field")
+				s.reject(w, r, http.StatusBadRequest, "Bad request", "send the preset (or options) field before the file field", "missing preset before file")
 				return
 			}
 			if msg, ok := s.checkOptions(r, opts); !ok {
-				WriteProblem(w, http.StatusUnprocessableEntity, "Invalid options", msg)
+				s.reject(w, r, http.StatusUnprocessableEntity, "Invalid options", msg, "invalid options")
 				return
 			}
 			filename = SanitizeFilename(part.FileName())
-			f, err := os.OpenFile(inPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			f, err := s.openInput(inPath)
 			if err != nil {
-				WriteProblem(w, http.StatusInternalServerError, "Internal error", "")
+				s.serverFault(w, r, id, "open_input", err)
 				return
 			}
-			stored = true
-			n, err := io.Copy(f, io.LimitReader(part, s.cfg.MaxUploadBytes+1))
+			opened = true
+			n, err := io.Copy(tagWriter{f}, io.LimitReader(part, s.cfg.MaxUploadBytes+1))
 			cerr := f.Close()
 			switch {
 			case err != nil:
-				s.uploadError(w, err)
+				s.uploadError(w, r, id, err)
 				return
 			case n > s.cfg.MaxUploadBytes:
-				s.uploadError(w, errTooLarge)
+				s.uploadError(w, r, id, errTooLarge)
 				return
 			case n == 0:
-				s.uploadError(w, errEmpty)
+				s.uploadError(w, r, id, errEmpty)
 				return
 			case cerr != nil:
-				WriteProblem(w, http.StatusInternalServerError, "Internal error", "")
+				s.serverFault(w, r, id, "close_input", cerr)
 				return
 			}
+			stored = true
+		default:
+			s.reject(w, r, http.StatusBadRequest, "Bad request", "unknown form field", "unknown form field")
+			return
 		}
 	}
 	if !stored {
-		WriteProblem(w, http.StatusBadRequest, "Bad request", "missing file field")
+		s.reject(w, r, http.StatusBadRequest, "Bad request", "missing file field", "missing file")
 		return
 	}
 	// A completed upload must not be orphaned (file removed but row committed) by a client
@@ -249,14 +356,14 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	j := &jobs.Job{ID: id, Filename: filename, InputPath: inPath, Options: opts}
 	if err := s.store.Create(ctx, j); err != nil {
-		WriteProblem(w, http.StatusInternalServerError, "Internal error", "")
+		s.serverFault(w, r, id, "create_job", err)
 		return
 	}
 	created = true
 	s.audit.Event(r, "job_created", id, "preset", opts.Preset)
 	got, err := s.store.Get(ctx, id)
 	if err != nil {
-		WriteProblem(w, http.StatusInternalServerError, "Internal error", "")
+		s.serverFault(w, r, id, "get_job", err)
 		return
 	}
 	w.Header().Set("Location", "/api/v1/jobs/"+id)

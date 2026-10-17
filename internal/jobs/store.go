@@ -215,6 +215,13 @@ func (s *Store) Counts(ctx context.Context) (map[string]int, error) {
 	return out, rows.Err()
 }
 
+// CountActive returns the number of jobs that are queued, probing or running.
+func (s *Store) CountActive(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status IN ('queued','probing','running')`).Scan(&n)
+	return n, err
+}
+
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func (s *Store) UpsertWorker(ctx context.Context, id string, encoders []string) error {

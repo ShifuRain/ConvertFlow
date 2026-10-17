@@ -3,6 +3,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
@@ -17,6 +18,10 @@ type Deps struct {
 	Cfg           config.Config
 	Audit         *audit.Logger
 	EventInterval time.Duration // SSE poll interval; default 1s
+
+	// Test seams; nil selects the production implementation.
+	OpenInput func(path string) (io.WriteCloser, error) // creates the exclusive input file
+	FreeBytes func(dir string) (uint64, error)          // free space on the data volume
 }
 
 type Server struct {
@@ -24,12 +29,28 @@ type Server struct {
 	cfg   config.Config
 	audit *audit.Logger
 	every time.Duration
+
+	uploadSlots chan struct{}
+	openInput   func(string) (io.WriteCloser, error)
+	freeBytes   func(string) (uint64, error)
 }
 
 const liveWindow = 30 * time.Second // a worker is "live" if it was seen this recently
 
 func NewHandler(d Deps) http.Handler {
 	s := &Server{store: d.Store, cfg: d.Cfg, audit: d.Audit, every: d.EventInterval}
+	slots := d.Cfg.MaxConcurrentUploads
+	if slots <= 0 {
+		slots = 4
+	}
+	s.uploadSlots = make(chan struct{}, slots)
+	s.openInput, s.freeBytes = d.OpenInput, d.FreeBytes
+	if s.openInput == nil {
+		s.openInput = DefaultOpenInput
+	}
+	if s.freeBytes == nil {
+		s.freeBytes = diskFree
+	}
 	if s.every <= 0 {
 		s.every = time.Second
 	}
