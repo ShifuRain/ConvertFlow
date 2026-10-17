@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 RT=${CONTAINER_RUNTIME:-docker}
 refs=(
   docker.io/library/node:22-bookworm-slim
-  docker.io/library/golang:1.25-bookworm
+  docker.io/library/golang:1.26.9-bookworm
   gcr.io/distroless/static-debian12:nonroot
   docker.io/library/debian:bookworm-slim
   docker.io/library/postgres:16-bookworm

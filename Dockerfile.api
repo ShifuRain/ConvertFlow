@@ -2,11 +2,11 @@
 FROM docker.io/library/node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS ui
 WORKDIR /src/ui
 COPY ui/package.json ui/package-lock.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 COPY ui/ ./
 RUN mkdir -p /src/internal/ui/dist && npm run build
 
-FROM docker.io/library/golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS build
+FROM docker.io/library/golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

@@ -30,7 +30,7 @@ RUN set -eux; \
     if ldd /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe | grep -q 'not found'; then echo 'unresolved shared libraries' >&2; ldd /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe >&2; exit 1; fi; \
     printf 'ffmpeg %s flavor=%s sha256=%s\n' "$FFMPEG_VERSION" "$FFMPEG_FLAVOR" "$FFMPEG_SHA256" > /opt/ffmpeg/BUILDINFO
 
-FROM docker.io/library/golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS gobuild
+FROM docker.io/library/golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -41,6 +41,9 @@ FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e27
 ARG FFMPEG_FLAVOR=lgpl
 RUN set -eux; \
     apt-get update; \
+    # The pinned base digest lags Debian security updates (perl-base deb12u3 -> deb12u4 fixes CVE-2026-13221 and other
+    # HIGH/CRITICAL findings): apply pending security upgrades. Remove once the base digest itself carries them.
+    apt-get upgrade -y --no-install-recommends; \
     apt-get install -y --no-install-recommends libsvtav1enc1 libaom3 libvpx7 libopus0 libvorbis0a libvorbisenc2 libmp3lame0 zlib1g; \
     if [ "$FFMPEG_FLAVOR" = "full" ]; then apt-get install -y --no-install-recommends libx264-164 libx265-199; fi; \
     rm -rf /var/lib/apt/lists/*; \
