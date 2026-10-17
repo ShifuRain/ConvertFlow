@@ -1,9 +1,9 @@
 .PHONY: ui test test-db build
 ui:
 	cd ui && npm ci && npm run build
-test:
+test: ui
 	go vet ./...
-	go test ./...
+	CONVERTFLOW_REQUIRE_UI=1 go test ./...
 test-db:
 	scripts/test-db.sh
 build:

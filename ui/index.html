@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ConvertFlow</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>ConvertFlow</h1>
+    <nav><a href="docs.html">API</a></nav>
+  </header>
+  <main>
+    <section class="panel" aria-label="Upload">
+      <button id="drop" type="button" class="drop">
+        <span class="drop-title">Drop files here</span>
+        <span class="muted">or press to choose video / audio files</span>
+      </button>
+      <input id="file" type="file" multiple hidden>
+      <div class="controls">
+        <label for="preset">Preset</label>
+        <select id="preset"></select>
+        <details>
+          <summary>Advanced</summary>
+          <div class="adv">
+            <label for="speed">Speed (0 best – 10 fastest)</label>
+            <input id="speed" type="number" min="0" max="10" placeholder="default">
+            <label for="crf">Quality CRF (18 best – 45 smallest)</label>
+            <input id="crf" type="number" min="18" max="45" placeholder="default">
+            <label for="height">Max height</label>
+            <select id="height"><option value="">original</option><option>2160</option><option>1440</option><option>1080</option><option>720</option><option>480</option><option>360</option><option>240</option></select>
+            <label for="abr">Audio bitrate (kbit/s)</label>
+            <select id="abr"><option value="">default</option><option>64</option><option>96</option><option>128</option><option>192</option><option>256</option><option>320</option></select>
+          </div>
+        </details>
+      </div>
+      <p id="notice" class="muted" hidden></p>
+      <p id="error" class="error" role="alert" hidden></p>
+    </section>
+    <section class="panel" aria-label="Jobs">
+      <table>
+        <thead><tr><th>File</th><th>Preset</th><th>Status</th><th>Progress</th><th>Encoder</th><th><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody id="jobs"></tbody>
+      </table>
+      <p id="empty" class="muted">No jobs yet.</p>
+    </section>
+  </main>
+  <div id="live" class="sr-only" role="status" aria-live="polite"></div>
+  <script src="main.js"></script>
+</body>
+</html>

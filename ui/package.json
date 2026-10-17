@@ -1,0 +1,13 @@
+{
+  "name": "convertflow-ui",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && esbuild src/main.ts src/docs.ts --bundle --minify --target=es2020 --outdir=../internal/ui/dist && cp index.html docs.html src/style.css ../internal/ui/dist/"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
