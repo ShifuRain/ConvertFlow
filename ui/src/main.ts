@@ -11,6 +11,19 @@ const streams = new Map<string, EventSource>();
 const TERMINAL = ["done", "failed", "canceled"];
 const UPLOAD_CONCURRENCY = 2; // the server caps simultaneous uploads; queue the rest here
 const MAX_UPLOAD_RETRIES = 4;
+const MAX_STREAMS = 4; // client-side cap on EventSources; the rest of the active jobs are polled
+const POLL_MS = 3000;
+const BACKOFF_BASE_MS = 3000;
+const BACKOFF_MAX_MS = 60000;
+const OUTPUT_URL = /^\/api\/v1\/jobs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/output$/;
+
+interface Item { file: File; preset: string; field: { name: string; value: string }; tries: number }
+const pending: Item[] = [];
+let uploading = 0;
+const failures = new Map<string, number>(); // consecutive stream failures per job
+const retryAt = new Map<string, number>(); // earliest time a stream may be reopened
+let globalFails = 0; // consecutive stream failures across all jobs (server-wide trouble, e.g. 503 cap)
+let globalRetryAt = 0;
 
 // All server-provided strings (filenames, errors, encoder names) go through textContent only.
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", cls = ""): HTMLElementTagNameMap[K] {
@@ -126,11 +139,11 @@ function render(job: Job) {
   r.bar.setAttribute("aria-label", `Progress of ${job.filename}`);
   r.enc.textContent = job.encoder_used;
   // Rebuild the action cell only when it changes, so keyboard focus is not lost on every tick.
-  const key = `${terminal}|${job.output_url ?? ""}`;
+  const key = `${terminal}|${job.output_url && OUTPUT_URL.test(job.output_url) ? job.output_url : ""}`;
   if (key !== r.last) {
     r.last = key;
     const kids: (Node | string)[] = [];
-    if (job.output_url) {
+    if (job.output_url && OUTPUT_URL.test(job.output_url)) {
       const a = el("a", "Download", "btn");
       a.href = job.output_url;
       kids.push(a, " ");
@@ -143,7 +156,7 @@ function render(job: Job) {
     r.act.replaceChildren(...kids);
   }
   setEmpty();
-  if (terminal) closeStream(job.id); else subscribe(job.id);
+  if (terminal) { closeStream(job.id); failures.delete(job.id); retryAt.delete(job.id); } else subscribe(job.id);
 }
 
 function closeStream(id: string) {
@@ -153,30 +166,68 @@ function closeStream(id: string) {
 
 function dropRow(id: string) {
   closeStream(id);
+  failures.delete(id);
+  retryAt.delete(id);
   rows.get(id)?.tr.remove();
   rows.delete(id);
   setEmpty();
 }
 
 function subscribe(id: string) {
-  if (streams.has(id)) return;
+  if (streams.has(id) || streams.size >= MAX_STREAMS) return; // over the cap: the shared poll covers it
+  if (Math.max(globalRetryAt, retryAt.get(id) ?? 0) > Date.now()) return; // backing off: the shared poll covers it
   const es = new EventSource(`/api/v1/jobs/${id}/events`);
   streams.set(id, es);
   es.onmessage = (ev) => {
     let j: Job;
     try { j = JSON.parse(ev.data); } catch { return; }
+    failures.delete(id);
+    retryAt.delete(id);
+    globalFails = 0;
     const was = rows.get(id)?.status.textContent;
     render(j);
     if (TERMINAL.includes(j.status) && was !== rows.get(id)?.status.textContent) {
       announce(`${j.filename}: ${j.status}${j.error ? ` – ${j.error}` : ""}`);
     }
   };
-  // The stream ended or dropped (server restart, max stream lifetime, 503 busy). Re-sync from the
-  // job resource, then resubscribe if it is still active; a 404 means it was removed meanwhile.
+  // The stream ended or failed (server restart, max stream lifetime, 503 busy). Close it so the
+  // browser does not auto-reconnect, back off exponentially with jitter, and let the shared poll
+  // keep the row fresh until the backoff expires.
   es.onerror = () => {
     closeStream(id);
-    setTimeout(() => { void resync(id); }, 3000);
+    const n = (failures.get(id) ?? 0) + 1;
+    failures.set(id, n);
+    retryAt.set(id, Date.now() + backoffMs(n));
+    globalFails++;
+    globalRetryAt = Date.now() + backoffMs(globalFails);
   };
+}
+
+function backoffMs(n: number): number {
+  const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (n - 1));
+  return base * (0.5 + Math.random() * 0.5);
+}
+
+let polling = false;
+// One shared poll serves every active job that has no open stream (cap reached, backing off, or
+// the stream failed). It also reopens streams when their backoff has expired and detects jobs
+// removed meanwhile (404).
+async function poll() {
+  if (polling) return;
+  const active = [...rows.entries()].filter(([id, r]) => r.last !== "" && !streams.has(id) && !r.last.startsWith("true|"));
+  if (active.length === 0) return;
+  polling = true;
+  try {
+    const res = await fetch("/api/v1/jobs");
+    if (res.ok) {
+      const byId = new Map((await res.json() as Job[]).map(j => [j.id, j]));
+      for (const [id] of active) {
+        const j = byId.get(id);
+        if (j) render(j); // render() reopens a stream when allowed
+        else await resync(id); // not in the (bounded) list: ask for it directly
+      }
+    }
+  } catch { /* network down: next tick */ } finally { polling = false; }
 }
 
 async function resync(id: string) {
@@ -184,9 +235,8 @@ async function resync(id: string) {
   try {
     const res = await fetch(`/api/v1/jobs/${id}`);
     if (res.status === 404) { dropRow(id); announce("A job was removed."); return; }
-    if (res.ok) { render(await res.json()); return; }
-  } catch { /* network down: retry below */ }
-  setTimeout(() => { void resync(id); }, 5000);
+    if (res.ok) render(await res.json());
+  } catch { /* retry on the next poll */ }
 }
 
 async function remove(id: string) {
@@ -199,10 +249,6 @@ async function remove(id: string) {
 }
 
 // ---- upload queue ----
-interface Item { file: File; preset: string; field: { name: string; value: string }; tries: number }
-const pending: Item[] = [];
-let uploading = 0;
-
 function enqueue(files: File[]) {
   showError("");
   const preset = $<HTMLSelectElement>("preset").value;
@@ -246,6 +292,11 @@ function send(item: Item): Promise<void> {
     fd.append("file", file); // the filename is display-only on the server
 
     const xhr = new XMLHttpRequest();
+    const cancel = el("button", "Cancel");
+    cancel.type = "button";
+    cancel.setAttribute("aria-label", `Cancel upload of ${file.name}`);
+    cancel.onclick = () => { item.tries = MAX_UPLOAD_RETRIES + 1; xhr.abort(); };
+    r.act.append(cancel);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable && e.total > 0) r.bar.value = (e.loaded / e.total) * 100; };
     xhr.onload = () => {
       if (xhr.status === 202) {
@@ -260,7 +311,7 @@ function send(item: Item): Promise<void> {
       } else fail(problemText(xhr.status, xhr.responseText));
     };
     xhr.onerror = () => fail("network error");
-    xhr.onabort = () => fail("upload aborted");
+    xhr.onabort = () => { announce(`${file.name}: upload canceled`); done(); };
     xhr.open("POST", "/api/v1/jobs");
     xhr.send(fd);
   });
@@ -314,5 +365,6 @@ async function init() {
   await loadPresets();
   setInterval(() => { void loadPresets(); }, 30000);
   await loadJobs();
+  setInterval(() => { void poll(); }, POLL_MS);
 }
 init().catch((e) => showError(String(e)));
