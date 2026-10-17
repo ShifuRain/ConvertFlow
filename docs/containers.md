@@ -22,7 +22,11 @@ The worker and database sit on an internal network with no egress.
 
 ## Notes and limits
 
-- Only **rootless podman 6.x** (with the docker-compose provider) has been verified. The Docker engine is NOT verified.
+- Verified: **rootless podman 6.1** locally and **podman 4.9** (ubuntu-24.04 CI runner), both with the docker-compose provider. The Docker engine is NOT verified.
+- **podman 4.x does not apply the compose `ulimits`** (`core: 0` and `nofile` are absent from the container's `HostConfig.Ulimits`), so
+  on podman 4 the core-dump hard limit stays at the host default (observed: soft 0, hard unlimited). `tests/container/hardening.sh`
+  keeps asserting the setting in the compose model everywhere, asserts RLIMIT_CORE 0/0 at runtime on podman 5+ and docker, and on
+  podman <5 only asserts that the effective soft limit is 0 (the check name says so). Use podman 5+ if the hard limit matters to you.
 - Pinned base-image digests go stale. Run `scripts/pin-digests.sh` before each release; `scripts/check-pinned-digests.sh --online` (weekly workflow, strict on release) detects drift. See docs/supply-chain.md.
 - `scripts/smoke.sh` and `tests/container/hardening.sh` use their own compose projects (`convertflow-smoke`,
   `convertflow-hardening`) and host ports (18080 / 18081); they refuse `down -v` for any other project and never touch a
