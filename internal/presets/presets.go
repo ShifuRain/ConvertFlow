@@ -38,7 +38,28 @@ var all = []Preset{
 	{ID: "audio-aac", Label: "Audio – AAC (M4A)", Kind: KindAudio, Container: "ipod", Ext: "m4a", Candidates: []Candidate{{"", "aac"}}},
 }
 
+// lgplSafe encoders are royalty-free and allowed in the LGPL flavor.
+// This is an explicit allow-list (fail-closed) to protect against future patent-encumbered encoders.
+var lgplSafe = map[string]bool{
+	// AV1 encoders (all royalty-free)
+	"av1_nvenc":  true,
+	"av1_qsv":    true,
+	"av1_vaapi":  true,
+	"libsvtav1":  true,
+	"libaom-av1": true,
+	// VP9 encoders (royalty-free)
+	"libvpx-vp9": true,
+	"libvpx":     true,
+	// Audio encoders (royalty-free)
+	"libopus":    true,
+	"libvorbis":  true,
+	"flac":       true,
+	"libmp3lame": true,
+	"pcm_s16le":  true,
+}
+
 // fullOnly encoders are withheld in the royalty-free (lgpl) flavor for patent reasons.
+// These are NOT in lgplSafe (the allow-list).
 var fullOnly = map[string]bool{"libx264": true, "libx265": true, "aac": true}
 
 func All() []Preset { return append([]Preset(nil), all...) }
@@ -88,9 +109,13 @@ func AllEncoders() []string {
 	return out
 }
 
+// FlavorAllows returns whether the given encoder is allowed in the specified flavor.
+// For "full" flavor, all encoders are allowed.
+// For "lgpl" or any unknown flavor, only encoders in the explicit allow-list (lgplSafe) are allowed (fail-closed).
 func FlavorAllows(flavor, encoder string) bool {
 	if flavor == "full" {
 		return true
 	}
-	return !fullOnly[encoder]
+	// For lgpl or any unknown flavor, use the allow-list (fail-closed)
+	return lgplSafe[encoder]
 }

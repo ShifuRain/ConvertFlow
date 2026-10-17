@@ -75,3 +75,49 @@ func TestUniqueIDsAndEncoders(t *testing.T) {
 		t.Fatalf("AllEncoders incomplete: %v", all)
 	}
 }
+
+func TestFlavorAllowsFailsClosed(t *testing.T) {
+	// Test that patent-encumbered and unknown encoders are denied in lgpl and unknown flavors
+	deniedEncoders := []string{"h264_nvenc", "hevc_nvenc", "libx264", "libx265", "aac", "libfoo"}
+	for _, e := range deniedEncoders {
+		if presets.FlavorAllows("lgpl", e) {
+			t.Errorf("%s should be denied in lgpl flavor", e)
+		}
+		if presets.FlavorAllows("LGPL", e) {
+			t.Errorf("%s should be denied in unknown flavor LGPL", e)
+		}
+		if presets.FlavorAllows("", e) {
+			t.Errorf("%s should be denied in empty flavor", e)
+		}
+	}
+	// Full flavor allows all encoders
+	for _, e := range deniedEncoders {
+		if !presets.FlavorAllows("full", e) {
+			t.Errorf("%s should be allowed in full flavor", e)
+		}
+	}
+}
+
+func TestAllEncodersClassified(t *testing.T) {
+	// Every encoder in AllEncoders() must be either allowed under lgpl or in fullOnly
+	lgplAllowed := set()
+	for _, e := range presets.AllEncoders() {
+		// Encoder is allowed in lgpl if FlavorAllows returns true
+		if presets.FlavorAllows("lgpl", e) {
+			lgplAllowed[e] = true
+		}
+	}
+	// Check that all encoders are either allowed in lgpl or explicitly in fullOnly
+	for _, p := range presets.All() {
+		for _, c := range p.Candidates {
+			for _, e := range []string{c.Video, c.Audio} {
+				if e == "" {
+					continue
+				}
+				if !presets.FlavorAllows("lgpl", e) && !presets.FlavorAllows("full", e) {
+					t.Errorf("encoder %s is unclassified", e)
+				}
+			}
+		}
+	}
+}
