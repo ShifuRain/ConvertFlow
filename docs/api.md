@@ -106,7 +106,7 @@ curl -s -X DELETE $BASE/api/v1/jobs/$ID -w '%{http_code}\n'
 ```
 
 - Queued, done, failed or canceled job: removed together with its files, `204`.
-- Job being probed or encoded: cancellation is requested, `202` with `{"id":"...","status":"canceling"}`. The worker stops FFmpeg and marks the job `canceled`; delete it again to remove the record. If it finished in the meantime, `409` and you delete it again.
+- Job being probed or encoded (`probing`/`running`): **the first `DELETE` only cancels** - it requests cancellation and answers `202` with `{"id":"...","status":"canceling"}`; nothing is deleted yet. The worker stops FFmpeg, removes its partial output and its input file, and marks the job `canceled` (the files are gone once the job reaches that terminal state). Send a **second `DELETE`** after that to remove the job record (and any file that is still there, `204`). If the worker is gone, the janitor turns the job into `canceled` after `CONVERTFLOW_STALE_AFTER`. If it finished in the meantime, `409` and you delete it again.
 - Unknown id: `404`.
 
 ## Errors (RFC 9457)

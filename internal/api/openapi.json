@@ -147,7 +147,7 @@
       "delete": {
         "operationId": "deleteJob",
         "summary": "Delete an idle job and its files, or request cancellation of an active one",
-        "description": "Queued and finished jobs are deleted together with their input and output files (204). A probing or running job is asked to stop (202); once it reports `canceled`, delete it again.",
+        "description": "Queued and finished jobs are deleted together with their input and output files (204). A probing or running job is only asked to stop (202): nothing is deleted by that first request; its files are removed when it reaches a terminal state, and a second DELETE removes the record.",
         "parameters": [
           {
             "$ref": "#/components/parameters/JobId"
