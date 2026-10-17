@@ -8,13 +8,28 @@ parse, `scripts/check-pinned-digests.sh`). They have **not run on GitHub yet**; 
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | push to main, PRs, manual | `test` (gofmt, `go vet`, `go test -race` with a Postgres service, UI build + `tsc --noEmit`), `security` (govulncheck, gosec, licence policy), `pinning` (pinning policy, `.trivyignore` policy, actionlint), `images` (api + worker **lgpl** build with buildx GHA cache, Trivy), `hardening` (`tests/container/hardening.sh` + `--self-test`), `image-full` (FULL/GPL worker, **manual dispatch only**) |
-| `release.yml` | tags `v*` only | gates, build + push to GHCR, cosign keyless signing, Trivy, SBOMs, THIRD-PARTY-LICENSES, SHA256SUMS, air-gap bundle, **draft** release |
+| `ci.yml` | push to main, PRs, manual | `test` (gofmt, `go vet`, `go test -race` with a Postgres service, UI build + `tsc --noEmit`), `security` (govulncheck, gosec, licence policy), `pinning` (pinning policy, `.trivyignore` policy, actionlint), `images` (api + worker **lgpl** build with buildx GHA cache, Trivy), `hardening` (`tests/container/hardening.sh` + `--self-test`), `image-full` (FULL/GPL worker, **manual dispatch only**). `build-images` uploads the image archives first; `trivy` and `hardening` both depend on it, so hardening does not depend on the scan result |
+| `release.yml` | tags `v*` only | `build-and-gate` (read-only token): CI-status gate, pinning/security gates, local image archives, Trivy, SBOMs, THIRD-PARTY-LICENSES, air-gap bundle, checksums. `publish` (environment `release`): verify checksums, push, cosign keyless signing, **draft** release |
 | `digests.yml` | weekly + manual | `scripts/check-pinned-digests.sh --online` |
 
 All third-party actions are pinned to full commit SHAs (tag in a comment). Top-level `permissions: contents: read`;
 only the release job elevates (`contents`, `packages`, `id-token`: write). No `pull_request_target`, no secret is echoed,
 CI runs are cancelled when superseded. Tool versions live in `scripts/tool-versions.env` (nothing is `@latest`).
+
+## Release privilege split
+
+* `build-and-gate` has `contents: read` (+ `actions: read` to query the CI result) and is the only job that runs npm,
+  Go tools, buildx, Trivy or Syft. It pushes and signs **nothing**: a red Trivy gate leaves nothing in GHCR.
+  It requires, fail-closed (`scripts/check-ci-status.sh`, unit-tested with canned JSON), that the `ci.yml` run for the
+  exact tagged commit completed with success; the tag must be semver and reachable from `main`.
+* `publish` runs no npm/go install steps. It first verifies the artifacts: the hash of `SHA256SUMS.inputs` arrives as a
+  job *output* (not via the artifact store), every file is checked against it and no extra files may exist. Then it pushes
+  the already-scanned archives, signs by digest, signs the checksum/SBOM/bundle files and creates the draft.
+* **Owner action required:** create the GitHub environment `release` (Settings, Environments) and add required reviewers
+  (and restrict it to tags `v*`). The workflow lints and parses without the environment existing, but without reviewers
+  the publish job is not gated by a human. A draft release must still be published by hand.
+* `npm ci --ignore-scripts` is used everywhere (Makefile, Dockerfile.api); `make ui` was verified to work without
+  esbuild's postinstall (the platform binary comes from its optional dependency).
 
 ## Policies
 
