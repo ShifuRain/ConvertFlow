@@ -94,35 +94,51 @@ func (s *Store) exec(ctx context.Context, q string, args ...any) error {
 	return err
 }
 
+// guarded runs a transition and returns ErrNotFound when no row matched, i.e. the job
+// is gone or no longer in a state that allows it (for workers: the lease was lost).
+func (s *Store) guarded(ctx context.Context, q string, args ...any) error {
+	tag, err := s.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) SetProbe(ctx context.Context, id string, probe []byte) error {
-	return s.exec(ctx, `UPDATE jobs SET probe = $2, updated_at = now() WHERE id = $1::uuid`, id, probe)
+	return s.guarded(ctx, `UPDATE jobs SET probe = $2, updated_at = now() WHERE id = $1::uuid AND status = 'probing'`, id, probe)
 }
 
 func (s *Store) SetRunning(ctx context.Context, id, encoder string) error {
-	return s.exec(ctx, `UPDATE jobs SET status = 'running', encoder_used = $2, updated_at = now() WHERE id = $1::uuid`, id, encoder)
+	return s.guarded(ctx, `UPDATE jobs SET status = 'running', encoder_used = $2, updated_at = now() WHERE id = $1::uuid AND status = 'probing'`, id, encoder)
 }
 
 func (s *Store) UpdateProgress(ctx context.Context, id string, pct float64) error {
-	return s.exec(ctx, `UPDATE jobs SET progress = $2, updated_at = now() WHERE id = $1::uuid AND status = 'running'`, id, pct)
+	return s.guarded(ctx, `UPDATE jobs SET progress = $2, updated_at = now() WHERE id = $1::uuid AND status = 'running'`, id, pct)
 }
 
 // Heartbeat refreshes the liveness timestamp and reports whether cancellation was requested.
 func (s *Store) Heartbeat(ctx context.Context, id string) (bool, error) {
 	var c bool
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET heartbeat_at = now() WHERE id = $1::uuid RETURNING cancel_requested`, id).Scan(&c)
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET heartbeat_at = now() WHERE id = $1::uuid AND status IN ('probing','running') RETURNING cancel_requested`, id).Scan(&c)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
 	return c, err
 }
 
 func (s *Store) Complete(ctx context.Context, id, outputPath string) error {
-	return s.exec(ctx, `UPDATE jobs SET status = 'done', progress = 100, output_path = $2, finished_at = now(), updated_at = now() WHERE id = $1::uuid`, id, outputPath)
+	return s.guarded(ctx, `UPDATE jobs SET status = 'done', progress = 100, output_path = $2, finished_at = now(), updated_at = now() WHERE id = $1::uuid AND status = 'running'`, id, outputPath)
 }
 
 func (s *Store) Fail(ctx context.Context, id, msg string) error {
-	return s.exec(ctx, `UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now() WHERE id = $1::uuid`, id, msg)
+	return s.guarded(ctx, `UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now() WHERE id = $1::uuid AND status IN ('probing','running')`, id, msg)
 }
 
 func (s *Store) MarkCanceled(ctx context.Context, id string) error {
-	return s.exec(ctx, `UPDATE jobs SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id = $1::uuid`, id)
+	return s.guarded(ctx, `UPDATE jobs SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id = $1::uuid AND status IN ('queued','probing','running')`, id)
 }
 
 // RequestCancel cancels a queued job immediately and flags an active one for its worker.
@@ -147,14 +163,16 @@ func (s *Store) Delete(ctx context.Context, id string) (*Job, error) {
 	return j, err
 }
 
+// RequeueStale handles jobs whose worker stopped heartbeating. Stale jobs with a pending
+// cancel request become canceled; they are counted in neither requeued nor failed.
 func (s *Store) RequeueStale(ctx context.Context, staleAfter time.Duration, maxAttempts int) (int, int, error) {
 	var requeued, failed int
 	err := s.pool.QueryRow(ctx, `
 WITH s AS (
   UPDATE jobs SET
-    status = CASE WHEN attempts < $2 THEN 'queued' ELSE 'failed' END,
-    error = CASE WHEN attempts < $2 THEN error ELSE 'worker lost; attempts exhausted' END,
-    finished_at = CASE WHEN attempts < $2 THEN NULL ELSE now() END,
+    status = CASE WHEN cancel_requested THEN 'canceled' WHEN attempts < $2 THEN 'queued' ELSE 'failed' END,
+    error = CASE WHEN cancel_requested OR attempts < $2 THEN error ELSE 'worker lost; attempts exhausted' END,
+    finished_at = CASE WHEN cancel_requested OR attempts >= $2 THEN now() ELSE NULL END,
     progress = 0, worker_id = '', updated_at = now()
   WHERE status IN ('probing','running') AND heartbeat_at < now() - make_interval(secs => $1)
   RETURNING status)

@@ -2,6 +2,7 @@ package jobs_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -28,7 +29,7 @@ func TestCreateGetRoundTrip(t *testing.T) {
 	if err != nil || got.Status != jobs.StatusQueued || got.Options.Preset != "audio-wav" || got.Filename != "a.mp4" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
-	if _, err := s.Get(ctx, uuid.NewString()); err != jobs.ErrNotFound {
+	if _, err := s.Get(ctx, uuid.NewString()); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -123,8 +124,15 @@ func TestCompleteAndFail(t *testing.T) {
 	a, b := newJob(), newJob()
 	_ = s.Create(ctx, a)
 	_ = s.Create(ctx, b)
-	_ = s.Complete(ctx, a.ID, "/data/out/x.wav")
-	_ = s.Fail(ctx, b.ID, "boom")
+	_, _ = s.Claim(ctx, "w") // a
+	_, _ = s.Claim(ctx, "w") // b
+	_ = s.SetRunning(ctx, a.ID, "pcm_s16le")
+	if err := s.Complete(ctx, a.ID, "/data/out/x.wav"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Fail(ctx, b.ID, "boom"); err != nil {
+		t.Fatal(err)
+	}
 	ga, _ := s.Get(ctx, a.ID)
 	gb, _ := s.Get(ctx, b.ID)
 	if ga.Status != jobs.StatusDone || ga.Progress != 100 || ga.OutputPath != "/data/out/x.wav" {
@@ -165,14 +173,14 @@ func TestDeleteSemantics(t *testing.T) {
 	_ = s.Create(ctx, idle)
 	_ = s.Create(ctx, busy)
 	_, _ = s.Claim(ctx, "w") // claims `idle` (older)
-	if _, err := s.Delete(ctx, idle.ID); err != jobs.ErrBusy {
+	if _, err := s.Delete(ctx, idle.ID); !errors.Is(err, jobs.ErrBusy) {
 		t.Fatalf("want ErrBusy, got %v", err)
 	}
 	d, err := s.Delete(ctx, busy.ID) // still queued
 	if err != nil || d.ID != busy.ID {
 		t.Fatalf("got %v %v", d, err)
 	}
-	if _, err := s.Delete(ctx, uuid.NewString()); err != jobs.ErrNotFound {
+	if _, err := s.Delete(ctx, uuid.NewString()); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -184,6 +192,8 @@ func TestExpiredAndExists(t *testing.T) {
 	old, fresh := newJob(), newJob()
 	_ = s.Create(ctx, old)
 	_ = s.Create(ctx, fresh)
+	_, _ = s.Claim(ctx, "w")
+	_, _ = s.Claim(ctx, "w")
 	_ = s.Fail(ctx, old.ID, "x")
 	_ = s.Fail(ctx, fresh.ID, "x")
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET finished_at = now() - interval '2 days' WHERE id = $1::uuid`, old.ID)
@@ -222,5 +232,93 @@ func TestCounts(t *testing.T) {
 	c, err := s.Counts(ctx)
 	if err != nil || c["queued"] != 1 {
 		t.Fatalf("got %v %v", c, err)
+	}
+}
+
+func TestZombieWritesAfterRequeue(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	_, _ = s.Claim(ctx, "w")
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
+	if r, _, err := s.RequeueStale(ctx, time.Minute, 3); err != nil || r != 1 {
+		t.Fatalf("requeue %d %v", r, err)
+	}
+	checks := map[string]error{
+		"SetProbe":       s.SetProbe(ctx, j.ID, []byte(`{}`)),
+		"SetRunning":     s.SetRunning(ctx, j.ID, "x"),
+		"UpdateProgress": s.UpdateProgress(ctx, j.ID, 5),
+		"Complete":       s.Complete(ctx, j.ID, "/o"),
+		"Fail":           s.Fail(ctx, j.ID, "x"),
+	}
+	_, hbErr := s.Heartbeat(ctx, j.ID)
+	checks["Heartbeat"] = hbErr
+	for name, err := range checks {
+		if !errors.Is(err, jobs.ErrNotFound) {
+			t.Errorf("%s: want ErrNotFound, got %v", name, err)
+		}
+	}
+}
+
+func TestZombieLeavesJobQueued(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	_, _ = s.Claim(ctx, "w")
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
+	_, _, _ = s.RequeueStale(ctx, time.Minute, 3)
+	_ = s.SetRunning(ctx, j.ID, "x")
+	_ = s.Complete(ctx, j.ID, "/o")
+	_ = s.Fail(ctx, j.ID, "x")
+	got, _ := s.Get(ctx, j.ID)
+	if got.Status != jobs.StatusQueued || got.OutputPath != "" {
+		t.Fatalf("job mutated by zombie: %+v", got)
+	}
+}
+
+func TestMarkCanceledOnDoneIsNotFound(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	_, _ = s.Claim(ctx, "w")
+	_ = s.SetRunning(ctx, j.ID, "x")
+	_ = s.Complete(ctx, j.ID, "/o")
+	if err := s.MarkCanceled(ctx, j.ID); !errors.Is(err, jobs.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	got, _ := s.Get(ctx, j.ID)
+	if got.Status != jobs.StatusDone {
+		t.Fatalf("status %s", got.Status)
+	}
+}
+
+func TestHeartbeatMissingRow(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	if _, err := s.Heartbeat(context.Background(), uuid.NewString()); !errors.Is(err, jobs.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestRequeueStaleCancelRequestedGoesCanceled(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	_, _ = s.Claim(ctx, "w")
+	_ = s.RequestCancel(ctx, j.ID)
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
+	requeued, failed, err := s.RequeueStale(ctx, time.Minute, 3)
+	if err != nil || requeued != 0 || failed != 0 {
+		t.Fatalf("got %d,%d,%v", requeued, failed, err)
+	}
+	got, _ := s.Get(ctx, j.ID)
+	if got.Status != jobs.StatusCanceled || got.FinishedAt == nil {
+		t.Fatalf("bad %+v", got)
 	}
 }
