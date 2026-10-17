@@ -1,0 +1,226 @@
+package jobs_test
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ShifuRain/convertflow/internal/db/dbtest"
+	"github.com/ShifuRain/convertflow/internal/jobs"
+	"github.com/google/uuid"
+)
+
+func newJob() *jobs.Job {
+	id := uuid.NewString()
+	return &jobs.Job{ID: id, Filename: "a.mp4", InputPath: "/data/in/" + id, Options: jobs.Options{Preset: "audio-wav"}}
+}
+
+func TestCreateGetRoundTrip(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	j := newJob()
+	if err := s.Create(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, j.ID)
+	if err != nil || got.Status != jobs.StatusQueued || got.Options.Preset != "audio-wav" || got.Filename != "a.mp4" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	if _, err := s.Get(ctx, uuid.NewString()); err != jobs.ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestClaimIsExclusive(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if err := s.Create(ctx, newJob()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	claimed := map[string]int{}
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			j, err := s.Claim(ctx, fmt.Sprintf("w%d", i))
+			if err != nil {
+				t.Errorf("claim: %v", err)
+				return
+			}
+			if j != nil {
+				mu.Lock()
+				claimed[j.ID]++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if len(claimed) != 3 {
+		t.Fatalf("want 3 distinct claims, got %v", claimed)
+	}
+	for id, n := range claimed {
+		if n != 1 {
+			t.Fatalf("job %s claimed %d times", id, n)
+		}
+	}
+}
+
+func TestClaimEmptyQueue(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	j, err := s.Claim(context.Background(), "w")
+	if j != nil || err != nil {
+		t.Fatalf("want nil,nil got %v,%v", j, err)
+	}
+}
+
+func TestLifecycleAndCancel(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	c, _ := s.Claim(ctx, "w1")
+	if c.Status != jobs.StatusProbing || c.Attempts != 1 || c.WorkerID != "w1" {
+		t.Fatalf("bad claim %+v", c)
+	}
+	_ = s.SetRunning(ctx, j.ID, "libsvtav1")
+	_ = s.UpdateProgress(ctx, j.ID, 42.5)
+	cancel, err := s.Heartbeat(ctx, j.ID)
+	if err != nil || cancel {
+		t.Fatalf("heartbeat %v %v", cancel, err)
+	}
+	_ = s.RequestCancel(ctx, j.ID)
+	if cancel, _ = s.Heartbeat(ctx, j.ID); !cancel {
+		t.Fatal("cancel flag not visible to heartbeat")
+	}
+	_ = s.MarkCanceled(ctx, j.ID)
+	got, _ := s.Get(ctx, j.ID)
+	if got.Status != jobs.StatusCanceled || got.FinishedAt == nil || got.EncoderUsed != "libsvtav1" {
+		t.Fatalf("bad final %+v", got)
+	}
+}
+
+func TestRequestCancelQueuedCancelsImmediately(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	_ = s.RequestCancel(ctx, j.ID)
+	got, _ := s.Get(ctx, j.ID)
+	if got.Status != jobs.StatusCanceled {
+		t.Fatalf("want canceled, got %s", got.Status)
+	}
+}
+
+func TestCompleteAndFail(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	a, b := newJob(), newJob()
+	_ = s.Create(ctx, a)
+	_ = s.Create(ctx, b)
+	_ = s.Complete(ctx, a.ID, "/data/out/x.wav")
+	_ = s.Fail(ctx, b.ID, "boom")
+	ga, _ := s.Get(ctx, a.ID)
+	gb, _ := s.Get(ctx, b.ID)
+	if ga.Status != jobs.StatusDone || ga.Progress != 100 || ga.OutputPath != "/data/out/x.wav" {
+		t.Fatalf("bad done %+v", ga)
+	}
+	if gb.Status != jobs.StatusFailed || gb.Error != "boom" {
+		t.Fatalf("bad failed %+v", gb)
+	}
+}
+
+func TestRequeueStale(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	a, b := newJob(), newJob()
+	_ = s.Create(ctx, a)
+	_ = s.Create(ctx, b)
+	_, _ = s.Claim(ctx, "w") // a: attempts=1
+	_, _ = s.Claim(ctx, "w") // b: attempts=1
+	// b has exhausted attempts
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET attempts = 3 WHERE id = $1::uuid`, b.ID)
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
+	requeued, failed, err := s.RequeueStale(ctx, time.Minute, 3)
+	if err != nil || requeued != 1 || failed != 1 {
+		t.Fatalf("got %d,%d,%v", requeued, failed, err)
+	}
+	ga, _ := s.Get(ctx, a.ID)
+	gb, _ := s.Get(ctx, b.ID)
+	if ga.Status != jobs.StatusQueued || gb.Status != jobs.StatusFailed {
+		t.Fatalf("a=%s b=%s", ga.Status, gb.Status)
+	}
+}
+
+func TestDeleteSemantics(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	idle, busy := newJob(), newJob()
+	_ = s.Create(ctx, idle)
+	_ = s.Create(ctx, busy)
+	_, _ = s.Claim(ctx, "w") // claims `idle` (older)
+	if _, err := s.Delete(ctx, idle.ID); err != jobs.ErrBusy {
+		t.Fatalf("want ErrBusy, got %v", err)
+	}
+	d, err := s.Delete(ctx, busy.ID) // still queued
+	if err != nil || d.ID != busy.ID {
+		t.Fatalf("got %v %v", d, err)
+	}
+	if _, err := s.Delete(ctx, uuid.NewString()); err != jobs.ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestExpiredAndExists(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	old, fresh := newJob(), newJob()
+	_ = s.Create(ctx, old)
+	_ = s.Create(ctx, fresh)
+	_ = s.Fail(ctx, old.ID, "x")
+	_ = s.Fail(ctx, fresh.ID, "x")
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET finished_at = now() - interval '2 days' WHERE id = $1::uuid`, old.ID)
+	exp, err := s.Expired(ctx, 24*time.Hour)
+	if err != nil || len(exp) != 1 || exp[0].ID != old.ID {
+		t.Fatalf("got %v %v", exp, err)
+	}
+	if ok, _ := s.Exists(ctx, old.ID); !ok {
+		t.Fatal("should exist")
+	}
+	if ok, _ := s.Exists(ctx, uuid.NewString()); ok {
+		t.Fatal("should not exist")
+	}
+}
+
+func TestWorkersCapabilities(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	_ = s.UpsertWorker(ctx, "w1", []string{"libopus", "pcm_s16le"})
+	_ = s.UpsertWorker(ctx, "w2", []string{"libsvtav1"})
+	_, _ = pool.Exec(ctx, `INSERT INTO workers (id, encoders, seen_at) VALUES ('dead', '{libx264}', now() - interval '1 hour')`)
+	enc, err := s.LiveEncoders(ctx, time.Minute)
+	if err != nil || !enc["libopus"] || !enc["libsvtav1"] || enc["libx264"] {
+		t.Fatalf("got %v %v", enc, err)
+	}
+	if n, _ := s.LiveWorkers(ctx, time.Minute); n != 2 {
+		t.Fatalf("want 2 live workers, got %d", n)
+	}
+}
+
+func TestCounts(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	_ = s.Create(ctx, newJob())
+	c, err := s.Counts(ctx)
+	if err != nil || c["queued"] != 1 {
+		t.Fatalf("got %v %v", c, err)
+	}
+}
