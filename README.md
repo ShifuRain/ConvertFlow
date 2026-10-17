@@ -6,6 +6,10 @@ Self-hosted, air-gap-friendly web app and REST API that transcodes video and aud
 
 ConvertFlow is software, not an ISMS. It cannot be "IT-Grundschutz compliant" or certified; see [docs/grundschutz-mapping.md](docs/grundschutz-mapping.md) for how it supports an operator's own Grundschutz work. **Note:** that mapping covers the classic IT-Grundschutz-Kompendium, Edition 2023, only. The BSI is introducing Grundschutz++ (which it states will replace the Kompendium, with a transition period); this mapping does not cover it. Verify the current status at bsi.bund.de.
 
+## Known deviations
+
+The implementation differs from the design spec in a few accepted ways: no VP8 preset; no MKV output and no MP4 output in the default `lgpl` flavor (MP4 only in `full`); no AVX2/CPU-instruction probing (software encoders are chosen by trial encode); a plain TypeScript UI instead of a framework; the input is deleted right after processing; hardware encoders are inert in the default image; libaom is bundled but no preset uses it. Details: [docs/deviations.md](docs/deviations.md).
+
 ## Verification status
 
 Everything below was run on **rootless podman 6.1.2 with the docker-compose provider on Linux**. The Docker engine, Windows and macOS are **not verified**. The GitHub workflows have not run on GitHub yet ([docs/supply-chain.md](docs/supply-chain.md)).
@@ -92,6 +96,7 @@ Run the tests with `scripts/test-db.sh` (starts a throwaway PostgreSQL container
 - [docs/risk-acceptance-template.md](docs/risk-acceptance-template.md) - risk acceptance template for the missing authentication (German and English)
 - [docs/licensing.md](docs/licensing.md) - licenses, FFmpeg flavors, patent notice, source offer
 - [docs/containers.md](docs/containers.md) and [docs/supply-chain.md](docs/supply-chain.md) - container build, hardening checks, CI and release pipeline
+- [docs/deviations.md](docs/deviations.md) - known, accepted deviations from the design spec (no VP8 preset, no MKV/MP4 output in `lgpl`, no CPU-instruction probing, plain TypeScript UI, input deleted after processing, hardware encoders inert in the default image, libaom bundled but unused)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
 License: Apache-2.0 ([LICENSE](LICENSE)). See [docs/licensing.md](docs/licensing.md) for FFmpeg and third-party components.
