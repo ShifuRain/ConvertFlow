@@ -189,12 +189,15 @@ SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status 
 // ErrNoWorker is the error stored on queued jobs that waited longer than the maximum queue age.
 const ErrNoWorker = "no worker available for this preset"
 
-// ExpireQueued fails queued jobs older than maxAge in one guarded statement (a job claimed in the
+// ExpireQueued fails jobs that have been queued for longer than maxAge in one guarded statement (a job claimed in the
 // meantime is no longer 'queued' and is not touched) and returns their ids and input paths.
+// The age counts from the last transition into 'queued' (create or requeue): both set updated_at and
+// nothing else touches a queued row, so a job requeued after a worker crash gets a fresh window
+// instead of expiring on its original created_at.
 func (s *Store) ExpireQueued(ctx context.Context, maxAge time.Duration) ([]Job, error) {
 	rows, err := s.pool.Query(ctx, `
 UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now()
-WHERE status = 'queued' AND created_at < now() - make_interval(secs => $1)
+WHERE status = 'queued' AND updated_at < now() - make_interval(secs => $1)
 RETURNING id::text, input_path`, maxAge.Seconds(), ErrNoWorker)
 	if err != nil {
 		return nil, err

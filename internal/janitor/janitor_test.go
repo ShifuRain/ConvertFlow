@@ -377,7 +377,7 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 
 func (e *env) backdate(t *testing.T, id string, age time.Duration) {
 	t.Helper()
-	if _, err := e.pool.Exec(context.Background(), `UPDATE jobs SET created_at = now() - make_interval(secs => $2) WHERE id = $1::uuid`, id, age.Seconds()); err != nil {
+	if _, err := e.pool.Exec(context.Background(), `UPDATE jobs SET created_at = now() - make_interval(secs => $2), updated_at = now() - make_interval(secs => $2) WHERE id = $1::uuid`, id, age.Seconds()); err != nil {
 		t.Fatal(err)
 	}
 }

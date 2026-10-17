@@ -407,14 +407,14 @@ func TestExpireQueued(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '3 hours' WHERE id = $1::uuid`, old.ID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '3 hours', updated_at = now() - interval '3 hours' WHERE id = $1::uuid`, old.ID); err != nil {
 		t.Fatal(err)
 	}
 	// An old job that a worker already claimed must not be touched.
 	if err := s.Create(ctx, active); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '4 hours' WHERE id = $1::uuid`, active.ID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '4 hours', updated_at = now() - interval '4 hours' WHERE id = $1::uuid`, active.ID); err != nil {
 		t.Fatal(err)
 	}
 	if j, _ := s.Claim(ctx, "w", []string{"audio-wav"}); j == nil || j.ID != active.ID {
@@ -435,5 +435,43 @@ func TestExpireQueued(t *testing.T) {
 	}
 	if again, _ := s.ExpireQueued(ctx, time.Hour); len(again) != 0 {
 		t.Errorf("second call: %v", again)
+	}
+}
+
+// The queue age counts from the moment a job last became queued: a job that was created long ago
+// but was requeued just now (its worker died) must not be failed as "no worker available".
+func TestExpireQueuedCountsFromLastQueuedTransition(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	requeued, stranded := newJob(), newJob()
+	for _, j := range []*jobs.Job{requeued, stranded} {
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// requeued: created 3h ago, claimed, worker went silent, janitor requeues it now.
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '3 hours', updated_at = now() - interval '3 hours' WHERE id = $1::uuid`, requeued.ID); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := s.Claim(ctx, "w", []string{"audio-wav"}); j == nil || j.ID != requeued.ID {
+		t.Fatalf("setup claim: %v", j)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes' WHERE id = $1::uuid`, requeued.ID); err != nil {
+		t.Fatal(err)
+	}
+	if r, _, err := s.RequeueStale(ctx, time.Minute, 3); err != nil || r != 1 {
+		t.Fatalf("requeue: %d %v", r, err)
+	}
+	// stranded: has been waiting in the queue for 3h.
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '3 hours', updated_at = now() - interval '3 hours' WHERE id = $1::uuid`, stranded.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ExpireQueued(ctx, time.Hour)
+	if err != nil || len(got) != 1 || got[0].ID != stranded.ID {
+		t.Fatalf("ExpireQueued = %+v %v", got, err)
+	}
+	if j, _ := s.Get(ctx, requeued.ID); j.Status != jobs.StatusQueued {
+		t.Errorf("requeued job was expired: %+v", j)
 	}
 }
