@@ -131,15 +131,15 @@ jobs:
           pg=$(grep -oE 'docker\.io/library/postgres:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' compose.yaml | head -n1)
           podman pull -q "$pg" >/dev/null
           scripts/gen-licenses.sh "$RUNNER_TEMP/rel/dist/THIRD-PARTY-LICENSES" "$FLAVOR" \
-            "api=localhost/convertflow-api:$VERSION" "worker=localhost/convertflow-worker:$VERSION-$FLAVOR" "postgres=$pg"
+            "api=docker.io/library/convertflow-api:$VERSION" "worker=docker.io/library/convertflow-worker:$VERSION-$FLAVOR" "postgres=$pg"
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" -C "$RUNNER_TEMP/rel/dist" -cf - THIRD-PARTY-LICENSES \
             | gzip -9n > "$RUNNER_TEMP/rel/dist/THIRD-PARTY-LICENSES.tar.gz"
       - name: Air-gap bundle
         env:
           CONTAINER_RUNTIME: podman
-          API_IMAGE: localhost/convertflow-api:${{ github.ref_name }}
-          WORKER_IMAGE: localhost/convertflow-worker:${{ github.ref_name }}-lgpl
+          API_IMAGE: docker.io/library/convertflow-api:${{ github.ref_name }}
+          WORKER_IMAGE: docker.io/library/convertflow-worker:${{ github.ref_name }}-lgpl
         run: |
           set -euo pipefail
           LICENSES_DIR="$RUNNER_TEMP/rel/dist/THIRD-PARTY-LICENSES" SBOM_DIR="$RUNNER_TEMP/rel/dist/sbom" \
