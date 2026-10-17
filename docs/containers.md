@@ -6,7 +6,7 @@ Images: `convertflow-api` (distroless static, no shell, no ffmpeg) and `convertf
 Workflow (podman or docker; set `CONTAINER_RUNTIME`):
 
     scripts/pin-digests.sh          # outside the air gap, before every release: resolves real digests, review `git diff`
-    scripts/gen-secrets.sh          # once: writes ./secrets (git-ignored, umask 077)
+    scripts/gen-secrets.sh          # once: writes ./secrets (git-ignored, umask 077): bootstrap and application DB passwords + URL
     set -a; . docker/ffmpeg.env; set +a
     FFMPEG_FLAVOR=lgpl podman compose build     # or FFMPEG_FLAVOR=full (GPL + x264/x265, prints a patent/licence notice)
     tests/container/hardening.sh    # static + runtime hardening checks (starts the stack if needed)

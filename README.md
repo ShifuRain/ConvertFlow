@@ -4,7 +4,7 @@ Self-hosted, air-gap-friendly web app and REST API that transcodes video and aud
 
 **There is no authentication.** Anyone who can reach the port can submit, list, download and delete jobs. The default compose file publishes the API on `127.0.0.1` only. Read [docs/security.md](docs/security.md) and [docs/risk-acceptance-template.md](docs/risk-acceptance-template.md) before exposing it to a network.
 
-ConvertFlow is software, not an ISMS. It cannot be "IT-Grundschutz compliant" or certified; see [docs/grundschutz-mapping.md](docs/grundschutz-mapping.md) for how it supports an operator's own Grundschutz work.
+ConvertFlow is software, not an ISMS. It cannot be "IT-Grundschutz compliant" or certified; see [docs/grundschutz-mapping.md](docs/grundschutz-mapping.md) for how it supports an operator's own Grundschutz work. **Note:** that mapping covers the classic IT-Grundschutz-Kompendium, Edition 2023, only. The BSI is introducing Grundschutz++ (which it states will replace the Kompendium, with a transition period); this mapping does not cover it. Verify the current status at bsi.bund.de.
 
 ## Verification status
 
@@ -22,7 +22,7 @@ On a connected machine, obtain the release bundle `convertflow-<version>-lgpl-ai
 tar -xzf convertflow-<version>-lgpl-airgap.tar.gz && cd convertflow-<version>-lgpl
 sha256sum -c SHA256SUMS                       # integrity of the transferred files
 gunzip -c images.tar.gz | podman load         # docker load is UNVERIFIED
-scripts/gen-secrets.sh                        # random DB password into ./secrets (mode 700)
+scripts/gen-secrets.sh                        # random DB passwords + connection URL into ./secrets (mode 700)
 set -a; . docker/ffmpeg.env; set +a
 CONVERTFLOW_VERSION=<version> FFMPEG_FLAVOR=lgpl \
   podman compose -f compose.yaml -f compose.airgap.yaml up -d --no-build

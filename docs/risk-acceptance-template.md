@@ -33,6 +33,13 @@ ConvertFlow has **no identity and access management**. There are no users, no ro
 - CON.10.A1 Authentisierung bei Webanwendungen, CON.10.A2 Zugriffskontrolle bei Webanwendungen, CON.10.A3 Sicheres Session-Management
 - APP.3.1.A1 Authentisierung, APP.3.2.A5 Authentisierung
 
+Further deviations from the default expectations that the same decision should record (details in [grundschutz-mapping.md](grundschutz-mapping.md) and [security.md](security.md)):
+
+- **Database connection without TLS** (`sslmode=disable` in the connection URL) on the internal `backend` network (APP.4.3.A16). Anyone who can read traffic on that network (for example a compromised container attached to it) can read database traffic including the application role's password exchange.
+- **Database roles.** The application (api, worker) connects as `convertflow_app`, a role without superuser, createdb, createrole, replication and bypass-RLS rights that owns only the application database. A **bootstrap superuser** (`convertflow_admin`) still exists inside the `db` container; its password file is mounted into the `db` container only, not into api or worker. Existing data volumes created before this change keep the old setup (the application connecting as a superuser) until the manual migration in [operations.md](operations.md#upgrading-an-existing-deployment-existing-pgdata-volume) has been done: [ORGANISATION: state which applies to this installation].
+- **The `api` container sits on the non-internal `frontend` network** (needed for the published port) and therefore has egress capability, unlike `worker` and `db`.
+- **Browser-originated cross-origin requests** are mitigated, not eliminated; see T2 and section 4.
+
 ## 3. Threat and impact analysis
 
 ### 3.1 What a client can do (exposed capabilities)
@@ -55,12 +62,13 @@ No shell access; no arbitrary FFmpeg arguments (only a preset id and four valida
 | # | Scenario | Confidentiality | Integrity | Availability |
 |---|---|---|---|---|
 | T1 | A user of the segment reads another user's converted file or filename | affected: other users' files and filenames visible within retention (default 24 h) | | |
-| T2 | A user or a malicious web page in a user's browser cancels or deletes other users' jobs, or submits uploads | | affected: loss of in-progress or finished results | affected: forced re-work |
+| T2 | A user cancels or deletes other users' jobs or submits uploads (any client with network access). **Browser variant:** a malicious web page open in an operator's browser sends a cross-origin `POST` (upload) or `DELETE` to `http://127.0.0.1:8080` or the internal host name | | affected: loss of in-progress or finished results | affected: forced re-work |
 | T3 | Queue flooding / resource exhaustion by uploading many large files | | | affected: CPU exhaustion, disk fill, queue full (`503`/`507`) up to the configured caps |
-| T4 | Hostile media file exploits an FFmpeg/codec flaw in the worker | affected: files of the media volume and the database credentials are reachable by code running in the worker | affected | affected |
+| T4 | Hostile media file exploits an FFmpeg/codec flaw in the worker | affected: files of the media volume and the credentials of the unprivileged database role `convertflow_app` are reachable by code running in the worker (no superuser credentials) | affected | affected |
 | T5 | Eavesdropping on the unencrypted HTTP connection | affected if TLS is not used | possible manipulation | |
 | T6 | Lack of accountability: actions cannot be attributed to persons | | | audit shows the TCP peer address only (the proxy address behind a reverse proxy) |
 | T7 | Data remnants after deletion (plain unlink) | affected if the volume is not encrypted | | |
+| T8 | Interception of database traffic on the internal network (`sslmode=disable`), or misuse of the application database role by a compromised api/worker container | affected: job metadata (filenames, options) and the role's password | affected: job rows can be changed by the application role | |
 
 [ORGANISATION: add scenarios specific to your environment and rate likelihood and impact per your risk methodology (e.g. BSI-Standard 200-3).]
 
@@ -76,7 +84,9 @@ Controls **implemented in the product** (with configuration references; defaults
 |---|---|
 | Loopback-only publication by default (`127.0.0.1:8080`); exposure is a deliberate edit of the `ports:` line in `compose.yaml` | `compose.yaml`; verified by `tests/container/hardening.sh` ("published port bound to 127.0.0.1 only") |
 | Internal-only network for worker and database (no egress); worker FFmpeg built with `--disable-network` and run with `-protocol_whitelist file` | `compose.yaml` (`backend: internal: true`), `Dockerfile.worker`, `internal/ffmpeg/args.go` |
-| Hardened containers: non-root, read-only root filesystem, all capabilities dropped, `no-new-privileges`, seccomp, pids/memory/CPU limits, secrets as files | `compose.yaml`, `tests/container/hardening.sh` |
+| Hardened containers: non-root, read-only root filesystem, all capabilities dropped, `no-new-privileges`, seccomp, pids/memory/CPU limits, secrets as files. **Caveat:** the `api` container is also attached to the non-internal `frontend` network, so unlike `worker` and `db` it has egress capability; the api image has no shell and no media decoder | `compose.yaml`, `tests/container/hardening.sh` |
+| Cross-origin protection (T2, browser variant): state-changing requests under `/api/` are refused with `403` before the body is read when `Sec-Fetch-Site` is not `same-origin`/`none`, or (header absent) `Origin` differs from `Host`; audited as `request_rejected`/`cross_origin`. **Residual limits:** clients that send neither header (curl, scripts, malware on a host that can reach the port) are allowed on purpose; a page served from the same host:port is same-origin; the proxy must forward `Host` unchanged; verified with HTTP clients, not in a real browser. This is not access control | `internal/api/middleware.go`; tests `TestCrossOriginTable`, `TestCrossOriginUploadRefusedBeforeAnyWrite`; [operations.md](operations.md#cross-origin-requests-from-browsers) |
+| Least-privilege database role: api and worker use `convertflow_app` (no superuser, createdb, createrole, replication, bypass-RLS); the bootstrap superuser password is available to the `db` container only; connection without TLS on the internal network is an accepted deviation (T8) | `docker/db-init/10-app-role.sh`, `compose.yaml`; `tests/container/hardening.sh` ("application role is NOT a superuser"); [operations.md](operations.md#database-role-and-secrets) |
 | Upload and resource limits: `CONVERTFLOW_MAX_UPLOAD_BYTES` (8 GiB), `CONVERTFLOW_MAX_CONCURRENT_UPLOADS` (4), `CONVERTFLOW_MAX_QUEUED_JOBS` (100), `CONVERTFLOW_MIN_FREE_BYTES`, `CONVERTFLOW_MAX_SSE_STREAMS` (64) | [operations.md](operations.md#configuration-reference) |
 | Media limits: `CONVERTFLOW_MAX_DURATION_SEC`, `CONVERTFLOW_MAX_PIXELS`, `CONVERTFLOW_MAX_STREAMS`, `CONVERTFLOW_MAX_OUTPUT_BYTES`, `CONVERTFLOW_JOB_TIMEOUT` | same |
 | Retention: finished jobs and files deleted after `CONVERTFLOW_RETENTION` (24 h); explicit delete; orphan sweep | [operations.md](operations.md#deletion-storage-and-encryption) |
@@ -100,7 +110,7 @@ Controls the **operator must provide** (the product cannot):
 
 ## 5. Residual risk assessment
 
-With the controls above the remaining risk is that **every party that can reach the service port can read, delete and cancel every job and can consume the capacity of the service**, and that a flaw in media parsing can expose the contents of the media volume (in-retention files) and the database credentials.
+With the controls above the remaining risk is that **every party that can reach the service port can read, delete and cancel every job and can consume the capacity of the service**, and that a flaw in media parsing can expose the contents of the media volume (in-retention files) and the credentials of the application database role.
 
 | Risk | Residual rating |
 |---|---|
@@ -111,6 +121,7 @@ With the controls above the remaining risk is that **every party that can reach 
 | T5 Eavesdropping | [ORGANISATION: ...] |
 | T6 Lack of accountability | [ORGANISATION: ...] |
 | T7 Data remnants | [ORGANISATION: ...] |
+| T8 Database traffic / application database role | [ORGANISATION: ...] |
 
 Overall residual risk: [ORGANISATION: low / medium / high] - [ORGANISATION: justification]
 
@@ -171,6 +182,13 @@ ConvertFlow hat **kein Identitäts- und Berechtigungsmanagement**. Es gibt keine
 - CON.10.A1 Authentisierung bei Webanwendungen, CON.10.A2 Zugriffskontrolle bei Webanwendungen, CON.10.A3 Sicheres Session-Management
 - APP.3.1.A1 Authentisierung, APP.3.2.A5 Authentisierung
 
+Weitere Abweichungen von den üblichen Erwartungen, die dieselbe Entscheidung festhalten sollte (Details in [grundschutz-mapping.md](grundschutz-mapping.md) und [security.md](security.md)):
+
+- **Datenbankverbindung ohne TLS** (`sslmode=disable` in der Verbindungs-URL) im internen Netz `backend` (APP.4.3.A16). Wer den Verkehr in diesem Netz mitlesen kann (z. B. ein kompromittierter Container im Netz), kann den Datenbankverkehr lesen.
+- **Datenbankrollen.** Die Anwendung (api, worker) verbindet sich als `convertflow_app`, eine Rolle ohne Superuser-, createdb-, createrole-, Replikations- und Bypass-RLS-Rechte, die nur die Anwendungsdatenbank besitzt. Ein **Bootstrap-Superuser** (`convertflow_admin`) existiert weiterhin im Container `db`; seine Passwortdatei wird nur in den Container `db` eingebunden, nicht in api oder worker. Datenvolumes, die vor dieser Änderung angelegt wurden, behalten das alte Setup (Anwendung als Superuser) bis zur manuellen Migration gemäß [operations.md](operations.md#upgrading-an-existing-deployment-existing-pgdata-volume): [ORGANISATION: angeben, was für diese Installation gilt].
+- **Der Container `api` hängt im nicht-internen Netz `frontend`** (für den veröffentlichten Port nötig) und hat deshalb im Unterschied zu `worker` und `db` Egress-Fähigkeit.
+- **Browser-initiierte Cross-Origin-Anfragen** werden gemindert, nicht ausgeschlossen; siehe T2 und Abschnitt 4.
+
 ## 3. Bedrohungs- und Auswirkungsanalyse
 
 ### 3.1 Was ein Client tun kann
@@ -193,12 +211,13 @@ Kein Shell-Zugriff; keine beliebigen FFmpeg-Argumente (nur eine Preset-ID und vi
 | Nr. | Szenario | Vertraulichkeit | Integrität | Verfügbarkeit |
 |---|---|---|---|---|
 | T1 | Nutzende des Segments lesen Dateien oder Dateinamen anderer | betroffen: fremde Dateien und Dateinamen innerhalb der Aufbewahrung (Standard 24 h) sichtbar | | |
-| T2 | Nutzende oder eine schädliche Webseite im Browser brechen fremde Aufträge ab/löschen sie oder reichen Uploads ein | | betroffen: Verlust laufender oder fertiger Ergebnisse | betroffen: Mehraufwand |
+| T2 | Nutzende (jeder Client mit Netzzugang) brechen fremde Aufträge ab/löschen sie oder reichen Uploads ein. **Browser-Variante:** eine schädliche Webseite im Browser einer oder eines Betreibenden sendet einen Cross-Origin-`POST` (Upload) oder `DELETE` an `http://127.0.0.1:8080` oder den internen Hostnamen | | betroffen: Verlust laufender oder fertiger Ergebnisse | betroffen: Mehraufwand |
 | T3 | Überlastung durch viele große Uploads | | | betroffen: CPU-Auslastung, Platte voll, Warteschlange voll (`503`/`507`) bis zu den konfigurierten Grenzen |
-| T4 | Schadhafte Mediendatei nutzt eine Schwachstelle in FFmpeg/Codec im Worker | betroffen: Dateien des Medienvolumens und Datenbank-Zugangsdaten für Code im Worker erreichbar | betroffen | betroffen |
+| T4 | Schadhafte Mediendatei nutzt eine Schwachstelle in FFmpeg/Codec im Worker | betroffen: Dateien des Medienvolumens und Zugangsdaten der unprivilegierten Datenbankrolle `convertflow_app` für Code im Worker erreichbar (keine Superuser-Zugangsdaten) | betroffen | betroffen |
 | T5 | Mithören der unverschlüsselten HTTP-Verbindung | betroffen ohne TLS | Manipulation möglich | |
 | T6 | Fehlende Zurechenbarkeit von Aktionen | | | Audit-Log enthält nur die TCP-Peer-Adresse (hinter einem Reverse Proxy: Adresse des Proxys) |
 | T7 | Datenreste nach dem Löschen (einfaches Unlink) | betroffen, wenn das Volume nicht verschlüsselt ist | | |
+| T8 | Mithören des Datenbankverkehrs im internen Netz (`sslmode=disable`) oder Missbrauch der Anwendungs-Datenbankrolle durch einen kompromittierten api-/worker-Container | betroffen: Auftragsmetadaten (Dateinamen, Optionen) und das Rollenpasswort | betroffen: Auftragszeilen können durch die Anwendungsrolle geändert werden | |
 
 [ORGANISATION: umgebungsspezifische Szenarien ergänzen; Eintrittshäufigkeit und Auswirkung nach der eigenen Risikomethodik bewerten (z. B. BSI-Standard 200-3).]
 
@@ -214,7 +233,9 @@ Kein Shell-Zugriff; keine beliebigen FFmpeg-Argumente (nur eine Preset-ID und vi
 |---|---|
 | Standardmäßig nur Loopback (`127.0.0.1:8080`); Freigabe nach außen nur durch bewusste Änderung der Zeile `ports:` in `compose.yaml` | `compose.yaml`; geprüft durch `tests/container/hardening.sh` |
 | Internes Netz für Worker und Datenbank (kein Egress); FFmpeg mit `--disable-network` gebaut und mit `-protocol_whitelist file` gestartet | `compose.yaml`, `Dockerfile.worker`, `internal/ffmpeg/args.go` |
-| Gehärtete Container: Nicht-Root, Root-Dateisystem schreibgeschützt, alle Capabilities entfernt, `no-new-privileges`, seccomp, pids-/Speicher-/CPU-Limits, Secrets als Dateien | `compose.yaml`, `tests/container/hardening.sh` |
+| Gehärtete Container: Nicht-Root, Root-Dateisystem schreibgeschützt, alle Capabilities entfernt, `no-new-privileges`, seccomp, pids-/Speicher-/CPU-Limits, Secrets als Dateien. **Einschränkung:** der Container `api` hängt zusätzlich im nicht-internen Netz `frontend` und hat daher im Unterschied zu `worker` und `db` Egress-Fähigkeit; das api-Image enthält keine Shell und keinen Mediendecoder | `compose.yaml`, `tests/container/hardening.sh` |
+| Cross-Origin-Schutz (T2, Browser-Variante): zustandsändernde Anfragen unter `/api/` werden vor dem Lesen des Bodys mit `403` abgelehnt, wenn `Sec-Fetch-Site` nicht `same-origin`/`none` ist oder (ohne diesen Header) `Origin` von `Host` abweicht; Audit-Ereignis `request_rejected`/`cross_origin`. **Restgrenzen:** Clients ohne beide Header (curl, Skripte, Schadsoftware auf einem Host mit Zugang zum Port) sind absichtlich zugelassen; eine Seite vom selben Host:Port ist Same-Origin; der Proxy muss `Host` unverändert weiterreichen; mit HTTP-Clients geprüft, nicht in einem echten Browser. Das ist keine Zugriffskontrolle | `internal/api/middleware.go`; Tests `TestCrossOriginTable`, `TestCrossOriginUploadRefusedBeforeAnyWrite`; [operations.md](operations.md#cross-origin-requests-from-browsers) |
+| Datenbankrolle mit minimalen Rechten: api und worker nutzen `convertflow_app` (kein Superuser, createdb, createrole, Replikation, Bypass-RLS); das Passwort des Bootstrap-Superusers steht nur dem Container `db` zur Verfügung; die Verbindung ohne TLS im internen Netz ist eine akzeptierte Abweichung (T8) | `docker/db-init/10-app-role.sh`, `compose.yaml`; `tests/container/hardening.sh` („application role is NOT a superuser“); [operations.md](operations.md#database-role-and-secrets) |
 | Upload- und Ressourcenlimits: `CONVERTFLOW_MAX_UPLOAD_BYTES` (8 GiB), `CONVERTFLOW_MAX_CONCURRENT_UPLOADS` (4), `CONVERTFLOW_MAX_QUEUED_JOBS` (100), `CONVERTFLOW_MIN_FREE_BYTES`, `CONVERTFLOW_MAX_SSE_STREAMS` (64) | [operations.md](operations.md#configuration-reference) |
 | Medienlimits: `CONVERTFLOW_MAX_DURATION_SEC`, `CONVERTFLOW_MAX_PIXELS`, `CONVERTFLOW_MAX_STREAMS`, `CONVERTFLOW_MAX_OUTPUT_BYTES`, `CONVERTFLOW_JOB_TIMEOUT` | ebenda |
 | Aufbewahrung: Aufträge und Dateien werden nach `CONVERTFLOW_RETENTION` (24 h) gelöscht; explizites Löschen; Waisendatei-Bereinigung | [operations.md](operations.md#deletion-storage-and-encryption) |
@@ -238,7 +259,7 @@ Kein Shell-Zugriff; keine beliebigen FFmpeg-Argumente (nur eine Preset-ID und vi
 
 ## 5. Restrisikobewertung
 
-Mit den genannten Maßnahmen verbleibt das Risiko, dass **jede Stelle, die den Dienst-Port erreicht, alle Aufträge lesen, löschen und abbrechen sowie Kapazität des Dienstes verbrauchen kann**, und dass eine Schwachstelle beim Parsen von Medien den Inhalt des Medienvolumens (Dateien innerhalb der Aufbewahrung) und die Datenbank-Zugangsdaten offenlegen kann.
+Mit den genannten Maßnahmen verbleibt das Risiko, dass **jede Stelle, die den Dienst-Port erreicht, alle Aufträge lesen, löschen und abbrechen sowie Kapazität des Dienstes verbrauchen kann**, und dass eine Schwachstelle beim Parsen von Medien den Inhalt des Medienvolumens (Dateien innerhalb der Aufbewahrung) und die Zugangsdaten der Anwendungs-Datenbankrolle offenlegen kann.
 
 | Risiko | Restrisiko-Bewertung |
 |---|---|
@@ -249,6 +270,7 @@ Mit den genannten Maßnahmen verbleibt das Risiko, dass **jede Stelle, die den D
 | T5 Mithören | [ORGANISATION: ...] |
 | T6 Fehlende Zurechenbarkeit | [ORGANISATION: ...] |
 | T7 Datenreste | [ORGANISATION: ...] |
+| T8 Datenbankverkehr / Anwendungs-Datenbankrolle | [ORGANISATION: ...] |
 
 Gesamtrestrisiko: [ORGANISATION: gering / mittel / hoch] - [ORGANISATION: Begründung]
 
