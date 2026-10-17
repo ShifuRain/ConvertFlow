@@ -284,6 +284,7 @@ func (s *Server) removeData(id, p string) {
 		slog.Warn("refusing to remove path outside the data dir", "job_id", id)
 		return
 	}
+	// #nosec G703 -- abs was verified above to lie strictly inside the data dir
 	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
 		slog.Error("removing job file failed", "job_id", id, "err", err)
 	}

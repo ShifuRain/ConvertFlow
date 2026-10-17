@@ -30,6 +30,7 @@ func (t *tailBuffer) String() string { return t.buf.String() }
 // Run executes bin with args (no shell), reports progress parsed from `-progress pipe:1`,
 // and returns the tail of stderr. Cancelling ctx kills the process.
 func Run(ctx context.Context, bin string, args []string, dir string, durationSec float64, onProgress func(pct float64)) (string, error) {
+	// #nosec G204 -- bin is the configured ffmpeg path and args come from the allow-list builder; no shell is involved
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir
 	cmd.Env = minimalEnv()

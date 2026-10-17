@@ -131,6 +131,7 @@ func (t tagWriter) Write(p []byte) (int, error) {
 
 // DefaultOpenInput creates a new input file, failing if it already exists.
 func DefaultOpenInput(path string) (io.WriteCloser, error) {
+	// #nosec G304 -- path is server-generated under the data dir (never client-supplied); O_EXCL prevents overwrite
 	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
@@ -139,6 +140,7 @@ func diskFree(dir string) (uint64, error) {
 	if err := syscall.Statfs(dir, &st); err != nil {
 		return 0, err
 	}
+	// #nosec G115 -- Bsize is a positive block size reported by statfs
 	return st.Bavail * uint64(st.Bsize), nil
 }
 

@@ -126,6 +126,7 @@ func healthcheck() int {
 		// #nosec G402 -- loopback health probe against our own listener
 		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
+	// #nosec G704 -- URL is built from our own listen address (loopback probe), never from request input
 	resp, err := client.Get(fmt.Sprintf("%s://%s/healthz", scheme, net.JoinHostPort(host, port)))
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return 1

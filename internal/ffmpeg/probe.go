@@ -158,6 +158,7 @@ func minimalEnv() []string { return []string{"PATH=" + os.Getenv("PATH")} }
 func Probe(ctx context.Context, bin, path, dir string) (*ProbeResult, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// #nosec G204 -- bin is the configured ffprobe path; path is server-generated, passed as "file:"+path with protocol_whitelist=file
 	cmd := exec.CommandContext(ctx, bin, "-v", "error", "-protocol_whitelist", "file",
 		"-print_format", "json",
 		"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height,duration:stream_disposition=attached_pic",
