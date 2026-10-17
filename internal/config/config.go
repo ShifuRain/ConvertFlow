@@ -1,0 +1,102 @@
+// Package config parses ConvertFlow's environment-based configuration.
+package config
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	ListenAddr     string
+	DatabaseURL    string
+	DataDir        string
+	Flavor         string // "lgpl" or "full"
+	TLSCertFile    string
+	TLSKeyFile     string
+	VAAPIDevice    string
+	MaxUploadBytes int64
+	MaxPixels      int64
+	MaxDurationSec float64
+	MaxStreams     int
+	MaxAttempts    int
+	Retention      time.Duration
+	StaleAfter     time.Duration
+	WorkerPoll     time.Duration
+}
+
+func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Config, error) {
+	var firstErr error
+	fail := func(format string, a ...any) {
+		if firstErr == nil {
+			firstErr = fmt.Errorf(format, a...)
+		}
+	}
+	str := func(key, def string) string {
+		if v := getenv(key); v != "" {
+			return v
+		}
+		return def
+	}
+	num := func(key string, def int64) int64 {
+		v := getenv(key)
+		if v == "" {
+			return def
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			fail("%s must be a positive integer, got %q", key, v)
+			return def
+		}
+		return n
+	}
+	dur := func(key string, def time.Duration) time.Duration {
+		v := getenv(key)
+		if v == "" {
+			return def
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			fail("%s must be a positive duration, got %q", key, v)
+			return def
+		}
+		return d
+	}
+
+	c := Config{
+		ListenAddr:     str("CONVERTFLOW_LISTEN", "127.0.0.1:8080"),
+		DataDir:        str("CONVERTFLOW_DATA_DIR", "/data"),
+		Flavor:         str("CONVERTFLOW_FLAVOR", "lgpl"),
+		TLSCertFile:    getenv("CONVERTFLOW_TLS_CERT_FILE"),
+		TLSKeyFile:     getenv("CONVERTFLOW_TLS_KEY_FILE"),
+		VAAPIDevice:    str("CONVERTFLOW_VAAPI_DEVICE", "/dev/dri/renderD128"),
+		MaxUploadBytes: num("CONVERTFLOW_MAX_UPLOAD_BYTES", 8<<30),
+		MaxPixels:      num("CONVERTFLOW_MAX_PIXELS", 8192*4320),
+		MaxDurationSec: float64(num("CONVERTFLOW_MAX_DURATION_SEC", 6*3600)),
+		MaxStreams:     int(num("CONVERTFLOW_MAX_STREAMS", 16)),
+		MaxAttempts:    int(num("CONVERTFLOW_MAX_ATTEMPTS", 3)),
+		Retention:      dur("CONVERTFLOW_RETENTION", 24*time.Hour),
+		StaleAfter:     dur("CONVERTFLOW_STALE_AFTER", 60*time.Second),
+		WorkerPoll:     dur("CONVERTFLOW_WORKER_POLL", 2*time.Second),
+	}
+	if c.Flavor != "lgpl" && c.Flavor != "full" {
+		fail("CONVERTFLOW_FLAVOR must be \"lgpl\" or \"full\", got %q", c.Flavor)
+	}
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		fail("CONVERTFLOW_TLS_CERT_FILE and CONVERTFLOW_TLS_KEY_FILE must be set together")
+	}
+	c.DatabaseURL = getenv("CONVERTFLOW_DATABASE_URL")
+	if f := getenv("CONVERTFLOW_DATABASE_URL_FILE"); f != "" {
+		b, err := readFile(f)
+		if err != nil {
+			fail("reading CONVERTFLOW_DATABASE_URL_FILE: %v", err)
+		} else {
+			c.DatabaseURL = strings.TrimSpace(string(b))
+		}
+	}
+	if c.DatabaseURL == "" {
+		fail("CONVERTFLOW_DATABASE_URL or CONVERTFLOW_DATABASE_URL_FILE is required")
+	}
+	return c, firstErr
+}
