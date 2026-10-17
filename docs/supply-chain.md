@@ -25,6 +25,12 @@ CI runs are cancelled when superseded. Tool versions live in `scripts/tool-versi
 * `publish` runs no npm/go install steps. It first verifies the artifacts: the hash of `SHA256SUMS.inputs` arrives as a
   job *output* (not via the artifact store), every file is checked against it and no extra files may exist. Then it pushes
   the already-scanned archives, signs by digest, signs the checksum/SBOM/bundle files and creates the draft.
+* **Limits of the hash chain:** it protects the hand-off between the jobs against tampering with the artifact store and
+  against time-of-check/time-of-use swaps. It does NOT protect against a compromised `build-and-gate` job: that job produces the
+  artifact, its hash and the scan verdict. The real controls are `--ignore-scripts`, the committed lockfile, a build job that
+  holds no write token, and the human approval on the `release` environment.
+* **If the `release` environment does not exist, GitHub creates it automatically WITHOUT reviewers.** The owner must create
+  it with required reviewers and restrict deployment branches/tags to `v*` tags BEFORE the first tag push.
 * **Owner action required:** create the GitHub environment `release` (Settings, Environments) and add required reviewers
   (and restrict it to tags `v*`). The workflow lints and parses without the environment existing, but without reviewers
   the publish job is not gated by a human. A draft release must still be published by hand.
