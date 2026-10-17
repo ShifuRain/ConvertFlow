@@ -23,7 +23,7 @@ The worker and database sit on an internal network with no egress.
 ## Notes and limits
 
 - Only **rootless podman 6.x** (with the docker-compose provider) has been verified. The Docker engine is NOT verified.
-- Pinned base-image digests go stale. Run `scripts/pin-digests.sh` before each release (CI should check this).
+- Pinned base-image digests go stale. Run `scripts/pin-digests.sh` before each release; `scripts/check-pinned-digests.sh --online` (weekly workflow, strict on release) detects drift. See docs/supply-chain.md.
 - `scripts/smoke.sh` and `tests/container/hardening.sh` use their own compose projects (`convertflow-smoke`,
   `convertflow-hardening`) and host ports (18080 / 18081); they refuse `down -v` for any other project and never touch a
   real `convertflow` deployment. `tests/container/hardening.sh --self-test` proves a weakened config is rejected.
