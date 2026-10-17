@@ -18,6 +18,7 @@ import (
 	"github.com/ShifuRain/convertflow/internal/audit"
 	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/db"
+	"github.com/ShifuRain/convertflow/internal/janitor"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 )
 
@@ -54,6 +55,9 @@ func run() error {
 	}
 	store := jobs.NewStore(pool)
 	al := audit.New(os.Stdout)
+	go (&janitor.Janitor{Store: store, Audit: al, DataDir: cfg.DataDir, Retention: cfg.Retention,
+		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout,
+		Interval: time.Minute}).Run(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
