@@ -1,0 +1,97 @@
+# ConvertFlow stack. Works with docker compose and `podman compose`.
+# Build args for the worker come from the shell:  set -a; . docker/ffmpeg.env; set +a
+# Run scripts/gen-secrets.sh once before `up`. Run scripts/pin-digests.sh before every release.
+name: convertflow
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+  db:
+    <<: *hardening
+    image: docker.io/library/postgres:16-bookworm@sha256:0ea6700a3b4f0ae6ce746519073558aed4d88a79d8d07622a9a644946c7319c4
+    user: "999:999"
+    environment:
+      POSTGRES_USER: convertflow
+      POSTGRES_DB: convertflow
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    tmpfs: ["/tmp", "/run/postgresql:mode=1777"]
+    networks: [backend]
+    pids_limit: 200
+    mem_limit: 1g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U convertflow -d convertflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    <<: *hardening
+    image: convertflow-api:${CONVERTFLOW_VERSION:-dev}
+    build: {context: ., dockerfile: Dockerfile.api}
+    depends_on: {db: {condition: service_healthy}}
+    environment:
+      CONVERTFLOW_LISTEN: "0.0.0.0:8080"
+      CONVERTFLOW_DATABASE_URL_FILE: /run/secrets/database_url
+      CONVERTFLOW_RETENTION: ${CONVERTFLOW_RETENTION:-24h}
+      CONVERTFLOW_MAX_UPLOAD_BYTES: ${CONVERTFLOW_MAX_UPLOAD_BYTES:-8589934592}
+    secrets: [database_url]
+    volumes: ["media:/data"]
+    tmpfs: ["/tmp:size=64m"]
+    ports: ["127.0.0.1:8080:8080"]   # change the host IP deliberately to expose the service
+    networks: [frontend, backend]
+    pids_limit: 200
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "/convertflow-api", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *hardening
+    image: convertflow-worker:${CONVERTFLOW_VERSION:-dev}
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        FFMPEG_FLAVOR: ${FFMPEG_FLAVOR:-lgpl}
+        FFMPEG_VERSION: ${FFMPEG_VERSION:?set via docker/ffmpeg.env}
+        FFMPEG_SHA256: ${FFMPEG_SHA256:?set via docker/ffmpeg.env}
+    depends_on: {db: {condition: service_healthy}}
+    environment:
+      CONVERTFLOW_DATABASE_URL_FILE: /run/secrets/database_url
+      CONVERTFLOW_FLAVOR: ${FFMPEG_FLAVOR:-lgpl}
+    secrets: [database_url]
+    volumes: ["media:/data"]
+    tmpfs: ["/tmp:size=2g,mode=1777"]
+    networks: [backend]            # no egress: backend is internal
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 4.0
+    healthcheck:
+      # liveness only (the worker exits on fatal errors and restart policy replaces it)
+      test: ["CMD-SHELL", "grep -q convertflow-worker /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  frontend: {}
+  backend: {internal: true}
+
+volumes:
+  pgdata: {}
+  media: {}
+
+secrets:
+  db_password: {file: ./secrets/db_password}
+  database_url: {file: ./secrets/database_url}
