@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ConvertFlow API</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top"><h1>ConvertFlow API</h1><nav><a href="index.html">Back</a></nav></header>
+  <main>
+    <section class="panel">
+      <p class="muted">Machine-readable spec: <a href="/api/openapi.json">/api/openapi.json</a></p>
+      <div id="endpoints"></div>
+      <h2>Example</h2>
+      <pre>curl -F preset=audio-flac -F file=@song.wav HOST:8080/api/v1/jobs
+curl HOST:8080/api/v1/jobs/&lt;id&gt;
+curl -OJ HOST:8080/api/v1/jobs/&lt;id&gt;/output</pre>
+      <p class="muted">Send the <code>preset</code> (or <code>options</code> JSON) field before the <code>file</code> field.</p>
+      <p class="muted"><code>DELETE</code> on a job that is still probing or running only cancels it (<code>202</code>); its files are removed when it reaches the canceled state, and a second <code>DELETE</code> removes the record.</p>
+    </section>
+  </main>
+  <script src="docs.js"></script>
+</body>
+</html>

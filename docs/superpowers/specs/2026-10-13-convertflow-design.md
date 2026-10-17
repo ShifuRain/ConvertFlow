@@ -92,7 +92,7 @@ OpenAPI 3.1 served at `/api/openapi.json`, with an offline viewer. Errors use RF
 | `GET /api/v1/jobs`, `GET /api/v1/jobs/{id}` | Status, progress, ffprobe metadata, encoder used, error summary. |
 | `GET /api/v1/jobs/{id}/events` | SSE progress stream. |
 | `GET /api/v1/jobs/{id}/output` | Download result (range requests supported). |
-| `DELETE /api/v1/jobs/{id}` | Cancel and delete files. |
+| `DELETE /api/v1/jobs/{id}` | Idle job (queued, done, failed, canceled): delete record and files (`204`). Probing/running job: the first `DELETE` only requests cancellation (`202`); the files are removed when the job reaches a terminal state, and a second `DELETE` removes the record. |
 | `GET /api/v1/presets` | Presets runnable on the current workers. |
 | `GET /healthz`, `GET /metrics` | Liveness; Prometheus metrics. |
 

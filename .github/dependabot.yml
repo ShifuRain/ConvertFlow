@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+  - package-ecosystem: npm
+    directory: /ui
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+  # Dockerfile.api / Dockerfile.worker base images (digest-pinned FROM lines are updated together with their tag).
+  # Dependabot looks for files named "Dockerfile*" and for compose files in the directory.
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    labels: [dependencies]

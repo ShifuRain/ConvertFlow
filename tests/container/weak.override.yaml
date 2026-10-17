@@ -1,0 +1,7 @@
+# Deliberately weakened config: used only to prove tests/container/hardening.sh fails when hardening regresses.
+#   COMPOSE_FILES="-f tests/container/weak.override.yaml" CONTAINER_RUNTIME=podman tests/container/hardening.sh
+services:
+  worker:
+    cap_drop: !reset []
+    cap_add: [NET_RAW]
+    read_only: false

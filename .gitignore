@@ -1,0 +1,6 @@
+/secrets/
+/bin/
+ui/node_modules/
+internal/ui/dist/*
+!internal/ui/dist/.gitkeep
+/.superpowers/

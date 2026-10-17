@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+FROM docker.io/library/node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS ui
+WORKDIR /src/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY ui/ ./
+RUN mkdir -p /src/internal/ui/dist && npm run build \
+ && test -s /src/internal/ui/dist/main.js && test -s /src/internal/ui/dist/docs.js
+
+FROM docker.io/library/golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=ui /src/internal/ui/dist ./internal/ui/dist
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/convertflow-api ./cmd/convertflow-api \
+ && mkdir -p /out/data/in /out/data/out
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+COPY --from=build /out/convertflow-api /convertflow-api
+COPY --from=build --chown=65532:65532 /out/data /data
+USER 65532:65532
+ENV CONVERTFLOW_DATA_DIR=/data
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 CMD ["/convertflow-api", "healthcheck"]
+ENTRYPOINT ["/convertflow-api"]
