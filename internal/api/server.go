@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
@@ -14,10 +16,12 @@ import (
 )
 
 type Deps struct {
-	Store         *jobs.Store
-	Cfg           config.Config
-	Audit         *audit.Logger
-	EventInterval time.Duration // SSE poll interval; default 1s
+	Store          *jobs.Store
+	Cfg            config.Config
+	Audit          *audit.Logger
+	EventInterval  time.Duration // SSE poll interval; default 1s
+	SSEHeartbeat   time.Duration // idle keepalive comment interval; default 15s
+	SSEMaxLifetime time.Duration // hard cap on one SSE connection; default 10m
 
 	// Test seams; nil selects the production implementation.
 	OpenInput func(path string) (io.WriteCloser, error) // creates the exclusive input file
@@ -29,6 +33,10 @@ type Server struct {
 	cfg   config.Config
 	audit *audit.Logger
 	every time.Duration
+
+	sseSlots     chan struct{}
+	sseHeartbeat time.Duration
+	sseMaxLife   time.Duration
 
 	uploadSlots chan struct{}
 	openInput   func(string) (io.WriteCloser, error)
@@ -44,6 +52,10 @@ func NewHandler(d Deps) http.Handler {
 		slots = 4
 	}
 	s.uploadSlots = make(chan struct{}, slots)
+	sseCap := d.Cfg.MaxSSEStreams
+	if sseCap <= 0 {
+		sseCap = defaultMaxSSEStreams
+	}
 	s.openInput, s.freeBytes = d.OpenInput, d.FreeBytes
 	if s.openInput == nil {
 		s.openInput = DefaultOpenInput
@@ -54,14 +66,100 @@ func NewHandler(d Deps) http.Handler {
 	if s.every <= 0 {
 		s.every = time.Second
 	}
-	mux := http.NewServeMux()
-	s.routes(mux)
-	mux.Handle("/", ui.Handler())
-	return recoverer(securityHeaders(d.Cfg.TLSCertFile != "", noStoreAPI(mux)))
+	s.sseSlots = make(chan struct{}, sseCap)
+	s.sseHeartbeat, s.sseMaxLife = d.SSEHeartbeat, d.SSEMaxLifetime
+	if s.sseHeartbeat <= 0 {
+		s.sseHeartbeat = defaultSSEHeartbeat
+	}
+	if s.sseMaxLife <= 0 {
+		s.sseMaxLife = defaultSSEMaxLifetime
+	}
+	return recoverer(securityHeaders(d.Cfg.TLSCertFile != "", noStoreAPI(s.rootMux())))
 }
 
-func (s *Server) routes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/v1/jobs", s.createJob)
+type route struct {
+	method, pattern string
+	h               http.HandlerFunc
+}
+
+func (s *Server) routeTable() []route {
+	return []route{
+		{"POST", "/api/v1/jobs", s.createJob},
+		{"GET", "/api/v1/jobs", s.listJobs},
+		{"GET", "/api/v1/jobs/{id}", s.getJob},
+		{"DELETE", "/api/v1/jobs/{id}", s.deleteJob},
+		{"GET", "/api/v1/jobs/{id}/events", s.events},
+		{"GET", "/api/v1/jobs/{id}/output", s.output},
+		{"GET", "/api/v1/presets", s.listPresets},
+		{"GET", "/api/openapi.json", s.openapi},
+		{"GET", "/healthz", s.healthz},
+		{"GET", "/metrics", s.metrics},
+	}
+}
+
+// routePatterns lists "METHOD pattern" for every registered route (used to keep the OpenAPI
+// document in sync).
+func routePatterns() []string {
+	var out []string
+	for _, r := range (&Server{}).routeTable() {
+		out = append(out, r.method+" "+r.pattern)
+	}
+	return out
+}
+
+// rootMux serves the API routes and the UI. Everything under /api/ (plus /healthz and /metrics)
+// is routed by apiRouter so that unknown paths and wrong methods answer with problem+json rather
+// than falling through to the static file server.
+func (s *Server) rootMux() http.Handler {
+	routes := http.NewServeMux()
+	methods := map[string]bool{}
+	for _, r := range s.routeTable() {
+		routes.HandleFunc(r.method+" "+r.pattern, r.h)
+		methods[r.method] = true
+		if r.method == "GET" {
+			methods["HEAD"] = true
+		}
+	}
+	probe := make([]string, 0, len(methods))
+	for m := range methods {
+		probe = append(probe, m)
+	}
+	sort.Strings(probe)
+	apiRouter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := routes.Handler(r); pattern != "" {
+			routes.ServeHTTP(w, r)
+			return
+		}
+		var allow []string
+		for _, m := range probe {
+			pr := r.Clone(r.Context())
+			pr.Method = m
+			if _, p := routes.Handler(pr); p != "" {
+				allow = append(allow, m)
+			}
+		}
+		if len(allow) > 0 {
+			w.Header().Set("Allow", strings.Join(allow, ", "))
+			WriteProblem(w, http.StatusMethodNotAllowed, "Method not allowed", "")
+			return
+		}
+		WriteProblem(w, http.StatusNotFound, "Not found", "no such endpoint")
+	})
+	uiH := ui.Handler()
+	mux := http.NewServeMux()
+	mux.Handle("/api", apiRouter)
+	mux.Handle("/api/", apiRouter)
+	mux.Handle("/healthz", apiRouter)
+	mux.Handle("/metrics", apiRouter)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			WriteProblem(w, http.StatusMethodNotAllowed, "Method not allowed", "")
+			return
+		}
+		uiH.ServeHTTP(w, r)
+	})
+	return mux
 }
 
 // jobView is the public representation of a job (never exposes server paths).

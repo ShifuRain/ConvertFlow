@@ -116,3 +116,19 @@ func TestUploadResourceBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestSSEStreamCap(t *testing.T) {
+	base := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}
+	c, err := config.Load(env(base), noFile)
+	if err != nil || c.MaxSSEStreams != 64 {
+		t.Fatalf("default: %+v %v", c, err)
+	}
+	base["CONVERTFLOW_MAX_SSE_STREAMS"] = "5"
+	if c, err = config.Load(env(base), noFile); err != nil || c.MaxSSEStreams != 5 {
+		t.Fatalf("override: %+v %v", c, err)
+	}
+	base["CONVERTFLOW_MAX_SSE_STREAMS"] = "0"
+	if _, err = config.Load(env(base), noFile); err == nil {
+		t.Fatal("0 must be rejected")
+	}
+}

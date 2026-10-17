@@ -32,6 +32,7 @@ type Config struct {
 	MaxConcurrentUploads int   // simultaneous in-flight upload requests; excess get 503
 	MaxQueuedJobs        int   // queued+probing+running jobs; excess uploads get 503
 	MinFreeBytes         int64 // free space required on the data volume; below it uploads get 507
+	MaxSSEStreams        int   // simultaneous progress streams; excess get 503
 }
 
 func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Config, error) {
@@ -92,6 +93,7 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	}
 	c.MaxConcurrentUploads = int(num("CONVERTFLOW_MAX_CONCURRENT_UPLOADS", 4))
 	c.MaxQueuedJobs = int(num("CONVERTFLOW_MAX_QUEUED_JOBS", 100))
+	c.MaxSSEStreams = int(num("CONVERTFLOW_MAX_SSE_STREAMS", 64))
 	// Default: room for one maximum-size upload plus a similarly sized output.
 	c.MinFreeBytes = num("CONVERTFLOW_MIN_FREE_BYTES", 2*c.MaxUploadBytes)
 	if c.Flavor != "lgpl" && c.Flavor != "full" {
