@@ -20,7 +20,7 @@ for spec in "$@"; do
   cid=$("$RT" create "$img" /nonexistent 2>/dev/null)
   "$RT" cp "$cid:/usr/share/doc" "$d/doc" 2>/dev/null || echo "note: $img has no /usr/share/doc" > "$d/NO-DOC.txt"
   for p in /var/lib/dpkg/status /var/lib/dpkg/status.d; do "$RT" cp "$cid:$p" "$d/$(basename "$p")" 2>/dev/null || true; done
-  "$RT" rm "$cid" >/dev/null
+  "$RT" rm -v "$cid" >/dev/null   # -v: do not leak the image's anonymous volumes (postgres declares one)
   printf '%s\n' "$img" > "$d/IMAGE.txt"
 done
 . docker/ffmpeg.env
