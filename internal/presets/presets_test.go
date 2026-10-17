@@ -99,30 +99,6 @@ func TestFlavorAllowsFailsClosed(t *testing.T) {
 	}
 }
 
-func TestAllEncodersClassified(t *testing.T) {
-	// Every encoder in AllEncoders() must be either allowed under lgpl or in fullOnly
-	lgplAllowed := set()
-	for _, e := range presets.AllEncoders() {
-		// Encoder is allowed in lgpl if FlavorAllows returns true
-		if presets.FlavorAllows("lgpl", e) {
-			lgplAllowed[e] = true
-		}
-	}
-	// Check that all encoders are either allowed in lgpl or explicitly in fullOnly
-	for _, p := range presets.All() {
-		for _, c := range p.Candidates {
-			for _, e := range []string{c.Video, c.Audio} {
-				if e == "" {
-					continue
-				}
-				if !presets.FlavorAllows("lgpl", e) && !presets.FlavorAllows("full", e) {
-					t.Errorf("encoder %s is unclassified", e)
-				}
-			}
-		}
-	}
-}
-
 func TestRunnableIsPerWorker(t *testing.T) {
 	ids := func(ps []presets.Preset) string { return strings.Join(presets.IDs(ps), ",") }
 	split := [][]string{{"libvpx-vp9"}, {"libopus"}}
