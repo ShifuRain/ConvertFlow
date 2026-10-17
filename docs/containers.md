@@ -37,3 +37,13 @@ The worker and database sit on an internal network with no egress.
   build shows `--enable-gpl`/`--enable-nonfree`/`--enable-version3`.
 
 Operating the stack (configuration, TLS, backup, monitoring): see [operations.md](operations.md). Documentation consistency is checked by `scripts/check-docs.sh` (also run in CI).
+
+## Known limitation: DNS from the internal network on podman 4.x
+
+The worker and database sit on an `internal` network, which blocks routed egress. On podman 4.x with
+aardvark-dns, one CI run observed an external name resolving from the worker; the later runs timed out
+(isolation held) and the cause was not found. Treat DNS forwarding as **not ruled out on podman 4.x**:
+a compromised worker could in principle use DNS lookups as a covert channel. The hardening test now probes
+this three times and fails on any answer. On podman 6.x the same probe passes locally. Air-gapped
+operators should use podman 5 or newer (or docker, which is unverified) and block DNS at the host
+firewall for the container networks.
