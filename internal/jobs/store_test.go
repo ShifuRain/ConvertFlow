@@ -396,3 +396,44 @@ func TestClaimFiltersByPreset(t *testing.T) {
 		t.Fatalf("nothing left, got %v", j)
 	}
 }
+
+func TestExpireQueued(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	old, young, active := newJob(), newJob(), newJob()
+	for _, j := range []*jobs.Job{old, young} {
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '3 hours' WHERE id = $1::uuid`, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	// An old job that a worker already claimed must not be touched.
+	if err := s.Create(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '4 hours' WHERE id = $1::uuid`, active.ID); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := s.Claim(ctx, "w", []string{"audio-wav"}); j == nil || j.ID != active.ID {
+		t.Fatalf("setup claim: %v", j)
+	}
+	got, err := s.ExpireQueued(ctx, time.Hour)
+	if err != nil || len(got) != 1 || got[0].ID != old.ID || got[0].InputPath != old.InputPath {
+		t.Fatalf("ExpireQueued = %+v %v", got, err)
+	}
+	if j, _ := s.Get(ctx, old.ID); j.Status != jobs.StatusFailed || j.Error != jobs.ErrNoWorker {
+		t.Errorf("old: %+v", j)
+	}
+	if j, _ := s.Get(ctx, young.ID); j.Status != jobs.StatusQueued {
+		t.Errorf("young: %+v", j)
+	}
+	if j, _ := s.Get(ctx, active.ID); j.Status != jobs.StatusProbing {
+		t.Errorf("claimed: %+v", j)
+	}
+	if again, _ := s.ExpireQueued(ctx, time.Hour); len(again) != 0 {
+		t.Errorf("second call: %v", again)
+	}
+}

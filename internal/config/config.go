@@ -25,6 +25,7 @@ type Config struct {
 	JobTimeout     time.Duration // worker wall-clock limit for one FFmpeg run
 	Retention      time.Duration
 	StaleAfter     time.Duration
+	MaxQueueAge    time.Duration // queued jobs older than this are failed by the janitor
 	WorkerPoll     time.Duration
 
 	// Upload resource bounds (the service has no authentication, so these cap what anyone on the
@@ -89,6 +90,7 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		JobTimeout:     dur("CONVERTFLOW_JOB_TIMEOUT", 4*time.Hour),
 		Retention:      dur("CONVERTFLOW_RETENTION", 24*time.Hour),
 		StaleAfter:     dur("CONVERTFLOW_STALE_AFTER", 60*time.Second),
+		MaxQueueAge:    dur("CONVERTFLOW_MAX_QUEUE_AGE", 24*time.Hour),
 		WorkerPoll:     dur("CONVERTFLOW_WORKER_POLL", 2*time.Second),
 	}
 	c.MaxConcurrentUploads = int(num("CONVERTFLOW_MAX_CONCURRENT_UPLOADS", 4))

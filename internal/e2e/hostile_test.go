@@ -361,8 +361,7 @@ func TestPlaylistInputsLeaveNoTraces(t *testing.T) {
 func TestHostileFilenamesEndToEnd(t *testing.T) {
 	s := start(t, opts{})
 	escapeTarget := "/tmp/cf-e2e-pwned.wav"
-	_ = os.Remove(escapeTarget)
-	t.Cleanup(func() { _ = os.Remove(escapeTarget) })
+	_, preexisting := os.Stat(escapeTarget) // never delete or judge a file we did not create
 
 	names := []struct {
 		name     string
@@ -408,7 +407,7 @@ func TestHostileFilenamesEndToEnd(t *testing.T) {
 	if ents, _ := os.ReadDir(s.dir); len(ents) != 2 {
 		t.Errorf("data dir has extra entries: %v", ents)
 	}
-	if _, err := os.Stat(escapeTarget); err == nil {
+	if _, err := os.Stat(escapeTarget); err == nil && preexisting != nil {
 		t.Errorf("%s was created by a traversal file name", escapeTarget)
 	}
 	s.waitDirEmpty("in")

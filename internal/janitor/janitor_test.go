@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,5 +372,72 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not stop")
+	}
+}
+
+func (e *env) backdate(t *testing.T, id string, age time.Duration) {
+	t.Helper()
+	if _, err := e.pool.Exec(context.Background(), `UPDATE jobs SET created_at = now() - make_interval(secs => $2) WHERE id = $1::uuid`, id, age.Seconds()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSweepFailsStrandedQueuedJobs(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	old, fresh := e.job(t, "queued"), e.job(t, "queued")
+	oldIn := e.file(t, "in", old, 0)
+	freshIn := e.file(t, "in", fresh, 0)
+	e.backdate(t, old, 2*time.Hour)
+	if err := e.j.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.store.Get(context.Background(), old)
+	if err != nil || got.Status != jobs.StatusFailed || got.Error != jobs.ErrNoWorker || got.FinishedAt == nil {
+		t.Fatalf("old job: %+v %v", got, err)
+	}
+	if _, err := os.Stat(oldIn); !os.IsNotExist(err) {
+		t.Error("input of the stranded job was not removed")
+	}
+	if g, _ := e.store.Get(context.Background(), fresh); g.Status != jobs.StatusQueued {
+		t.Errorf("job within age touched: %s", g.Status)
+	}
+	if _, err := os.Stat(freshIn); err != nil {
+		t.Error("input of the young job was removed")
+	}
+	logs := e.log.String()
+	if !strings.Contains(logs, `"event":"job_queue_expired"`) || !strings.Contains(logs, old) || strings.Contains(logs, e.dir) {
+		t.Errorf("audit record wrong or leaks a path: %s", logs)
+	}
+	// Disabled when zero.
+	e.j.MaxQueueAge = 0
+	e.backdate(t, fresh, 1000*time.Hour)
+	_ = e.j.Sweep(context.Background())
+	if g, _ := e.store.Get(context.Background(), fresh); g.Status != jobs.StatusQueued {
+		t.Error("zero MaxQueueAge must disable the check")
+	}
+}
+
+// A job that a worker claims is never failed by the queue-age check, even if it is old.
+func TestSweepNeverFailsClaimedJobs(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	id := e.job(t, "queued")
+	e.backdate(t, id, 5*time.Hour)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var claimed *jobs.Job
+	go func() {
+		defer wg.Done()
+		claimed, _ = e.store.Claim(context.Background(), "w", presets.IDs(presets.All()))
+	}()
+	go func() { defer wg.Done(); _ = e.j.Sweep(context.Background()) }()
+	wg.Wait()
+	got, _ := e.store.Get(context.Background(), id)
+	switch {
+	case claimed != nil && got.Status != jobs.StatusProbing:
+		t.Fatalf("claimed job ended as %s", got.Status)
+	case claimed == nil && got.Status != jobs.StatusFailed:
+		t.Fatalf("unclaimed job ended as %s", got.Status)
 	}
 }

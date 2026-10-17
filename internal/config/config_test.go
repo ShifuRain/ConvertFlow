@@ -132,3 +132,20 @@ func TestSSEStreamCap(t *testing.T) {
 		t.Fatal("0 must be rejected")
 	}
 }
+
+func TestMaxQueueAge(t *testing.T) {
+	base := map[string]string{"CONVERTFLOW_DATABASE_URL": "x"}
+	if c, err := config.Load(env(base), noFile); err != nil || c.MaxQueueAge != 24*time.Hour {
+		t.Fatalf("default: %v %v", c.MaxQueueAge, err)
+	}
+	base["CONVERTFLOW_MAX_QUEUE_AGE"] = "90m"
+	if c, err := config.Load(env(base), noFile); err != nil || c.MaxQueueAge != 90*time.Minute {
+		t.Fatalf("override: %v %v", c.MaxQueueAge, err)
+	}
+	for _, bad := range []string{"0", "0s", "-1h", "soon"} {
+		base["CONVERTFLOW_MAX_QUEUE_AGE"] = bad
+		if _, err := config.Load(env(base), noFile); err == nil {
+			t.Errorf("%q: expected error", bad)
+		}
+	}
+}

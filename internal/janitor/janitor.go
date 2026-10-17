@@ -41,6 +41,9 @@ type Janitor struct {
 	// JobTimeout is the worker's run limit; files of probing/running jobs are never removed
 	// until older than JobTimeout plus a margin. Default DefaultJobTimeout.
 	JobTimeout time.Duration
+	// MaxQueueAge fails jobs that stayed queued this long (for example because no live worker
+	// offers their preset) and removes their input. Zero disables the check.
+	MaxQueueAge time.Duration
 }
 
 func (j *Janitor) Run(ctx context.Context) {
@@ -88,6 +91,16 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 	}
 	if requeued+failed > 0 {
 		j.Audit.System("jobs_recovered", "", "requeued", requeued, "failed", failed)
+	}
+	if j.MaxQueueAge > 0 {
+		stranded, err := j.Store.ExpireQueued(ctx, j.MaxQueueAge)
+		if err != nil {
+			return err
+		}
+		for _, e := range stranded {
+			j.removeData(e.ID, e.InputPath)
+			j.Audit.System("job_queue_expired", e.ID)
+		}
 	}
 	expired, err := j.Store.Expired(ctx, j.Retention)
 	if err != nil {

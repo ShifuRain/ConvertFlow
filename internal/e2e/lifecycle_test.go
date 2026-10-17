@@ -208,13 +208,28 @@ func contains(l []string, v string) bool {
 // Review Focus 7 (retention): the janitor deletes expired jobs together with their files and keeps
 // recent ones.
 func TestRetentionJanitor(t *testing.T) {
+	const retention = 5 * time.Second
 	s := start(t, opts{})
 	old := s.mustUpload("audio-wav", "old.wav", clip(t, "audio"))
 	oldFailed := s.mustUpload("audio-wav", "bad.wav", []byte("not media at all"))
 	if s.wait(old)["status"] != "done" || s.wait(oldFailed)["status"] != "failed" {
 		t.Fatal("setup jobs did not finish as expected")
 	}
-	time.Sleep(2500 * time.Millisecond)
+	// Poll until both are past the retention window (no fixed sleeps).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		exp, err := s.store.Expired(context.Background(), retention)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(exp) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("jobs never became expired")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	fresh := s.mustUpload("audio-wav", "fresh.wav", clip(t, "audio"))
 	if s.wait(fresh)["status"] != "done" {
 		t.Fatal("fresh job failed")
@@ -222,7 +237,7 @@ func TestRetentionJanitor(t *testing.T) {
 	if len(s.names("out")) != 2 {
 		t.Fatalf("want 2 outputs before sweep, got %v", s.names("out"))
 	}
-	j := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: 2 * time.Second,
+	j := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: retention,
 		StaleAfter: time.Hour, MaxAttempts: 3}
 	if err := j.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
@@ -492,6 +507,11 @@ func TestUnsupportedPresetStaysQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(1500 * time.Millisecond)
+	jan := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: time.Hour,
+		StaleAfter: time.Hour, MaxAttempts: 3, MaxQueueAge: time.Hour}
+	if err := jan.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if v := s.get("/api/v1/jobs/" + id).Body; v["status"] != "queued" || v["attempts"].(float64) != 0 {
 		t.Fatalf("job should still be queued: %v", v)
 	}
@@ -503,4 +523,36 @@ func TestUnsupportedPresetStaysQueued(t *testing.T) {
 	if v := s.waitStatus(id, 60*time.Second); v["status"] != "done" {
 		t.Fatalf("after a capable worker appears: %v", v)
 	}
+}
+
+// A job stranded in the queue (no live worker offers its preset) is failed by the janitor after the
+// maximum queue age, its input is removed, and the API's queue cap is freed.
+func TestStrandedQueuedJobExpires(t *testing.T) {
+	s := start(t, opts{noWorkers: true, maxQueued: 1})
+	s.addWorker("audio-only", workerOpts{hide: "libvpx-vp9|libvpx|libsvtav1|libx264|libx265"})
+	s.waitWorkers(1)
+	id := "22222222-3333-4444-8555-666666666666"
+	in := filepath.Join(s.dir, "in", id)
+	_ = os.WriteFile(in, clip(t, "video"), 0o600)
+	if err := s.store.Create(context.Background(), &jobs.Job{ID: id, Filename: "v.mkv", InputPath: in, Options: jobs.Options{Preset: "video-vp9"}}); err != nil {
+		t.Fatal(err)
+	}
+	if code, v := s.upload("audio-wav", "a.wav", clip(t, "audio")); code != http.StatusServiceUnavailable {
+		t.Fatalf("queue cap should refuse: %d %v", code, v)
+	}
+	time.Sleep(700 * time.Millisecond)
+	jan := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: time.Hour,
+		StaleAfter: time.Hour, MaxAttempts: 3, MaxQueueAge: 500 * time.Millisecond}
+	if err := jan.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v := s.get("/api/v1/jobs/" + id).Body
+	if v["status"] != "failed" || v["error"] != "no worker available for this preset" {
+		t.Fatalf("stranded job: %v", v)
+	}
+	s.waitDirEmpty("in")
+	if st := s.wait(s.mustUpload("audio-wav", "a.wav", clip(t, "audio")))["status"]; st != "done" {
+		t.Fatalf("upload after the cap freed up: %v", st)
+	}
+	s.assertNoLeak("logs", s.logs.String())
 }

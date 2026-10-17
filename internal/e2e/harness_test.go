@@ -194,6 +194,7 @@ type opts struct {
 	hide           string
 	jobTimeout     time.Duration
 	maxOutputBytes int64
+	maxQueued      int // MaxQueuedJobs cap of the API (0 = unlimited)
 }
 
 type workerHandle struct {
@@ -255,7 +256,7 @@ func start(t *testing.T, o opts) *stack {
 	}
 	h := api.NewHandler(api.Deps{
 		Store: s.store, Audit: audit.New(s.logs), EventInterval: 50 * time.Millisecond, SSEHeartbeat: time.Second,
-		Cfg: config.Config{DataDir: dir, Flavor: "full", MaxUploadBytes: maxUpload, MaxConcurrentUploads: maxUploads},
+		Cfg: config.Config{DataDir: dir, Flavor: "full", MaxUploadBytes: maxUpload, MaxConcurrentUploads: maxUploads, MaxQueuedJobs: o.maxQueued},
 	})
 	s.srv = httptest.NewServer(h)
 	s.base = s.srv.URL

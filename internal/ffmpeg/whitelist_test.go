@@ -20,7 +20,7 @@ func mk(t *testing.T, dir, name string, args ...string) string {
 	full := append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)
 	full = append(full, out)
 	if b, err := exec.Command("ffmpeg", full...).CombinedOutput(); err != nil {
-		t.Skipf("cannot build %s here: %v %s", name, err, b)
+		t.Fatalf("cannot build sample %s (tools are present, so encoders must be): %v %s", name, err, b)
 	}
 	return out
 }
