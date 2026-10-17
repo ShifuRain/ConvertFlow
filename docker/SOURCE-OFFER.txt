@@ -4,8 +4,8 @@ FFmpeg source code offer
 The ffmpeg and ffprobe binaries in this image are built from the unmodified FFmpeg
 release tarball named in /usr/share/doc/ffmpeg/BUILDINFO (https://ffmpeg.org/releases/),
 verified by SHA-256 at build time. FFmpeg is licensed under the GNU LGPL v2.1 or later;
-when the image is built with FFMPEG_FLAVOR=full (x264/x265, --enable-gpl --enable-version3)
-the combined binaries are licensed under the GNU GPL v3 or later.
+when the image is built with FFMPEG_FLAVOR=full (x264/x265, --enable-gpl)
+the combined binaries are licensed under the GNU GPL v2 or later.
 
 The license texts are in this directory (COPYING.*, LICENSE.md). The exact configure line is
 printed by `ffmpeg -version`.

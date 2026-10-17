@@ -30,7 +30,7 @@ done
   if [ "$flavor" = lgpl ]; then
     echo "  LGPL v2.1 or later; configured without --enable-gpl/--enable-nonfree/--enable-version3 (asserted at image build time)."
   else
-    echo "  FULL flavor: GPL v3 or later (x264/x265, --enable-gpl --enable-version3). Patent notice applies, see SOURCE-OFFER.txt."
+    echo "  FULL flavor: GPL v2 or later (x264/x265, --enable-gpl). Patent notice applies, see SOURCE-OFFER.txt."
   fi
   echo "Linked codec libraries: libsvtav1, libaom, libvpx, libopus, libvorbis, libmp3lame (+ libx264, libx265 in the full flavor);"
   echo "their licence files are under images/worker/doc/. License texts: images/worker/doc/ffmpeg/COPYING.*"
