@@ -27,6 +27,11 @@ The worker and database sit on an internal network with no egress.
   on podman 4 the core-dump hard limit stays at the host default (observed: soft 0, hard unlimited). `tests/container/hardening.sh`
   keeps asserting the setting in the compose model everywhere, asserts RLIMIT_CORE 0/0 at runtime on podman 5+ and docker, and on
   podman <5 only asserts that the effective soft limit is 0 (the check name says so). Use podman 5+ if the hard limit matters to you.
+- **DNS forwarding on podman 4.x (known limitation).** On podman 4.9 the aardvark-dns resolver of the `internal` backend network
+  forwards external lookups intermittently; this was observed repeatedly in CI. TCP egress from the worker stays blocked (that
+  check is strict everywhere), but name resolution can leak. CI downgrades only the "cannot resolve external names" probe to a
+  warning (`WARN:` line and a GitHub Actions `::warning::`) on podman <5; on podman 5+ and docker it is a hard failure. Compose
+  still must declare the network internal. `--self-test` proves both paths with a simulated resolution.
 - Pinned base-image digests go stale. Run `scripts/pin-digests.sh` before each release; `scripts/check-pinned-digests.sh --online` (weekly workflow, strict on release) detects drift. See docs/supply-chain.md.
 - `scripts/smoke.sh` and `tests/container/hardening.sh` use their own compose projects (`convertflow-smoke`,
   `convertflow-hardening`) and host ports (18080 / 18081); they refuse `down -v` for any other project and never touch a

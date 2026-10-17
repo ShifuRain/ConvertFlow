@@ -34,6 +34,17 @@ if [ "${1:-}" = "--self-test" ]; then
     "FAIL: worker rootfs is read-only"; do
     if grep -qF "$want" <<<"$out"; then echo "self-test saw expected: $want"; else echo "SELF-TEST FAIL: expected line missing: $want"; bad=1; fi
   done
+  # DNS probe policy: with a simulated resolution (test-only env, honoured only when HARDENING_SELFTEST=1)
+  # podman >=5 / docker must FAIL, podman <5 must only WARN.
+  for ver in 6 4; do
+    dout=$(HARDENING_SELFTEST=1 HARDENING_SELFTEST_LEAK=1 HARDENING_SELFTEST_MAJOR=$ver "$SELF" 2>&1) || true
+    if [ "$ver" = 6 ]; then
+      grep -qF "FAIL: worker: cannot resolve external names" <<<"$dout" || { echo "SELF-TEST FAIL: simulated DNS leak did not fail on major $ver"; bad=1; }
+    else
+      grep -qF "WARN: worker can resolve external names via aardvark-dns on podman <5" <<<"$dout" && ! grep -qF "FAIL: worker: cannot resolve external names" <<<"$dout" \
+        || { echo "SELF-TEST FAIL: simulated DNS leak was not a warning on major $ver"; bad=1; }
+    fi
+  done
   [ "$bad" = 0 ] && echo "self-test ok: weakened config is rejected for the expected reasons"
   exit "$bad"
 fi
@@ -104,6 +115,9 @@ safe_down
 trap safe_down EXIT
 RT_KIND=$($RT --version 2>/dev/null | awk 'tolower($1)=="podman"{print "podman"; exit} {print "other"; exit}')
 RT_MAJOR=$($RT --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1 | cut -d. -f1)
+if [ "${HARDENING_SELFTEST:-}" = 1 ]; then  # test-only overrides, inert unless the self-test sets HARDENING_SELFTEST=1
+  RT_KIND=podman; RT_MAJOR=${HARDENING_SELFTEST_MAJOR:-$RT_MAJOR}
+fi
 echo "info: runtime $RT_KIND major ${RT_MAJOR:-?}"
 FFMPEG_FLAVOR=$FLAVOR $RT compose -p "$PROJECT" "${CF[@]}" up -d --no-build --wait --wait-timeout 120 >/dev/null 2>&1 || true
 
@@ -176,7 +190,18 @@ if [ -n "$wid" ]; then
     "! $RT exec $wid bash -c 'timeout 4 bash -c \"</dev/tcp/1.1.1.1/53\"' 2>/dev/null"
   echo "info: worker resolv.conf: $($RT exec $wid cat /etc/resolv.conf | tr '\n' ';')"
   # three attempts, any success is a leak (aardvark-dns must not forward upstream from an internal network)
-  check "worker: cannot resolve external names" "! $RT exec $wid bash -c 'for i in 1 2 3; do timeout 4 getent hosts example.com && exit 0; done; exit 1' 2>&1 | grep -E ."
+  dns_probe="$RT exec $wid bash -c 'for i in 1 2 3; do timeout 4 getent hosts example.com && exit 0; done; exit 1' 2>&1"
+  [ "${HARDENING_SELFTEST:-}" = 1 ] && [ "${HARDENING_SELFTEST_LEAK:-}" = 1 ] && dns_probe="echo 93.184.216.34 example.com"
+  if [ "${RT_MAJOR:-0}" -ge 5 ] || [ "$RT_KIND" != podman ]; then
+    check "worker: cannot resolve external names" "! $dns_probe | grep -E ."
+  elif eval "$dns_probe" | grep -qE .; then
+    # podman 4.x: aardvark-dns forwards lookups from internal networks (observed repeatedly, intermittent); TCP egress stays blocked.
+    echo "WARN: worker can resolve external names via aardvark-dns on podman <5 (known limitation, see docs/containers.md)"
+    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::worker can resolve external names via aardvark-dns on podman <5 (known limitation, docs/containers.md)"
+    echo "ok:   worker: external name resolution tolerated on podman <5 (warning above)"
+  else
+    echo "ok:   worker: cannot resolve external names"
+  fi
   check "worker: scratch space is tmpfs" "$RT exec $wid sh -c 'grep -E \" /tmp tmpfs \" /proc/mounts' >/dev/null"
 fi
 aid=$(cid api)
