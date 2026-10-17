@@ -31,3 +31,5 @@ The worker and database sit on an internal network with no egress.
   (it filters presets by flavor) through one compose anchor together with job timeout / retention / stale settings.
 - The final worker image build fails if ffmpeg/ffprobe have unresolved libraries, expected encoders are missing, or an lgpl
   build shows `--enable-gpl`/`--enable-nonfree`/`--enable-version3`.
+
+Operating the stack (configuration, TLS, backup, monitoring): see [operations.md](operations.md). Documentation consistency is checked by `scripts/check-docs.sh` (also run in CI).
