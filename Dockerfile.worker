@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
+ARG FFMPEG_VERSION
+ARG FFMPEG_SHA256
+ARG FFMPEG_FLAVOR=lgpl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config nasm yasm curl ca-certificates xz-utils zlib1g-dev \
+      libsvtav1enc-dev libaom-dev libvpx-dev libopus-dev libvorbis-dev libmp3lame-dev \
+      libx264-dev libx265-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+# Fail closed: the tarball must match the SHA-256 pinned in docker/ffmpeg.env (which was
+# GPG-verified when it was recorded). No keyserver is used at build time.
+RUN test -n "$FFMPEG_VERSION" && test -n "$FFMPEG_SHA256" \
+ && curl -fLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+ && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
+ && mkdir ffmpeg && tar -xf ffmpeg.tar.xz -C ffmpeg --strip-components=1
+WORKDIR /src/ffmpeg
+RUN set -eux; \
+    flags="--prefix=/opt/ffmpeg --disable-debug --disable-doc --disable-ffplay --disable-network \
+      --disable-autodetect --enable-zlib \
+      --enable-libsvtav1 --enable-libaom --enable-libvpx --enable-libopus --enable-libvorbis --enable-libmp3lame"; \
+    if [ "$FFMPEG_FLAVOR" = "full" ]; then \
+      echo "NOTICE: building the GPL flavor (x264/x265). Redistribution requires offering source; H.264/H.265/AAC may require patent licenses. See /usr/share/doc/ffmpeg/SOURCE-OFFER.txt."; \
+      flags="$flags --enable-gpl --enable-version3 --enable-libx264 --enable-libx265"; \
+    elif [ "$FFMPEG_FLAVOR" != "lgpl" ]; then echo "unknown FFMPEG_FLAVOR $FFMPEG_FLAVOR" >&2; exit 1; fi; \
+    ./configure $flags; \
+    make -j"$(nproc)"; make install; \
+    ! ldd /opt/ffmpeg/bin/ffmpeg | grep 'not found'; \
+    printf 'ffmpeg %s flavor=%s sha256=%s\n' "$FFMPEG_VERSION" "$FFMPEG_FLAVOR" "$FFMPEG_SHA256" > /opt/ffmpeg/BUILDINFO
+
+FROM docker.io/library/golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS gobuild
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/convertflow-worker ./cmd/convertflow-worker
+
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+ARG FFMPEG_FLAVOR=lgpl
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libsvtav1enc1 libaom3 libvpx7 libopus0 libvorbis0a libvorbisenc2 libmp3lame0 zlib1g; \
+    if [ "$FFMPEG_FLAVOR" = "full" ]; then apt-get install -y --no-install-recommends libx264-164 libx265-199; fi; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd -g 65532 convertflow; useradd -u 65532 -g 65532 -M -s /usr/sbin/nologin convertflow; \
+    mkdir -p /data/in /data/out; chown -R 65532:65532 /data; \
+    find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true
+COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
+COPY --from=ffmpeg /opt/ffmpeg/BUILDINFO /usr/share/doc/ffmpeg/BUILDINFO
+COPY --from=ffmpeg /src/ffmpeg/COPYING.* /src/ffmpeg/LICENSE.md /usr/share/doc/ffmpeg/
+COPY docker/SOURCE-OFFER.txt /usr/share/doc/ffmpeg/SOURCE-OFFER.txt
+COPY --from=gobuild /out/convertflow-worker /usr/local/bin/convertflow-worker
+USER 65532:65532
+ENV CONVERTFLOW_DATA_DIR=/data CONVERTFLOW_FLAVOR=${FFMPEG_FLAVOR}
+ENTRYPOINT ["/usr/local/bin/convertflow-worker"]

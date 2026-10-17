@@ -1,0 +1,8 @@
+.git
+.superpowers
+secrets
+bin
+ui/node_modules
+internal/ui/dist
+compose.yaml
+Dockerfile.*

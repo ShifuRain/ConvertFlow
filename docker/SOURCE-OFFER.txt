@@ -1,0 +1,21 @@
+FFmpeg source code offer
+========================
+
+The ffmpeg and ffprobe binaries in this image are built from the unmodified FFmpeg
+release tarball named in /usr/share/doc/ffmpeg/BUILDINFO (https://ffmpeg.org/releases/),
+verified by SHA-256 at build time. FFmpeg is licensed under the GNU LGPL v2.1 or later;
+when the image is built with FFMPEG_FLAVOR=full (x264/x265, --enable-gpl --enable-version3)
+the combined binaries are licensed under the GNU GPL v3 or later.
+
+The license texts are in this directory (COPYING.*, LICENSE.md). The exact configure line is
+printed by `ffmpeg -version`.
+
+Written offer: for at least three years from the date you received this image, the operator
+who distributed it will provide, on request, the complete corresponding source code of the
+FFmpeg version and of the codec libraries linked into it (libsvtav1, libaom, libvpx, libopus,
+libvorbis, libmp3lame and, for the full flavor, libx264 and libx265), including the build
+scripts (Dockerfile.worker, docker/ffmpeg.env). Debian packages used at runtime provide their
+sources via `apt-get source <package>` on a Debian bookworm system.
+
+Patents: the full flavor includes encoders for H.264/H.265, which may be subject to patent
+licensing in your jurisdiction. The lgpl flavor omits them. You are responsible for compliance.
