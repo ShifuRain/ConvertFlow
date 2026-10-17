@@ -1,13 +1,18 @@
 package ffmpeg_test
 
 import (
+	"context"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/ShifuRain/convertflow/internal/ffmpeg"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 	"github.com/ShifuRain/convertflow/internal/presets"
+	"github.com/ShifuRain/convertflow/internal/testutil"
 )
 
 func ip(i int) *int { return &i }
@@ -45,7 +50,7 @@ func TestBuildArgsSVTAV1Defaults(t *testing.T) {
 	a := build(t, spec(t, "video-av1", presets.Candidate{Video: "libsvtav1", Audio: "libopus"}, jobs.Options{}, true, true))
 	for _, seq := range [][]string{
 		{"-c:v", "libsvtav1"}, {"-preset", "8"}, {"-crf", "35"}, {"-pix_fmt", "yuv420p"},
-		{"-c:a", "libopus"}, {"-b:a", "128k"}, {"-map", "0:v:0"}, {"-map", "0:a:0"},
+		{"-c:a", "libopus"}, {"-b:a", "128k"}, {"-map", "0:V:0"}, {"-map", "0:a:0"},
 		{"-f", "webm"}, {"-protocol_whitelist", "file"}, {"-map_metadata", "-1"},
 	} {
 		if !hasSeq(a, seq...) {
@@ -91,7 +96,7 @@ func TestBuildArgsVAAPI(t *testing.T) {
 
 func TestBuildArgsAudioPreset(t *testing.T) {
 	a := build(t, spec(t, "audio-mp3", presets.Candidate{Audio: "libmp3lame"}, jobs.Options{}, true, true))
-	if !slices.Contains(a, "-vn") || slices.Contains(a, "0:v:0") || !hasSeq(a, "-ac", "2") {
+	if !slices.Contains(a, "-vn") || slices.Contains(a, "0:V:0") || !hasSeq(a, "-ac", "2") {
 		t.Errorf("audio preset must drop video and downmix: %v", a)
 	}
 	a = build(t, spec(t, "audio-flac", presets.Candidate{Audio: "flac"}, jobs.Options{}, false, true))
@@ -115,7 +120,7 @@ func TestBuildArgsNeedsVideo(t *testing.T) {
 // for it, and an audio preset must still map only audio.
 func TestBuildArgsIgnoresCoverArt(t *testing.T) {
 	a := build(t, spec(t, "audio-opus", presets.Candidate{Audio: "libopus"}, jobs.Options{}, false, true))
-	if slices.Contains(a, "0:v:0") || !slices.Contains(a, "-vn") {
+	if slices.Contains(a, "0:V:0") || !slices.Contains(a, "-vn") {
 		t.Errorf("cover art must not be mapped: %v", a)
 	}
 }
@@ -231,5 +236,43 @@ func TestBuildArgsFileSizeCap(t *testing.T) {
 	// -fs is an output option: it must come after -i and before the output path.
 	if slices.Index(a, "-fs") < slices.Index(a, "-i") || slices.Index(a, "-fs") > len(a)-2 {
 		t.Errorf("-fs misplaced: %v", a)
+	}
+}
+
+// Video presets map "0:V:0" (capital V excludes attached pictures such as cover art), never "0:v:0".
+// A container whose cover picture comes BEFORE the real video cannot be produced with the available
+// muxers (mp4 sorts attached pictures last, matroska drops the disposition), so the argument itself is
+// asserted, and a real cover-art MP4 is converted end to end to prove the output is the real video.
+func TestVideoMapExcludesAttachedPictures(t *testing.T) {
+	testutil.RequireTools(t)
+	dir := t.TempDir()
+	cover := filepath.Join(dir, "cover.png")
+	run := func(args ...string) {
+		t.Helper()
+		if b, err := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("ffmpeg %v: %v\n%s", args, err, b)
+		}
+	}
+	run("-f", "lavfi", "-i", "color=red:size=64x64", "-frames:v", "1", cover)
+	in := filepath.Join(dir, "in.mp4")
+	run("-i", cover, "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=10", "-f", "lavfi", "-i", "sine=duration=1",
+		"-map", "0:v", "-map", "1:v", "-map", "2:a", "-c:v:1", "mpeg4", "-c:v:0", "png", "-c:a", "aac", "-disposition:v:0", "attached_pic", in)
+
+	a := build(t, spec(t, "video-vp9", presets.Candidate{Video: "libvpx-vp9", Audio: "libopus"}, jobs.Options{}, true, true))
+	if !hasSeq(a, "-map", "0:V:0") || slices.Contains(a, "0:v:0") {
+		t.Fatalf("video map must use capital V: %v", a)
+	}
+	pr, _, err := ffmpeg.Probe(context.Background(), "ffprobe", in, dir)
+	if err != nil || !pr.HasVideo() || !pr.HasAudio() {
+		t.Fatalf("probe: %+v %v", pr, err)
+	}
+	s := spec(t, "video-vp9", presets.Candidate{Video: "libvpx-vp9", Audio: "libopus"}, jobs.Options{}, true, true)
+	s.Input, s.Output = in, filepath.Join(dir, "out.webm")
+	if tail, err := ffmpeg.Run(context.Background(), "ffmpeg", build(t, s), dir, 1, nil); err != nil {
+		t.Fatalf("convert: %v\n%s", err, tail)
+	}
+	out, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height", "-of", "csv=p=0", s.Output).Output()
+	if err != nil || strings.TrimSpace(string(out)) != "320,240" {
+		t.Fatalf("output video is not the real video stream: %q %v", out, err)
 	}
 }

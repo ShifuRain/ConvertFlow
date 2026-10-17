@@ -71,7 +71,7 @@ func BuildArgs(s Spec) ([]string, error) {
 	}
 	a = append(a, "-format_whitelist", FormatWhitelist(), "-i", s.Input, "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn")
 	if video {
-		a = append(a, "-map", "0:v:0")
+		a = append(a, "-map", "0:V:0")
 	} else {
 		a = append(a, "-vn")
 	}
