@@ -2,7 +2,7 @@
 # Builds the offline ("air-gap") install bundle:
 #   convertflow-<version>-<flavor>-airgap.tar.gz
 #     images.tar.gz          api + worker + pinned postgres images (`save`), gzip -n
-#     compose.yaml + compose.airgap.yaml (db -> local postgres name), IMAGES.txt, docker/, scripts/gen-secrets.sh, README.md, LICENSE, SECURITY.md, CONTRIBUTING.md, docs/*.md
+#     compose.yaml + compose.airgap.yaml (db -> local postgres name), IMAGES.txt, docker/ (incl. db-init/), scripts/gen-secrets.sh, README.md, LICENSE, SECURITY.md, CONTRIBUTING.md, docs/*.md
 #     THIRD-PARTY-LICENSES/  (if $LICENSES_DIR is set)      sbom/*.cdx.json (if $SBOM_DIR is set)
 #     AIRGAP-README.txt      offline load + verify + start instructions
 #     SHA256SUMS             checksums of every file in the bundle
@@ -33,7 +33,7 @@ want_api=convertflow-api:$version want_worker=convertflow-worker:$version-$flavo
 
 stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
 b=$stage/convertflow-$version-$flavor
-mkdir -p "$b/docker" "$b/scripts" "$b/docs"
+mkdir -p "$b/docker/db-init" "$b/scripts" "$b/docs"
 fmt=(); [ "$RT" = podman ] && fmt=(--format docker-archive --multi-image-archive)
 # A saved/loaded archive carries only the platform image: it loses the registry name AND the multi-arch index digest
 # that compose.yaml pins, so an offline `up` would try to pull. Therefore the postgres image is saved under a local
@@ -45,6 +45,7 @@ want_pg=convertflow-postgres:$pg_tag
 gzip -9nc "$stage/images.tar" > "$b/images.tar.gz"
 cp compose.yaml README.md LICENSE SECURITY.md CONTRIBUTING.md "$b/"
 cp docker/ffmpeg.env docker/SOURCE-OFFER.txt "$b/docker/"
+cp -p docker/db-init/* "$b/docker/db-init/"
 cp scripts/gen-secrets.sh "$b/scripts/"
 for f in docs/*.md; do [ -f "$f" ] && cp "$f" "$b/docs/"; done
 [ -z "${LICENSES_DIR:-}" ] || cp -r "$LICENSES_DIR" "$b/THIRD-PARTY-LICENSES"
@@ -63,7 +64,9 @@ ConvertFlow $version ($flavor) - offline install bundle
    ($want_pg is the postgres image pinned in compose.yaml as
      $pg
    re-tagged locally, because a loaded archive cannot keep the registry digest; see IMAGES.txt.)
-3. Create secrets, then start without building:
+3. Create secrets (bootstrap DB superuser password, least-privilege application role password and the
+   application's connection URL; docker/db-init creates the application role on the first start), then
+   start without building:
      scripts/gen-secrets.sh
      set -a; . docker/ffmpeg.env; set +a
      CONVERTFLOW_VERSION=$version FFMPEG_FLAVOR=$flavor podman compose -f compose.yaml -f compose.airgap.yaml up -d --no-build

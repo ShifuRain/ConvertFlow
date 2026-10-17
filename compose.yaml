@@ -32,18 +32,23 @@ services:
     image: docker.io/library/postgres:16-bookworm@sha256:0ea6700a3b4f0ae6ce746519073558aed4d88a79d8d07622a9a644946c7319c4
     user: "999:999"
     environment:
-      POSTGRES_USER: convertflow
-      POSTGRES_DB: convertflow
+      # Bootstrap superuser: used only by the image entrypoint (initdb) and for administration inside
+      # this container. The application connects as convertflow_app, created by docker/db-init.
+      POSTGRES_USER: convertflow_admin
+      POSTGRES_DB: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
-    secrets: [db_password]
-    volumes: ["pgdata:/var/lib/postgresql/data"]
+    secrets: [db_password, db_app_password]
+    volumes:
+      - "pgdata:/var/lib/postgresql/data"
+      # init scripts run only when the data directory is empty (first start)
+      - "./docker/db-init:/docker-entrypoint-initdb.d:ro"
     tmpfs: ["/tmp", "/run/postgresql:mode=1777"]
     networks: [backend]
     pids_limit: 200
     mem_limit: 1g
     cpus: 1.0
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U convertflow -d convertflow"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U convertflow_app -d convertflow"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -112,5 +117,6 @@ volumes:
   media: {}
 
 secrets:
-  db_password: {file: ./secrets/db_password}
+  db_password: {file: ./secrets/db_password}              # bootstrap superuser (db container only)
+  db_app_password: {file: ./secrets/db_app_password}      # application role (db container reads it at init)
   database_url: {file: ./secrets/database_url}

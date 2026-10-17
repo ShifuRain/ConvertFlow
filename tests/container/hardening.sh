@@ -81,6 +81,12 @@ check "only the api publishes ports, on loopback by default" \
   "jq -e '([.services | to_entries[] | select(.key != \"api\") | .value.ports // [] | length] | add // 0) == 0 and (.services.api.ports | length == 1 and all(.host_ip == \"127.0.0.1\"))' <<<\"\$CFG\" >/dev/null"
 check "secrets are passed as files, not environment" \
   "! jq -e '.services | to_entries | any(.value.environment // {} | to_entries | any(.key | test(\"PASSWORD$|DATABASE_URL$\")))' <<<\"\$CFG\" >/dev/null"
+check "api and worker mount only the connection URL secret, not the database passwords" \
+  "jq -e '[.services.api, .services.worker] | all([.secrets[].source] == [\"database_url\"])' <<<\"\$CFG\" >/dev/null"
+check "db init scripts are mounted read-only into /docker-entrypoint-initdb.d" \
+  "jq -e '.services.db.volumes | any(.target == \"/docker-entrypoint-initdb.d\" and .read_only == true)' <<<\"\$CFG\" >/dev/null"
+check "database_url secret connects as the application role, not the bootstrap superuser" \
+  "grep -q '^postgres://convertflow_app:' secrets/database_url && ! grep -q 'convertflow_admin' secrets/database_url"
 check "external images in compose are pinned by digest" \
   "jq -e '.services | to_entries | all(.value.build != null or (.value.image | test(\"@sha256:[0-9a-f]{64}\$\")))' <<<\"\$CFG\" >/dev/null"
 # Every FROM that is not a reference to an earlier build stage must carry a digest.
@@ -122,8 +128,10 @@ for svc in db api worker; do
   check "$svc healthcheck is healthy" "[ \"\$($RT inspect $id --format '{{.State.Health.Status}}')\" = healthy ]"
   check "$svc environment contains no database password" \
     "! $RT inspect $id --format '{{json .Config.Env}}' | grep -qF \"\$(cat secrets/db_password)\""
+  check "$svc environment contains no application database password" \
+    "! $RT inspect $id --format '{{json .Config.Env}}' | grep -qF \"\$(cat secrets/db_app_password)\""
   check "$svc has no host mounts other than /run/secrets files" \
-    "! $RT inspect $id --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Destination}}{{println}}{{end}}{{end}}' | grep -v '^/run/secrets/' | grep -q ."
+    "! $RT inspect $id --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Destination}}{{println}}{{end}}{{end}}' | grep -v '^/run/secrets/' | grep -vx '/docker-entrypoint-initdb.d' | grep -q ."
 done
 
 # Shell-based behavioural checks (db and worker images contain a shell; the distroless API does not).
@@ -131,6 +139,26 @@ for svc in db worker; do
   id=$(cid "$svc"); [ -n "$id" ] || continue
   check "$svc: writing to the root filesystem fails" "! $RT exec $id sh -c 'touch /hardening-probe 2>/dev/null'"
 done
+# Least privilege in the database: the application role exists, is not a superuser and owns the
+# application database; api and worker connect as it and nobody else is connected to that database.
+did=$(cid db)
+if [ -n "$did" ]; then
+  # the password is read from the file secret inside the container: it never appears in a host argument list
+  app_psql() { $RT exec "$did" sh -c 'PGPASSWORD=$(cat /run/secrets/db_app_password) exec psql -X -At -h 127.0.0.1 -U convertflow_app -d convertflow -c "$1"' sh "$1" 2>/dev/null; }
+  check "db: the application role can log in over TCP with the app password secret" "[ \"\$(app_psql 'select 1')\" = 1 ]"
+  check "db: the application role is NOT a superuser (rolsuper is false for current_user)" \
+    "[ \"\$(app_psql 'select rolsuper from pg_roles where rolname = current_user')\" = f ]"
+  check "db: the application role has no createdb/createrole/replication/bypassrls" \
+    "[ \"\$(app_psql 'select rolcreatedb or rolcreaterole or rolreplication or rolbypassrls from pg_roles where rolname = current_user')\" = f ]"
+  check "db: the application role owns the application database" \
+    "[ \"\$(app_psql \"select pg_get_userbyid(datdba) from pg_database where datname = 'convertflow'\")\" = convertflow_app ]"
+  check "db: the application role cannot read server files (no superuser file access)" \
+    "! app_psql \"select pg_read_file('/etc/passwd')\" | grep -q ."
+  # the superuser role exists only as bootstrap role; inspected over the local socket (trust, inside the container)
+  admin_psql() { $RT exec "$did" psql -X -At -U convertflow_admin -d postgres -c "$1" 2>/dev/null; }
+  check "db: only the application role holds client connections to the application database" \
+    "[ \"\$(admin_psql \"select string_agg(distinct usename, ',') from pg_stat_activity where datname = 'convertflow' and backend_type = 'client backend' and pid <> pg_backend_pid() and application_name <> 'psql'\")\" = convertflow_app ]"
+fi
 wid=$(cid worker)
 if [ -n "$wid" ]; then
   check "worker: has no outbound connectivity (internal network)" \
