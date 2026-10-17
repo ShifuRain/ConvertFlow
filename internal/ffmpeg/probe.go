@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,19 @@ var allowedFormats = map[string]bool{
 	"avi": true, "flv": true, "mpegts": true, "mpeg": true, "ogg": true, "wav": true, "flac": true, "mp3": true,
 	"aac": true, "asf": true, "ac3": true, "eac3": true, "aiff": true, "caf": true, "ape": true, "wv": true,
 	"mxf": true, "amr": true, "au": true, "w64": true, "ivf": true, "nut": true, "dts": true, "tta": true,
+}
+
+// FormatWhitelist is the allow-list as a value for FFmpeg's -format_whitelist input option, so the
+// demuxer allow-list is enforced by FFmpeg itself (a demuxer outside it is never selected or opened)
+// and not only by validating the probe result. FFmpeg matches any alias of a demuxer's name, so the
+// grouped "mov,mp4,m4a,3gp,3g2,mj2" demuxer is covered by listing its member names.
+func FormatWhitelist() string {
+	names := make([]string, 0, len(allowedFormats))
+	for n := range allowedFormats {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 func ParseProbe(b []byte) (*ProbeResult, error) {
@@ -160,6 +174,7 @@ func Probe(ctx context.Context, bin, path, dir string) (*ProbeResult, []byte, er
 	defer cancel()
 	// #nosec G204 -- bin is the configured ffprobe path; path is server-generated, passed as "file:"+path with protocol_whitelist=file
 	cmd := exec.CommandContext(ctx, bin, "-v", "error", "-protocol_whitelist", "file",
+		"-format_whitelist", FormatWhitelist(),
 		"-print_format", "json",
 		"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height,duration:stream_disposition=attached_pic",
 		"-i", "file:"+path)

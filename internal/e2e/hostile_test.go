@@ -259,7 +259,7 @@ func TestPlaylistAndConcatInputsRejected(t *testing.T) {
 		{"sdp-tcp.sdp", fmt.Sprintf("v=0\no=- 0 0 IN IP4 127.0.0.1\ns=x\nc=IN IP4 127.0.0.1\nt=0 0\nm=audio %d TCP/RTP/AVP 0\na=rtpmap:0 PCMU/8000\n", lb.TCP), ""},
 		{"rtsp.txt", fmt.Sprintf("rtsp://127.0.0.1:%d/stream\n", lb.TCP), msgUnreadable},
 		{"rtsp-in-m3u.m3u8", fmt.Sprintf("#EXTM3U\nrtsp://127.0.0.1:%d/stream\n", lb.TCP), ""},
-		{"image2-png-%03d.mp4", string(readFile(t, png)), msgFormat},
+		{"image2-png-%03d.mp4", string(readFile(t, png)), ""},
 		{"image2-glob-*.jpg", string(readFile(t, jpg)), ""},
 		{"gif-%d.gif", string(readFile(t, gif)), ""},
 		{"movie-source.txt", "movie=" + canaryAbs + "[a];amovie=/etc/passwd\n", msgUnreadable},

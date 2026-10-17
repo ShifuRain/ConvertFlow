@@ -69,7 +69,7 @@ func BuildArgs(s Spec) ([]string, error) {
 	if s.Cand.Video == "av1_vaapi" {
 		a = append(a, "-vaapi_device", s.VAAPIDevice)
 	}
-	a = append(a, "-i", s.Input, "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn")
+	a = append(a, "-format_whitelist", FormatWhitelist(), "-i", s.Input, "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn")
 	if video {
 		a = append(a, "-map", "0:v:0")
 	} else {
