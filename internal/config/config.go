@@ -21,6 +21,8 @@ type Config struct {
 	MaxDurationSec float64
 	MaxStreams     int
 	MaxAttempts    int
+	MaxOutputBytes int64         // worker kills a conversion whose output exceeds this
+	JobTimeout     time.Duration // worker wall-clock limit for one FFmpeg run
 	Retention      time.Duration
 	StaleAfter     time.Duration
 	WorkerPoll     time.Duration
@@ -76,6 +78,8 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		MaxDurationSec: float64(num("CONVERTFLOW_MAX_DURATION_SEC", 6*3600)),
 		MaxStreams:     int(num("CONVERTFLOW_MAX_STREAMS", 16)),
 		MaxAttempts:    int(num("CONVERTFLOW_MAX_ATTEMPTS", 3)),
+		MaxOutputBytes: num("CONVERTFLOW_MAX_OUTPUT_BYTES", 16<<30),
+		JobTimeout:     dur("CONVERTFLOW_JOB_TIMEOUT", 4*time.Hour),
 		Retention:      dur("CONVERTFLOW_RETENTION", 24*time.Hour),
 		StaleAfter:     dur("CONVERTFLOW_STALE_AFTER", 60*time.Second),
 		WorkerPoll:     dur("CONVERTFLOW_WORKER_POLL", 2*time.Second),

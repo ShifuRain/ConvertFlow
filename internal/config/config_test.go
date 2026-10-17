@@ -43,11 +43,11 @@ func TestDatabaseURLFile(t *testing.T) {
 func TestInvalidValues(t *testing.T) {
 	base := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}
 	cases := map[string]map[string]string{
-		"missing db":  {},
-		"bad flavor":  {"CONVERTFLOW_FLAVOR": "gpl"},
-		"bad size":    {"CONVERTFLOW_MAX_UPLOAD_BYTES": "abc"},
-		"neg size":    {"CONVERTFLOW_MAX_UPLOAD_BYTES": "-5"},
-		"bad retain":  {"CONVERTFLOW_RETENTION": "tomorrow"},
+		"missing db": {},
+		"bad flavor": {"CONVERTFLOW_FLAVOR": "gpl"},
+		"bad size":   {"CONVERTFLOW_MAX_UPLOAD_BYTES": "abc"},
+		"neg size":   {"CONVERTFLOW_MAX_UPLOAD_BYTES": "-5"},
+		"bad retain": {"CONVERTFLOW_RETENTION": "tomorrow"},
 	}
 	for name, extra := range cases {
 		m := map[string]string{}
@@ -69,5 +69,23 @@ func TestRetentionOverride(t *testing.T) {
 	c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "x", "CONVERTFLOW_RETENTION": "36h"}), noFile)
 	if err != nil || c.Retention != 36*time.Hour {
 		t.Fatalf("got %v, %v", c.Retention, err)
+	}
+}
+
+func TestWorkerBudgets(t *testing.T) {
+	base := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}
+	c, err := config.Load(env(base), noFile)
+	if err != nil || c.JobTimeout != 4*time.Hour || c.MaxOutputBytes != 16<<30 {
+		t.Fatalf("bad defaults: %+v %v", c, err)
+	}
+	base["CONVERTFLOW_JOB_TIMEOUT"] = "90m"
+	base["CONVERTFLOW_MAX_OUTPUT_BYTES"] = "1000"
+	c, err = config.Load(env(base), noFile)
+	if err != nil || c.JobTimeout != 90*time.Minute || c.MaxOutputBytes != 1000 {
+		t.Fatalf("bad overrides: %+v %v", c, err)
+	}
+	base["CONVERTFLOW_JOB_TIMEOUT"] = "-1s"
+	if _, err = config.Load(env(base), noFile); err == nil {
+		t.Fatal("negative timeout must be rejected")
 	}
 }

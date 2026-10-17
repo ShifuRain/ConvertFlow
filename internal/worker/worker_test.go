@@ -1,0 +1,321 @@
+package worker_test
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/db/dbtest"
+	"github.com/ShifuRain/convertflow/internal/ffmpeg"
+	"github.com/ShifuRain/convertflow/internal/jobs"
+	"github.com/ShifuRain/convertflow/internal/testutil"
+	"github.com/ShifuRain/convertflow/internal/worker"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type env struct {
+	w     *worker.Worker
+	store *jobs.Store
+	dir   string
+	pool  *pgxpool.Pool
+}
+
+func setup(t *testing.T, lim ffmpeg.Limits) env {
+	t.Helper()
+	testutil.RequireTools(t)
+	pool := dbtest.New(t)
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "in"), 0o700)
+	_ = os.MkdirAll(filepath.Join(dir, "out"), 0o700)
+	store := jobs.NewStore(pool)
+	w := &worker.Worker{
+		ID: "w1", Store: store, Audit: audit.New(&strings.Builder{}),
+		FFmpegBin: "ffmpeg", FFprobeBin: "ffprobe", Flavor: "full",
+		OutDir: filepath.Join(dir, "out"), ScratchDir: t.TempDir(), Limits: lim,
+		Poll: 50 * time.Millisecond, HeartbeatEvery: 50 * time.Millisecond,
+	}
+	if err := w.RegisterCapabilities(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return env{w, store, dir, pool}
+}
+
+var defaultLimits = ffmpeg.Limits{MaxDurationSec: 3600, MaxPixels: 8192 * 4320, MaxStreams: 16}
+
+func (e env) enqueue(t *testing.T, src, preset string) string {
+	t.Helper()
+	id := uuid.NewString()
+	in := filepath.Join(e.dir, "in", id)
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(in, b, 0o600)
+	if err := e.store.Create(context.Background(), &jobs.Job{ID: id, Filename: "x", InputPath: in, Options: jobs.Options{Preset: preset}}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestWorkerConvertsAudio(t *testing.T) {
+	e := setup(t, defaultLimits)
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-flac")
+	ok, err := e.w.ProcessOne(context.Background())
+	if !ok || err != nil {
+		t.Fatalf("ProcessOne: %v %v", ok, err)
+	}
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusDone || j.EncoderUsed != "flac" || j.Progress != 100 {
+		t.Fatalf("bad job %+v", j)
+	}
+	if st, err := os.Stat(j.OutputPath); err != nil || st.Size() == 0 {
+		t.Fatalf("output missing: %v", err)
+	}
+	if _, err := os.Stat(j.InputPath); !os.IsNotExist(err) {
+		t.Fatal("input should be removed after completion")
+	}
+}
+
+func TestWorkerFailsOnGarbage(t *testing.T) {
+	e := setup(t, defaultLimits)
+	src := filepath.Join(t.TempDir(), "x.mp4")
+	_ = os.WriteFile(src, []byte("not media"), 0o600)
+	id := e.enqueue(t, src, "audio-wav")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || j.Error == "" || strings.Contains(j.Error, e.dir) {
+		t.Fatalf("bad failure %+v", j)
+	}
+}
+
+func TestWorkerFailsOnAudioOnlyForVideoPreset(t *testing.T) {
+	e := setup(t, defaultLimits)
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "video-vp9")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || !strings.Contains(j.Error, "no video stream") {
+		t.Fatalf("bad failure %+v", j)
+	}
+}
+
+func TestWorkerEnforcesLimits(t *testing.T) {
+	e := setup(t, ffmpeg.Limits{MaxDurationSec: 3600, MaxPixels: 100, MaxStreams: 16})
+	src := testutil.MakeClip(t, t.TempDir(), "v.mkv", "video")
+	id := e.enqueue(t, src, "video-vp9")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || !strings.Contains(j.Error, "dimensions") {
+		t.Fatalf("bad failure %+v", j)
+	}
+}
+
+func TestWorkerNoJob(t *testing.T) {
+	e := setup(t, defaultLimits)
+	ok, err := e.w.ProcessOne(context.Background())
+	if ok || err != nil {
+		t.Fatalf("got %v %v", ok, err)
+	}
+}
+
+func TestWatchCancelsOnRequest(t *testing.T) {
+	e := setup(t, defaultLimits)
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-wav")
+	ctx := context.Background()
+	if _, err := e.store.Claim(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.store.RequestCancel(ctx, id)
+	cctx, cancel := context.WithCancel(ctx)
+	var canceled atomic.Bool
+	done := make(chan struct{})
+	go func() { e.w.Watch(cctx, id, cancel, &canceled); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Watch did not react to cancel request")
+	}
+	if !canceled.Load() || cctx.Err() == nil {
+		t.Fatal("expected canceled flag and cancelled context")
+	}
+}
+
+func (e env) outFiles(t *testing.T) []string {
+	t.Helper()
+	ents, _ := os.ReadDir(filepath.Join(e.dir, "out"))
+	var n []string
+	for _, x := range ents {
+		n = append(n, x.Name())
+	}
+	return n
+}
+
+func TestWorkerFailsOnEmptyFile(t *testing.T) {
+	e := setup(t, defaultLimits)
+	src := filepath.Join(t.TempDir(), "x.mp4")
+	_ = os.WriteFile(src, nil, 0o600)
+	id := e.enqueue(t, src, "audio-wav")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || j.Error == "" || strings.Contains(j.Error, e.dir) || strings.Contains(j.Error, "/") {
+		t.Fatalf("bad failure %+v", j)
+	}
+	if _, err := os.Stat(j.InputPath); !os.IsNotExist(err) {
+		t.Fatal("input should be removed after failure")
+	}
+}
+
+func TestWorkerAudioOnlyMessageExact(t *testing.T) {
+	e := setup(t, defaultLimits)
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "video-vp9")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Error != "input has no video stream" {
+		t.Fatalf("got %q", j.Error)
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("no output expected")
+	}
+}
+
+func TestWorkerCoverArtMP3ToAudioPreset(t *testing.T) {
+	e := setup(t, defaultLimits)
+	d := t.TempDir()
+	mp3 := filepath.Join(d, "c.mp3")
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+		"-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=1",
+		"-map", "0:a", "-map", "1:v", "-frames:v", "1", "-c:a", "libmp3lame", "-c:v", "mjpeg",
+		"-disposition:v", "attached_pic", "-id3v2_version", "3", mp3)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("cannot build cover-art mp3: %v %s", err, b)
+	}
+	id := e.enqueue(t, mp3, "audio-flac")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusDone {
+		t.Fatalf("bad job %+v", j)
+	}
+	if st, err := os.Stat(j.OutputPath); err != nil || st.Size() == 0 {
+		t.Fatalf("output missing: %v", err)
+	}
+}
+
+func TestWorkerTimeoutFailsJob(t *testing.T) {
+	e := setup(t, defaultLimits)
+	e.w.JobTimeout = time.Millisecond
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-wav")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || j.Error != "conversion timed out" {
+		t.Fatalf("bad job %+v", j)
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("partial output must be removed")
+	}
+}
+
+func TestWorkerOutputCapFailsJob(t *testing.T) {
+	e := setup(t, defaultLimits)
+	e.w.MaxOutputBytes = 1000
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-wav")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || j.Error != "output exceeds size limit" {
+		t.Fatalf("bad job %+v", j)
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("oversize output must be removed")
+	}
+}
+
+func TestWorkerUnresolvablePresetFails(t *testing.T) {
+	e := setup(t, defaultLimits)
+	e.w.Flavor = "lgpl" // libx264/aac are not allowed under lgpl
+	if err := e.w.RegisterCapabilities(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	src := testutil.MakeClip(t, t.TempDir(), "v.mkv", "av")
+	id := e.enqueue(t, src, "video-h264")
+	_, _ = e.w.ProcessOne(context.Background())
+	j, _ := e.store.Get(context.Background(), id)
+	if j.Status != jobs.StatusFailed || !strings.Contains(j.Error, "no encoder available") {
+		t.Fatalf("bad job %+v", j)
+	}
+}
+
+func TestWorkerAbortsQuietlyWhenLeaseLost(t *testing.T) {
+	e := setup(t, defaultLimits)
+	d := t.TempDir()
+	long := filepath.Join(d, "long.mkv")
+	if b, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+		"testsrc=duration=60:size=1280x720:rate=25", "-c:v", "mpeg4", long).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, b)
+	}
+	id := e.enqueue(t, long, "video-vp9")
+	ctx := context.Background()
+	go func() {
+		for i := 0; i < 600; i++ {
+			j, err := e.store.Get(ctx, id)
+			if err == nil && j.Status == jobs.StatusRunning {
+				// simulate the janitor requeueing the job after a missed lease
+				_, _ = e.pool.Exec(ctx, `UPDATE jobs SET status='queued', worker_id='' WHERE id=$1::uuid`, id)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	start := time.Now()
+	ok, err := e.w.ProcessOne(ctx)
+	if !ok || err != nil {
+		t.Fatalf("ProcessOne: %v %v", ok, err)
+	}
+	if time.Since(start) > 20*time.Second {
+		t.Fatal("worker did not stop ffmpeg after losing the lease")
+	}
+	j, _ := e.store.Get(ctx, id)
+	if j.Status != jobs.StatusQueued || j.Error != "" {
+		t.Fatalf("job must be left alone, got %+v", j)
+	}
+	if _, err := os.Stat(j.InputPath); err != nil {
+		t.Fatal("input must be kept for the requeued job")
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("partial output must be removed")
+	}
+}
+
+func TestWatchStopsWhenLeaseLost(t *testing.T) {
+	e := setup(t, defaultLimits)
+	ctx := context.Background()
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-wav")
+	if _, err := e.store.Claim(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.store.Fail(ctx, id, "x")
+	cctx, cancel := context.WithCancel(ctx)
+	var canceled atomic.Bool
+	done := make(chan struct{})
+	go func() { e.w.Watch(cctx, id, cancel, &canceled); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Watch did not stop")
+	}
+	if canceled.Load() || cctx.Err() == nil {
+		t.Fatal("lease loss must cancel the context without marking user cancel")
+	}
+}
