@@ -2,7 +2,7 @@
 # Builds the offline ("air-gap") install bundle:
 #   convertflow-<version>-<flavor>-airgap.tar.gz
 #     images.tar.gz          api + worker + pinned postgres images (`save`), gzip -n
-#     compose.yaml + compose.airgap.yaml (db -> local postgres name), IMAGES.txt, docker/, scripts/gen-secrets.sh, README.md, LICENSE, docs/*.md
+#     compose.yaml + compose.airgap.yaml (db -> local postgres name), IMAGES.txt, docker/, scripts/gen-secrets.sh, README.md, LICENSE, SECURITY.md, CONTRIBUTING.md, docs/*.md
 #     THIRD-PARTY-LICENSES/  (if $LICENSES_DIR is set)      sbom/*.cdx.json (if $SBOM_DIR is set)
 #     AIRGAP-README.txt      offline load + verify + start instructions
 #     SHA256SUMS             checksums of every file in the bundle
@@ -43,7 +43,7 @@ want_pg=convertflow-postgres:$pg_tag
 "$RT" tag "$("$RT" image inspect "$pg" --format '{{.Id}}')" "$want_pg"
 "$RT" save "${fmt[@]}" -o "$stage/images.tar" "$want_api" "$want_worker" "$want_pg"
 gzip -9nc "$stage/images.tar" > "$b/images.tar.gz"
-cp compose.yaml README.md LICENSE "$b/"
+cp compose.yaml README.md LICENSE SECURITY.md CONTRIBUTING.md "$b/"
 cp docker/ffmpeg.env docker/SOURCE-OFFER.txt "$b/docker/"
 cp scripts/gen-secrets.sh "$b/scripts/"
 for f in docs/*.md; do [ -f "$f" ] && cp "$f" "$b/docs/"; done
