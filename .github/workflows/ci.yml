@@ -1,0 +1,254 @@
+# CI for ConvertFlow. NOTE: these workflows were validated statically (actionlint, YAML parse, the pinning checker) but
+# have not been executed on GitHub yet; the scripts they call were run locally with rootless podman 6.1.2.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_full:
+        description: "Also build and scan the FULL (GPL, x264/x265) worker flavor - long FFmpeg build"
+        type: boolean
+        default: false
+
+# Least privilege by default; no job below needs more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  test:
+    name: test (go vet, race tests, UI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: docker.io/library/postgres:16-bookworm@sha256:0ea6700a3b4f0ae6ce746519073558aed4d88a79d8d07622a9a644946c7319c4
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres?sslmode=disable
+      CONVERTFLOW_REQUIRE_UI: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install ffmpeg for the FFmpeg-dependent tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: UI build (includes tsc --noEmit)
+        run: make ui
+      - name: UI type check
+        run: npm --prefix ui run typecheck
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+
+  security:
+    name: security (govulncheck, gosec, licenses)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: make ui
+      - name: govulncheck, gosec, license policy (versions pinned in scripts/tool-versions.env)
+        run: scripts/security-scan.sh
+
+  pinning:
+    name: supply-chain pinning and workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Pinning policy (digests, commit SHAs, no floating tags)
+        run: scripts/check-pinned-digests.sh
+      - name: .trivyignore policy (justification + expiry) and its self-test
+        run: |
+          scripts/check-trivyignore.sh --self-test
+          scripts/check-trivyignore.sh
+      - name: actionlint
+        run: |
+          . scripts/tool-versions.env
+          go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
+  images:
+    name: images (lgpl build, Trivy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the pinned FFmpeg version (validated before use)
+        id: ff
+        run: |
+          set -euo pipefail
+          . docker/ffmpeg.env
+          [[ "$FFMPEG_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+          [[ "$FFMPEG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          { echo "version=$FFMPEG_VERSION"; echo "sha256=$FFMPEG_SHA256"; } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build api image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.api
+          push: false
+          tags: convertflow-api:dev
+          outputs: type=docker,dest=${{ runner.temp }}/api.tar
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+      - name: Build worker image (lgpl flavor)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: false
+          tags: convertflow-worker:dev-lgpl
+          build-args: |
+            FFMPEG_FLAVOR=lgpl
+            FFMPEG_VERSION=${{ steps.ff.outputs.version }}
+            FFMPEG_SHA256=${{ steps.ff.outputs.sha256 }}
+          outputs: type=docker,dest=${{ runner.temp }}/worker-lgpl.tar
+          cache-from: type=gha,scope=worker-lgpl
+          cache-to: type=gha,scope=worker-lgpl,mode=max
+      - name: Trivy scan (HIGH/CRITICAL with a fix fail the job; exceptions only via .trivyignore)
+        env:
+          CONTAINER_RUNTIME: docker
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: scripts/trivy-scan.sh "$RUNNER_TEMP_DIR/api.tar" "$RUNNER_TEMP_DIR/worker-lgpl.tar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: images-lgpl
+          path: |
+            ${{ runner.temp }}/api.tar
+            ${{ runner.temp }}/worker-lgpl.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  hardening:
+    name: container hardening test (rootless podman)
+    needs: images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: images-lgpl
+          path: ${{ runner.temp }}/images
+      # tests/container/hardening.sh has only been verified with rootless podman 6.x + the docker-compose provider
+      # (see docs/containers.md); the Docker engine is deliberately not used here. The runner ships podman 4.x;
+      # this job is the first run of the test on that version and may need adjustment.
+      - name: Install jq, podman and a pinned docker-compose provider
+        env:
+          COMPOSE_VERSION: v5.5.1
+          COMPOSE_SHA256: db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman jq uidmap
+          curl -fsSL -o /tmp/docker-compose "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  /tmp/docker-compose" | sha256sum -c -
+          sudo install -m 0755 /tmp/docker-compose /usr/local/bin/docker-compose
+          podman --version
+          podman info --format 'rootless={{.Host.Security.Rootless}}'
+      - name: Load the images built by the images job
+        env:
+          IMG_DIR: ${{ runner.temp }}/images
+        run: |
+          podman load -i "$IMG_DIR/api.tar"
+          podman load -i "$IMG_DIR/worker-lgpl.tar"
+          podman images
+      - name: Start the podman API socket for the compose provider
+        run: |
+          export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+          mkdir -p "$XDG_RUNTIME_DIR/podman"
+          nohup podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" >/tmp/podman-service.log 2>&1 &
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock" >> "$GITHUB_ENV"
+          sleep 2
+      - name: Hardening test
+        env:
+          CONTAINER_RUNTIME: podman
+        run: tests/container/hardening.sh
+      - name: Hardening self-test (a weakened config must be rejected)
+        env:
+          CONTAINER_RUNTIME: podman
+        run: tests/container/hardening.sh --self-test
+
+  image-full:
+    name: images (FULL flavor, manual only)
+    if: github.event_name == 'workflow_dispatch' && inputs.build_full
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the pinned FFmpeg version (validated before use)
+        id: ff
+        run: |
+          set -euo pipefail
+          . docker/ffmpeg.env
+          [[ "$FFMPEG_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+          [[ "$FFMPEG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          { echo "version=$FFMPEG_VERSION"; echo "sha256=$FFMPEG_SHA256"; } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build worker image (full flavor, GPL with x264/x265; patent and licence notice in docker/SOURCE-OFFER.txt)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: false
+          tags: convertflow-worker:dev-full
+          build-args: |
+            FFMPEG_FLAVOR=full
+            FFMPEG_VERSION=${{ steps.ff.outputs.version }}
+            FFMPEG_SHA256=${{ steps.ff.outputs.sha256 }}
+          outputs: type=docker,dest=${{ runner.temp }}/worker-full.tar
+          cache-from: type=gha,scope=worker-full
+          cache-to: type=gha,scope=worker-full,mode=max
+      - name: Trivy scan
+        env:
+          CONTAINER_RUNTIME: docker
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: scripts/trivy-scan.sh "$RUNNER_TEMP_DIR/worker-full.tar"

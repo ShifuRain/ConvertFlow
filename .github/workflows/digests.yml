@@ -1,0 +1,31 @@
+# Weekly staleness check of every digest-pinned container image (base images, CI tool images).
+# Policy (scripts/check-pinned-digests.sh): a pinned digest that no longer resolves FAILS this workflow;
+# a tag that has moved to a newer digest only produces a warning annotation (run scripts/pin-digests.sh,
+# review, commit - Dependabot's docker ecosystem also proposes such bumps for the Dockerfiles/compose).
+# The release workflow runs the same check with --strict, so a stale digest blocks a release.
+name: digests
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: digests
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: scripts/check-pinned-digests.sh --online
