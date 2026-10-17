@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 # Fail closed: the tarball must match the SHA-256 pinned in docker/ffmpeg.env (which was
 # GPG-verified when it was recorded). No keyserver is used at build time.
-RUN test -n "$FFMPEG_VERSION" && test -n "$FFMPEG_SHA256" \
+RUN printf '%s' "$FFMPEG_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)+$' \
+ && printf '%s' "$FFMPEG_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
  && curl -fLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
  && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
  && mkdir ffmpeg && tar -xf ffmpeg.tar.xz -C ffmpeg --strip-components=1
@@ -22,7 +23,7 @@ RUN set -eux; \
       --enable-libsvtav1 --enable-libaom --enable-libvpx --enable-libopus --enable-libvorbis --enable-libmp3lame"; \
     if [ "$FFMPEG_FLAVOR" = "full" ]; then \
       echo "NOTICE: building the GPL flavor (x264/x265). Redistribution requires offering source; H.264/H.265/AAC may require patent licenses. See /usr/share/doc/ffmpeg/SOURCE-OFFER.txt."; \
-      flags="$flags --enable-gpl --enable-version3 --enable-libx264 --enable-libx265"; \
+      flags="$flags --enable-gpl --enable-libx264 --enable-libx265"; \
     elif [ "$FFMPEG_FLAVOR" != "lgpl" ]; then echo "unknown FFMPEG_FLAVOR $FFMPEG_FLAVOR" >&2; exit 1; fi; \
     ./configure $flags; \
     make -j"$(nproc)"; make install; \
@@ -51,6 +52,19 @@ COPY --from=ffmpeg /opt/ffmpeg/BUILDINFO /usr/share/doc/ffmpeg/BUILDINFO
 COPY --from=ffmpeg /src/ffmpeg/COPYING.* /src/ffmpeg/LICENSE.md /usr/share/doc/ffmpeg/
 COPY docker/SOURCE-OFFER.txt /usr/share/doc/ffmpeg/SOURCE-OFFER.txt
 COPY --from=gobuild /out/convertflow-worker /usr/local/bin/convertflow-worker
+# Fail the build if the runtime image cannot actually run the FFmpeg we built (soname drift, missing libs,
+# missing encoders) or if the licence flavor is not what was requested.
+RUN set -eux; \
+    ! ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe | grep 'not found'; \
+    enc="$(ffmpeg -hide_banner -encoders)"; \
+    want="libsvtav1 libaom-av1 libvpx-vp9 libopus libvorbis libmp3lame"; \
+    if [ "$FFMPEG_FLAVOR" = "full" ]; then want="$want libx264 libx265"; fi; \
+    for e in $want; do printf '%s\n' "$enc" | grep -qw "$e" || { echo "missing encoder $e" >&2; exit 1; }; done; \
+    ver="$(ffmpeg -version)"; \
+    if [ "$FFMPEG_FLAVOR" = "lgpl" ]; then \
+      if printf '%s\n' "$ver" | grep -Eq -- '--enable-(gpl|nonfree|version3)'; then echo "lgpl image built with GPL/nonfree flags" >&2; exit 1; fi; \
+    else printf '%s\n' "$ver" | grep -q -- '--enable-gpl'; fi; \
+    ffprobe -version >/dev/null
 USER 65532:65532
 ENV CONVERTFLOW_DATA_DIR=/data CONVERTFLOW_FLAVOR=${FFMPEG_FLAVOR}
 ENTRYPOINT ["/usr/local/bin/convertflow-worker"]

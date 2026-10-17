@@ -6,3 +6,6 @@ ui/node_modules
 internal/ui/dist
 compose.yaml
 Dockerfile.*
+.env*
+tests
+docs
