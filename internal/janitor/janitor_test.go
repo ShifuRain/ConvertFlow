@@ -3,6 +3,7 @@ package janitor_test
 import (
 	"bytes"
 	"context"
+	"github.com/ShifuRain/convertflow/internal/presets"
 	"io"
 	"os"
 	"path/filepath"
@@ -84,7 +85,7 @@ func (e *env) job(t *testing.T, state string) string {
 
 func mustClaim(t *testing.T, s *jobs.Store) {
 	t.Helper()
-	if j, err := s.Claim(context.Background(), "w"); err != nil || j == nil {
+	if j, err := s.Claim(context.Background(), "w", presets.IDs(presets.All())); err != nil || j == nil {
 		t.Fatalf("claim: %v %v", j, err)
 	}
 }

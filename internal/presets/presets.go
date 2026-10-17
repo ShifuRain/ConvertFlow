@@ -119,3 +119,12 @@ func FlavorAllows(flavor, encoder string) bool {
 	// For lgpl or any unknown flavor, use the allow-list (fail-closed)
 	return lgplSafe[encoder]
 }
+
+// IDs returns the IDs of the given presets.
+func IDs(ps []Preset) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.ID)
+	}
+	return out
+}

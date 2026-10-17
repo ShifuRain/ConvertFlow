@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"github.com/ShifuRain/convertflow/internal/presets"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -132,7 +133,7 @@ func TestWatchCancelsOnRequest(t *testing.T) {
 	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
 	id := e.enqueue(t, src, "audio-wav")
 	ctx := context.Background()
-	if _, err := e.store.Claim(ctx, "w1"); err != nil {
+	if _, err := e.store.Claim(ctx, "w1", presets.IDs(presets.All())); err != nil {
 		t.Fatal(err)
 	}
 	_ = e.store.RequestCancel(ctx, id)
@@ -250,7 +251,18 @@ func TestWorkerUnresolvablePresetFails(t *testing.T) {
 	}
 	src := testutil.MakeClip(t, t.TempDir(), "v.mkv", "av")
 	id := e.enqueue(t, src, "video-h264")
-	_, _ = e.w.ProcessOne(context.Background())
+	// Capability-aware claiming keeps the job queued; the worker-side failure is defence in depth.
+	if ok, _ := e.w.ProcessOne(context.Background()); ok {
+		t.Fatal("worker claimed a job it cannot encode")
+	}
+	if j, _ := e.store.Get(context.Background(), id); j.Status != jobs.StatusQueued {
+		t.Fatalf("job should stay queued, got %s", j.Status)
+	}
+	claimed, err := e.store.Claim(context.Background(), "w1", presets.IDs(presets.All()))
+	if err != nil || claimed == nil {
+		t.Fatal(err)
+	}
+	e.w.ProcessClaimed(context.Background(), claimed)
 	j, _ := e.store.Get(context.Background(), id)
 	if j.Status != jobs.StatusFailed || !strings.Contains(j.Error, "no encoder available") {
 		t.Fatalf("bad job %+v", j)
@@ -303,7 +315,7 @@ func TestWatchStopsWhenLeaseLost(t *testing.T) {
 	ctx := context.Background()
 	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
 	id := e.enqueue(t, src, "audio-wav")
-	if _, err := e.store.Claim(ctx, "w1"); err != nil {
+	if _, err := e.store.Claim(ctx, "w1", presets.IDs(presets.All())); err != nil {
 		t.Fatal(err)
 	}
 	_ = e.store.Fail(ctx, id, "x")

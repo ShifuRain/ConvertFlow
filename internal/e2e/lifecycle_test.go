@@ -15,6 +15,7 @@ import (
 
 	"github.com/ShifuRain/convertflow/internal/audit"
 	"github.com/ShifuRain/convertflow/internal/janitor"
+	"github.com/ShifuRain/convertflow/internal/jobs"
 )
 
 // Review Focus 7 (round trip). The audio round trip checks container, duration and that the
@@ -394,19 +395,14 @@ func TestPresetsReflectLiveWorkers(t *testing.T) {
 	}
 }
 
-// Review Focus 7 (heterogeneous workers). Claim() does not match jobs to worker capabilities, so a
-// worker that lacks the encoder can claim the job and fail it permanently with "no encoder available
-// on this worker". Single-image deployments never hit this; mixed-capability fleets (for example an
-// lgpl worker next to a full one) would. Reported as a concern, not fixed: it needs a schema/claim
-// change. Remove the Skip to reproduce.
+// Review Focus 7 (heterogeneous workers): Claim only hands a worker jobs for presets it can encode,
+// so an audio-only worker next to a full one never fails a video job.
 func TestHeterogeneousWorkersMisclaim(t *testing.T) {
-	t.Skip("KNOWN BUG (Task 5/6 claim logic): Store.Claim ignores worker capabilities, so a worker lacking the preset's encoder " +
-		"can claim and permanently fail a job another live worker could run (error 'no encoder available on this worker for preset ...').")
 	s := start(t, opts{noWorkers: true})
 	s.addWorker("audio-only", workerOpts{hide: "libvpx-vp9|libvpx|libsvtav1|libx264|libx265"})
 	s.addWorker("full", workerOpts{})
 	s.waitWorkers(2)
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 12; i++ {
 		id := s.mustUpload("video-vp9", "v.mkv", clip(t, "video"))
 		if done := s.wait(id); done["status"] != "done" {
 			t.Fatalf("job %d: %v", i, done)
@@ -479,5 +475,32 @@ func TestParallelUploadsTwoWorkers(t *testing.T) {
 	s.waitDirEmpty("in")
 	if n := s.names("out"); len(n) != 8 {
 		t.Errorf("want 8 outputs, got %v", n)
+	}
+}
+
+// A queued job whose preset no live worker supports stays queued (neither failed nor claimed) and
+// still counts as active in the API's queue cap.
+func TestUnsupportedPresetStaysQueued(t *testing.T) {
+	s := start(t, opts{noWorkers: true})
+	s.addWorker("audio-only", workerOpts{hide: "libvpx-vp9|libvpx|libsvtav1|libx264|libx265"})
+	s.waitWorkers(1)
+	// Enqueue directly: the API (rightly) refuses presets nobody offers.
+	id := "11111111-2222-4333-8444-555555555555"
+	in := filepath.Join(s.dir, "in", id)
+	_ = os.WriteFile(in, clip(t, "video"), 0o600)
+	if err := s.store.Create(context.Background(), &jobs.Job{ID: id, Filename: "v.mkv", InputPath: in, Options: jobs.Options{Preset: "video-vp9"}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if v := s.get("/api/v1/jobs/" + id).Body; v["status"] != "queued" || v["attempts"].(float64) != 0 {
+		t.Fatalf("job should still be queued: %v", v)
+	}
+	if n, err := s.store.CountActive(context.Background()); err != nil || n != 1 {
+		t.Fatalf("CountActive = %d %v", n, err)
+	}
+	s.addWorker("full", workerOpts{})
+	s.waitWorkers(2)
+	if v := s.waitStatus(id, 60*time.Second); v["status"] != "done" {
+		t.Fatalf("after a capable worker appears: %v", v)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"github.com/ShifuRain/convertflow/internal/presets"
 	"io"
 	"net"
 	"net/http"
@@ -57,7 +58,7 @@ func seedDone(t *testing.T, f fixture, filename, preset, content string) string 
 	if err := f.store.Create(ctx, &jobs.Job{ID: id, Filename: filename, InputPath: in, Options: jobs.Options{Preset: preset}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.store.Claim(ctx, "w1"); err != nil {
+	if _, err := f.store.Claim(ctx, "w1", presets.IDs(presets.All())); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.store.SetRunning(ctx, id, "pcm_s16le"); err != nil {
@@ -210,7 +211,7 @@ func TestOutputNotReady(t *testing.T) {
 	ctx := context.Background()
 	id := uuid.NewString()
 	_ = f.store.Create(ctx, &jobs.Job{ID: id, Filename: "f", InputPath: "/x", Options: jobs.Options{Preset: "audio-wav"}})
-	_, _ = f.store.Claim(ctx, "w1")
+	_, _ = f.store.Claim(ctx, "w1", presets.IDs(presets.All()))
 	_ = f.store.Fail(ctx, id, "boom")
 	if w := get(f, "/api/v1/jobs/"+id+"/output"); w.Code != 409 {
 		t.Fatalf("failed job: want 409 got %d", w.Code)
@@ -239,7 +240,7 @@ func TestDeleteSemantics(t *testing.T) {
 	// running job: cancel requested, 202
 	rid := uuid.NewString()
 	_ = f.store.Create(ctx, &jobs.Job{ID: rid, Filename: "r", InputPath: "/x", Options: jobs.Options{Preset: "audio-wav"}})
-	_, _ = f.store.Claim(ctx, "w1")
+	_, _ = f.store.Claim(ctx, "w1", presets.IDs(presets.All()))
 	if w := del(f, "/api/v1/jobs/"+rid); w.Code != 202 {
 		t.Fatalf("want 202 got %d", w.Code)
 	}
@@ -515,7 +516,7 @@ func TestSSEStreamsUntilDone(t *testing.T) {
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		_, _ = f.store.Claim(ctx, "w1")
+		_, _ = f.store.Claim(ctx, "w1", presets.IDs(presets.All()))
 		_ = f.store.SetRunning(ctx, id, "pcm_s16le")
 		_ = f.store.UpdateProgress(ctx, id, 50)
 		time.Sleep(100 * time.Millisecond)

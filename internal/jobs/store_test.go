@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ShifuRain/convertflow/internal/presets"
 	"sync"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestClaimIsExclusive(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			j, err := s.Claim(ctx, fmt.Sprintf("w%d", i))
+			j, err := s.Claim(ctx, fmt.Sprintf("w%d", i), presets.IDs(presets.All()))
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -74,7 +75,7 @@ func TestClaimIsExclusive(t *testing.T) {
 
 func TestClaimEmptyQueue(t *testing.T) {
 	s := jobs.NewStore(dbtest.New(t))
-	j, err := s.Claim(context.Background(), "w")
+	j, err := s.Claim(context.Background(), "w", presets.IDs(presets.All()))
 	if j != nil || err != nil {
 		t.Fatalf("want nil,nil got %v,%v", j, err)
 	}
@@ -85,7 +86,7 @@ func TestLifecycleAndCancel(t *testing.T) {
 	ctx := context.Background()
 	j := newJob()
 	_ = s.Create(ctx, j)
-	c, _ := s.Claim(ctx, "w1")
+	c, _ := s.Claim(ctx, "w1", presets.IDs(presets.All()))
 	if c.Status != jobs.StatusProbing || c.Attempts != 1 || c.WorkerID != "w1" {
 		t.Fatalf("bad claim %+v", c)
 	}
@@ -124,8 +125,8 @@ func TestCompleteAndFail(t *testing.T) {
 	a, b := newJob(), newJob()
 	_ = s.Create(ctx, a)
 	_ = s.Create(ctx, b)
-	_, _ = s.Claim(ctx, "w") // a
-	_, _ = s.Claim(ctx, "w") // b
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // a
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // b
 	_ = s.SetRunning(ctx, a.ID, "pcm_s16le")
 	if err := s.Complete(ctx, a.ID, "/data/out/x.wav"); err != nil {
 		t.Fatal(err)
@@ -150,8 +151,8 @@ func TestRequeueStale(t *testing.T) {
 	a, b := newJob(), newJob()
 	_ = s.Create(ctx, a)
 	_ = s.Create(ctx, b)
-	_, _ = s.Claim(ctx, "w") // a: attempts=1
-	_, _ = s.Claim(ctx, "w") // b: attempts=1
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // a: attempts=1
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // b: attempts=1
 	// b has exhausted attempts
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET attempts = 3 WHERE id = $1::uuid`, b.ID)
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
@@ -172,7 +173,7 @@ func TestDeleteSemantics(t *testing.T) {
 	idle, busy := newJob(), newJob()
 	_ = s.Create(ctx, idle)
 	_ = s.Create(ctx, busy)
-	_, _ = s.Claim(ctx, "w") // claims `idle` (older)
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // claims `idle` (older)
 	if _, err := s.Delete(ctx, idle.ID); !errors.Is(err, jobs.ErrBusy) {
 		t.Fatalf("want ErrBusy, got %v", err)
 	}
@@ -192,8 +193,8 @@ func TestExpiredAndExists(t *testing.T) {
 	old, fresh := newJob(), newJob()
 	_ = s.Create(ctx, old)
 	_ = s.Create(ctx, fresh)
-	_, _ = s.Claim(ctx, "w")
-	_, _ = s.Claim(ctx, "w")
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_ = s.Fail(ctx, old.ID, "x")
 	_ = s.Fail(ctx, fresh.ID, "x")
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET finished_at = now() - interval '2 days' WHERE id = $1::uuid`, old.ID)
@@ -241,7 +242,7 @@ func TestZombieWritesAfterRequeue(t *testing.T) {
 	ctx := context.Background()
 	j := newJob()
 	_ = s.Create(ctx, j)
-	_, _ = s.Claim(ctx, "w")
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
 	if r, _, err := s.RequeueStale(ctx, time.Minute, 3); err != nil || r != 1 {
 		t.Fatalf("requeue %d %v", r, err)
@@ -268,7 +269,7 @@ func TestZombieLeavesJobQueued(t *testing.T) {
 	ctx := context.Background()
 	j := newJob()
 	_ = s.Create(ctx, j)
-	_, _ = s.Claim(ctx, "w")
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
 	_, _, _ = s.RequeueStale(ctx, time.Minute, 3)
 	_ = s.SetRunning(ctx, j.ID, "x")
@@ -285,7 +286,7 @@ func TestMarkCanceledOnDoneIsNotFound(t *testing.T) {
 	ctx := context.Background()
 	j := newJob()
 	_ = s.Create(ctx, j)
-	_, _ = s.Claim(ctx, "w")
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_ = s.SetRunning(ctx, j.ID, "x")
 	_ = s.Complete(ctx, j.ID, "/o")
 	if err := s.MarkCanceled(ctx, j.ID); !errors.Is(err, jobs.ErrNotFound) {
@@ -310,7 +311,7 @@ func TestRequeueStaleCancelRequestedGoesCanceled(t *testing.T) {
 	ctx := context.Background()
 	j := newJob()
 	_ = s.Create(ctx, j)
-	_, _ = s.Claim(ctx, "w")
+	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_ = s.RequestCancel(ctx, j.ID)
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
 	requeued, failed, err := s.RequeueStale(ctx, time.Minute, 3)
@@ -340,7 +341,7 @@ func TestCountActive(t *testing.T) {
 	if n, _ := s.CountActive(ctx); n != 4 {
 		t.Fatalf("queued jobs count: %d", n)
 	}
-	claimed, err := s.Claim(ctx, "w1") // probing still counts
+	claimed, err := s.Claim(ctx, "w1", presets.IDs(presets.All())) // probing still counts
 	if err != nil || claimed == nil {
 		t.Fatal(claimed, err)
 	}
@@ -360,5 +361,38 @@ func TestCountActive(t *testing.T) {
 	}
 	if n, _ := s.CountActive(ctx); n != 2 {
 		t.Fatalf("terminal jobs must not count: %d", n)
+	}
+}
+
+func TestClaimFiltersByPreset(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	mk := func(preset string) *jobs.Job {
+		j := newJob()
+		j.Options.Preset = preset
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+		return j
+	}
+	a1, b, a2 := mk("video-vp9"), mk("audio-wav"), mk("video-vp9")
+	if j, err := s.Claim(ctx, "w", nil); j != nil || err != nil {
+		t.Fatalf("empty list must claim nothing: %v %v", j, err)
+	}
+	if j, err := s.Claim(ctx, "w", []string{"audio-flac"}); j != nil || err != nil {
+		t.Fatalf("unrelated preset claimed: %v %v", j, err)
+	}
+	got, err := s.Claim(ctx, "wb", []string{"audio-wav"})
+	if err != nil || got == nil || got.ID != b.ID {
+		t.Fatalf("worker offering audio-wav: %v %v", got, err)
+	}
+	for _, want := range []string{a1.ID, a2.ID} { // oldest first among eligible
+		got, err := s.Claim(ctx, "wa", []string{"video-vp9", "audio-wav"})
+		if err != nil || got == nil || got.ID != want {
+			t.Fatalf("want %s, got %v %v", want, got, err)
+		}
+	}
+	if j, _ := s.Claim(ctx, "wa", presets.IDs(presets.All())); j != nil {
+		t.Fatalf("nothing left, got %v", j)
 	}
 }

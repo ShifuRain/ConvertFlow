@@ -51,8 +51,9 @@ type Worker struct {
 	// MaxOutputBytes kills a run whose output file grows beyond it (default 16 GiB).
 	MaxOutputBytes int64
 
-	mu       sync.RWMutex
-	encoders map[string]bool
+	mu        sync.RWMutex
+	encoders  map[string]bool
+	presetIDs []string // presets resolvable with encoders; guarded by mu
 }
 
 func (w *Worker) RegisterCapabilities(ctx context.Context) error {
@@ -64,10 +65,18 @@ func (w *Worker) RegisterCapabilities(ctx context.Context) error {
 	for _, e := range encs {
 		set[e] = true
 	}
+	ids := presets.IDs(presets.Available(set))
 	w.mu.Lock()
 	w.encoders = set
+	w.presetIDs = ids
 	w.mu.Unlock()
 	return w.Store.UpsertWorker(ctx, w.ID, encs)
+}
+
+func (w *Worker) claimable() []string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.presetIDs
 }
 
 func (w *Worker) snapshot() map[string]bool {
@@ -112,7 +121,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // ProcessOne claims and processes at most one job. It reports whether a job was claimed.
 func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
-	j, err := w.Store.Claim(ctx, w.ID)
+	j, err := w.Store.Claim(ctx, w.ID, w.claimable())
 	if err != nil {
 		return false, err
 	}

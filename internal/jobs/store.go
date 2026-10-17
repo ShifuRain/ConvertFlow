@@ -76,13 +76,18 @@ func collect(rows pgx.Rows) ([]Job, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) Claim(ctx context.Context, workerID string) (*Job, error) {
+// Claim takes the oldest queued job whose preset is in presetIDs (the presets the calling worker
+// can encode). An empty list claims nothing, so a job no live worker supports stays queued.
+func (s *Store) Claim(ctx context.Context, workerID string, presetIDs []string) (*Job, error) {
+	if len(presetIDs) == 0 {
+		return nil, nil
+	}
 	j, err := scanJob(s.pool.QueryRow(ctx, `
 UPDATE jobs SET status = 'probing', worker_id = $1, attempts = attempts + 1,
   heartbeat_at = now(), updated_at = now()
-WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at
+WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND options->>'preset' = ANY($2::text[]) ORDER BY created_at
             FOR UPDATE SKIP LOCKED LIMIT 1)
-RETURNING `+jobCols, workerID))
+RETURNING `+jobCols, workerID, presetIDs))
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
 	}
