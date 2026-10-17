@@ -10,11 +10,26 @@
 #      container's init process on the host (CapEff, NoNewPrivs, Seccomp, Uid), so it works for the
 #      shell-less distroless API image too. Where a container has a shell we additionally try the
 #      forbidden actions (write to rootfs, reach the internet).
-# If the stack is not running the script starts it (--no-build) and tears it down (down -v) on exit.
+# The script ALWAYS uses its own compose project (convertflow-hardening) and host port, starts it itself
+# (--no-build) and removes it (down -v) on exit. It never touches the default `convertflow` project, so a
+# real deployment and its volumes are safe. `down -v` is refused for any other project name.
 # COMPOSE_FILES may list extra "-f file" arguments (used to demonstrate that a weakened config fails).
+#   tests/container/hardening.sh --self-test   runs the weakened config and asserts the test FAILS.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 RT=${CONTAINER_RUNTIME:-docker}
+if [ "${1:-}" = "--self-test" ]; then
+  if COMPOSE_FILES="-f tests/container/weak.override.yaml" "$0" >/dev/null 2>&1; then
+    echo "SELF-TEST FAIL: weakened config passed the hardening test"; exit 1
+  fi
+  echo "self-test ok: weakened config is rejected"; exit 0
+fi
+PROJECT=convertflow-hardening
+export CONVERTFLOW_PORT=${CONVERTFLOW_HARDENING_PORT:-18081}
+safe_down() {
+  case "$PROJECT" in convertflow-hardening*) ;; *) echo "refusing down -v for project $PROJECT" >&2; return 1 ;; esac
+  $RT compose -p "$PROJECT" "${CF[@]}" down -v >/dev/null 2>&1 || true
+}
 # shellcheck disable=SC2206
 CF=(-f compose.yaml ${COMPOSE_FILES:-})
 fail=0
@@ -22,7 +37,7 @@ check() { if ! eval "$2"; then echo "FAIL: $1"; fail=1; else echo "ok:   $1"; fi
 
 set -a; . docker/ffmpeg.env; set +a
 scripts/gen-secrets.sh >/dev/null
-CFG=$($RT compose "${CF[@]}" config --format json 2>/dev/null)
+CFG=$($RT compose -p "$PROJECT" "${CF[@]}" config --format json 2>/dev/null)
 
 # ---- static checks on the compose model ------------------------------------------------------
 check "every service is read_only" \
@@ -33,6 +48,12 @@ check "every service sets no-new-privileges" \
   "jq -e '.services | to_entries | all((.value.security_opt // []) | index(\"no-new-privileges:true\"))' <<<\"\$CFG\" >/dev/null"
 check "no service is privileged or disables seccomp/apparmor" \
   "! jq -e '.services | to_entries | any(.value.privileged == true or ((.value.security_opt // []) | any(test(\"unconfined\"))))' <<<\"\$CFG\" >/dev/null"
+check "no host pid/network/ipc, devices, sysctls or privileged" \
+  "! jq -e '.services | to_entries | any(.value.pid == \"host\" or .value.network_mode == \"host\" or .value.ipc == \"host\" or ((.value.devices // []) | length > 0) or ((.value.sysctls // {}) | length > 0) or .value.privileged == true)' <<<\"\$CFG\" >/dev/null"
+check "every service has log rotation, core ulimit entry (compose JSON drops the zero values) and a stop grace period on api/worker" \
+  "jq -e '(.services | to_entries | all(.value.logging.options.\"max-size\" and (.value.ulimits | has(\"core\")))) and .services.api.stop_grace_period == \"45s\" and .services.worker.stop_grace_period == \"45s\"' <<<\"\$CFG\" >/dev/null"
+check "api and worker share identical job timeout/retention/flavor settings" \
+  "jq -e '[.services.api.environment, .services.worker.environment] | map({a:.CONVERTFLOW_JOB_TIMEOUT,b:.CONVERTFLOW_RETENTION,c:.CONVERTFLOW_STALE_AFTER,d:.CONVERTFLOW_FLAVOR,e:.CONVERTFLOW_MAX_ATTEMPTS}) | .[0] == .[1]' <<<\"\$CFG\" >/dev/null"
 check "every service has pids_limit, mem_limit and cpus" \
   "jq -e '.services | to_entries | all(.value.pids_limit and .value.mem_limit and .value.cpus)' <<<\"\$CFG\" >/dev/null"
 check "every service has a healthcheck and restart policy" \
@@ -53,21 +74,18 @@ check "external images in compose are pinned by digest" \
 check "Dockerfile base images are pinned by digest" \
   "! awk 'tolower(\$1)==\"from\"{ref=\$2; if(!(ref in st) && ref !~ /@sha256:[0-9a-f]{64}\$/) print FILENAME\": \"ref; for(i=3;i<=NF;i++) if(tolower(\$i)==\"as\") st[\$(i+1)]=1}' Dockerfile.api Dockerfile.worker | grep -q ."
 
-for img in convertflow-api convertflow-worker; do
-  user=$($RT image inspect "$img:${CONVERTFLOW_VERSION:-dev}" --format '{{.Config.User}}' 2>/dev/null || true)
+FLAVOR=${FFMPEG_FLAVOR:-lgpl}; export FFMPEG_FLAVOR=$FLAVOR
+for img in convertflow-api:${CONVERTFLOW_VERSION:-dev} convertflow-worker:${CONVERTFLOW_VERSION:-dev}-$FLAVOR; do
+  user=$($RT image inspect "$img" --format '{{.Config.User}}' 2>/dev/null || true)
   check "$img image runs as non-root ($user)" "[[ \"$user\" == 65532* ]]"
 done
 
 # ---- runtime checks on real containers ---------------------------------------------------------
-started=0
-if [ -z "$($RT ps -q --filter label=com.docker.compose.project=convertflow)" ]; then
-  FFMPEG_FLAVOR=${FFMPEG_FLAVOR:-lgpl} $RT compose "${CF[@]}" up -d --no-build --wait --wait-timeout 120 >/dev/null 2>&1 || true
-  started=1
-fi
-cleanup() { if [ "$started" = 1 ]; then $RT compose "${CF[@]}" down -v >/dev/null 2>&1 || true; fi; }
-trap cleanup EXIT
+safe_down
+trap safe_down EXIT
+FFMPEG_FLAVOR=$FLAVOR $RT compose -p "$PROJECT" "${CF[@]}" up -d --no-build --wait --wait-timeout 120 >/dev/null 2>&1 || true
 
-cid() { $RT ps -q --filter label=com.docker.compose.project=convertflow --filter "label=com.docker.compose.service=$1" | head -n1; }
+cid() { $RT ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=$1" | head -n1; }
 status() { grep -E "^$2:" "/proc/$1/status" | awk '{print $2}'; }
 
 for svc in db api worker; do
@@ -77,6 +95,7 @@ for svc in db api worker; do
   pid=$($RT inspect "$id" --format '{{.State.Pid}}')
   check "$svc has an empty effective capability set (CapEff=0)" "[ \"\$(status $pid CapEff)\" = 0000000000000000 ]"
   check "$svc has an empty bounding set (CapBnd=0)" "[ \"\$(status $pid CapBnd)\" = 0000000000000000 ]"
+  check "$svc has core dumps disabled (RLIMIT_CORE 0/0)" "grep -E '^Max core file size' /proc/$pid/limits | awk '{print \$5,\$6}' | grep -qx '0 0'"
   check "$svc runs with NoNewPrivs=1" "[ \"\$(status $pid NoNewPrivs)\" = 1 ]"
   check "$svc runs under a seccomp filter (Seccomp=2)" "[ \"\$(status $pid Seccomp)\" = 2 ]"
   # /proc/<pid>/status on the host shows the subuid-mapped id under rootless podman, so ask the runtime
@@ -112,7 +131,7 @@ if [ -n "$aid" ]; then
     "[ \"\$($RT inspect $aid --format '{{range \$p,\$b := .NetworkSettings.Ports}}{{range \$b}}{{.HostIp}} {{end}}{{end}}')\" = '127.0.0.1 ' ]"
   check "api: image has no shell" "! $RT exec $aid /bin/sh -c true >/dev/null 2>&1"
 fi
-bn=$($RT network ls --format '{{.Name}}' | grep -E '(^|_)backend$' | head -n1 || true)
+bn=$($RT network ls --format '{{.Name}}' | grep -E "^${PROJECT}_backend$" | head -n1 || true)
 check "runtime backend network is internal" "[ \"\$($RT network inspect $bn --format '{{.Internal}}')\" = true ]"
 
 exit $fail
