@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -23,6 +24,7 @@ type Stream struct {
 	CodecName   string `json:"codec_name"`
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
+	Duration    string `json:"duration"`
 	Disposition struct {
 		AttachedPic int `json:"attached_pic"`
 	} `json:"disposition"`
@@ -71,14 +73,49 @@ func (p *ProbeResult) HasAudio() bool {
 	return false
 }
 
-func (p *ProbeResult) DurationSeconds() float64 {
-	d, err := strconv.ParseFloat(p.Format.Duration, 64)
-	if err != nil || d < 0 {
-		return 0
+// parseDuration returns (seconds, true) only for finite, non-negative values.
+func parseDuration(s string) (float64, bool) {
+	d, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || !(d >= 0) || math.IsInf(d, 0) {
+		return 0, false
 	}
-	return d
+	return d, true
 }
 
+// DurationSeconds returns the larger of the container and per-stream durations,
+// or 0 when no valid duration is known (see DurationKnown).
+func (p *ProbeResult) DurationSeconds() float64 {
+	best := 0.0
+	if d, ok := parseDuration(p.Format.Duration); ok {
+		best = d
+	}
+	for _, s := range p.Streams {
+		if d, ok := parseDuration(s.Duration); ok && d > best {
+			best = d
+		}
+	}
+	return best
+}
+
+// DurationKnown reports whether any finite, non-negative duration was probed.
+func (p *ProbeResult) DurationKnown() bool {
+	if _, ok := parseDuration(p.Format.Duration); ok {
+		return true
+	}
+	for _, s := range p.Streams {
+		if _, ok := parseDuration(s.Duration); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate checks the container allow-list, stream count, duration and dimensions.
+// Limits semantics: MaxDurationSec <= 0 means "no duration limit"; MaxPixels and
+// MaxStreams are always enforced (a zero value rejects everything with video/streams).
+// An UNKNOWN duration (missing, N/A, NaN, Inf, negative) deliberately passes the
+// duration check: the worker enforces a wall-clock timeout instead. A known duration
+// above a positive limit fails.
 func (p *ProbeResult) Validate(l Limits) error {
 	ok := false
 	for _, n := range strings.Split(p.Format.FormatName, ",") {
@@ -95,10 +132,16 @@ func (p *ProbeResult) Validate(l Limits) error {
 	if len(p.Streams) > l.MaxStreams {
 		return fmt.Errorf("too many streams (limit %d)", l.MaxStreams)
 	}
-	if d := p.DurationSeconds(); l.MaxDurationSec > 0 && d > l.MaxDurationSec {
+	if p.DurationKnown() && l.MaxDurationSec > 0 && p.DurationSeconds() > l.MaxDurationSec {
 		return fmt.Errorf("duration exceeds limit of %.0f seconds", l.MaxDurationSec)
 	}
 	for _, s := range p.Streams {
+		if s.Width < 0 || s.Height < 0 {
+			return errors.New("invalid video dimensions")
+		}
+		if s.CodecType == "video" && s.Disposition.AttachedPic == 0 && (s.Width <= 0 || s.Height <= 0) {
+			return errors.New("video dimensions unknown")
+		}
 		if int64(s.Width)*int64(s.Height) > l.MaxPixels {
 			return errors.New("video dimensions exceed limit")
 		}
@@ -110,14 +153,15 @@ func minimalEnv() []string { return []string{"PATH=" + os.Getenv("PATH")} }
 
 // Probe runs ffprobe with a local-files-only protocol whitelist. dir is the working directory
 // (use an empty scratch dir so relative references inside hostile files resolve to nothing).
-// Errors never include ffprobe's stderr or file paths.
+// path must be a server-generated absolute path (it is passed as a "file:" URL via -i, so a leading
+// dash is not parsed as an option). Errors never include ffprobe's stderr or file paths.
 func Probe(ctx context.Context, bin, path, dir string) (*ProbeResult, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "-v", "error", "-protocol_whitelist", "file",
 		"-print_format", "json",
-		"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height:stream_disposition=attached_pic",
-		path)
+		"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height,duration:stream_disposition=attached_pic",
+		"-i", "file:"+path)
 	cmd.Dir = dir
 	cmd.Env = minimalEnv()
 	out, err := cmd.Output()

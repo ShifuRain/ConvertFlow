@@ -3,6 +3,7 @@ package ffmpeg
 import (
 	"context"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,45 +32,73 @@ func ParseEncoders(output string) []string {
 	return out
 }
 
+// parseKinds maps encoder name to its type letter ('V', 'A', ...).
+func parseKinds(output string) map[string]byte {
+	kinds := map[string]byte{}
+	started := false
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "------") {
+			started = true
+			continue
+		}
+		if !started {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) >= 2 && len(f[0]) == 6 {
+			kinds[f[1]] = f[0][0]
+		}
+	}
+	return kinds
+}
+
 // DetectEncoders lists the preset-relevant encoders this FFmpeg can really use under the
-// given flavor. Hardware encoders must also pass a short trial encode.
+// given flavor. Every candidate (after the fail-closed flavor filter) must pass a short
+// trial encode; failures and timeouts drop the encoder.
 func DetectEncoders(ctx context.Context, ffmpegBin, flavor, vaapiDevice string) ([]string, error) {
-	cmd := exec.CommandContext(ctx, ffmpegBin, "-hide_banner", "-encoders")
+	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(lctx, ffmpegBin, "-hide_banner", "-encoders")
 	cmd.Env = minimalEnv()
+	cmd.WaitDelay = 2 * time.Second
 	b, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	wanted := map[string]bool{}
-	for _, e := range presets.AllEncoders() {
-		wanted[e] = true
-	}
+	kinds := parseKinds(string(b))
 	var out []string
 	for _, e := range ParseEncoders(string(b)) {
-		if !wanted[e] || !presets.FlavorAllows(flavor, e) {
+		if !slices.Contains(presets.AllEncoders(), e) || !presets.FlavorAllows(flavor, e) {
 			continue
 		}
-		if hardwareEncoders[e] && !hwTrial(ctx, ffmpegBin, e, vaapiDevice) {
-			continue
+		if trialEncode(ctx, ffmpegBin, e, kinds[e], vaapiDevice) {
+			out = append(out, e)
 		}
-		out = append(out, e)
 	}
 	return out, nil
 }
 
-func hwTrial(ctx context.Context, bin, enc, vaapiDevice string) bool {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+func trialEncode(ctx context.Context, bin, enc string, kind byte, vaapiDevice string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	if enc == "av1_vaapi" {
 		args = append(args, "-vaapi_device", vaapiDevice)
 	}
-	args = append(args, "-f", "lavfi", "-i", "testsrc=duration=0.2:size=256x256:rate=5")
-	if enc == "av1_vaapi" {
-		args = append(args, "-vf", "format=nv12,hwupload")
+	if kind == 'A' {
+		args = append(args, "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-t", "0.2", "-c:a", enc)
+	} else {
+		args = append(args, "-f", "lavfi", "-i", "testsrc=duration=1:size=256x256:rate=10", "-frames:v", "2")
+		if enc == "av1_vaapi" {
+			args = append(args, "-vf", "format=nv12,hwupload")
+		} else if !hardwareEncoders[enc] {
+			args = append(args, "-pix_fmt", "yuv420p")
+		}
+		args = append(args, "-c:v", enc)
 	}
-	args = append(args, "-c:v", enc, "-f", "null", "-")
+	args = append(args, "-f", "null", "-")
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = minimalEnv()
+	cmd.WaitDelay = 2 * time.Second
 	return cmd.Run() == nil
 }

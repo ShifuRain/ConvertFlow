@@ -136,3 +136,53 @@ func TestProbeRejectsHLSPlaylistText(t *testing.T) {
 		t.Fatal("HLS playlist must be rejected")
 	}
 }
+
+func TestDurationKnownAndStreamDuration(t *testing.T) {
+	p, _ := ffmpeg.ParseProbe([]byte(`{"format":{"format_name":"wav","duration":"N/A"},"streams":[{"codec_type":"audio","duration":"5000"}]}`))
+	if !p.DurationKnown() || p.DurationSeconds() != 5000 {
+		t.Fatalf("stream duration not used: %v", p.DurationSeconds())
+	}
+	if p.Validate(ffmpeg.Limits{MaxDurationSec: 100, MaxPixels: 1 << 30, MaxStreams: 5}) == nil {
+		t.Fatal("known long stream duration must fail")
+	}
+	for _, d := range []string{"NaN", "Inf", "-Inf", "-3", "abc", ""} {
+		p, _ := ffmpeg.ParseProbe([]byte(`{"format":{"format_name":"wav","duration":"` + d + `"},"streams":[{"codec_type":"audio"}]}`))
+		if p.DurationKnown() || p.DurationSeconds() != 0 {
+			t.Errorf("%q must be unknown", d)
+		}
+		if err := p.Validate(lim); err != nil {
+			t.Errorf("%q: unknown duration must pass Validate: %v", d, err)
+		}
+	}
+}
+
+func TestValidateDimensions(t *testing.T) {
+	for name, st := range map[string]string{
+		"zero w":  `{"codec_type":"video","width":0,"height":10}`,
+		"missing": `{"codec_type":"video"}`,
+		"neg":     `{"codec_type":"audio","width":-1,"height":-1}`,
+		"neg h":   `{"codec_type":"video","width":10,"height":-5}`,
+	} {
+		p, _ := ffmpeg.ParseProbe([]byte(`{"format":{"format_name":"mov,mp4","duration":"1"},"streams":[` + st + `]}`))
+		if p.Validate(lim) == nil {
+			t.Errorf("%s: expected rejection", name)
+		}
+	}
+	p, _ := ffmpeg.ParseProbe([]byte(`{"format":{"format_name":"mp3","duration":"1"},"streams":[{"codec_type":"audio"},{"codec_type":"video","disposition":{"attached_pic":1}}]}`))
+	if err := p.Validate(lim); err != nil {
+		t.Errorf("cover art without dims must pass: %v", err)
+	}
+}
+
+func TestProbeLeadingDashPath(t *testing.T) {
+	testutil.RequireTools(t)
+	dir := t.TempDir()
+	clip := testutil.MakeClip(t, dir, "a.mkv", "av")
+	if err := os.Rename(clip, filepath.Join(dir, "-v.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := ffmpeg.Probe(context.Background(), "ffprobe", "-v.mkv", dir)
+	if err != nil || !p.HasVideo() {
+		t.Fatalf("leading-dash path: %v", err)
+	}
+}

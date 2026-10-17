@@ -18,16 +18,17 @@ func TestRunConverts(t *testing.T) {
 	in := testutil.MakeClip(t, dir, "a.wav", "audio")
 	out := filepath.Join(dir, "o.flac")
 	var last float64
+	var called bool
 	tail, err := ffmpeg.Run(context.Background(), "ffmpeg",
 		[]string{"-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-i", in, "-c:a", "flac", "-f", "flac", "-progress", "pipe:1", "-nostats", out},
-		dir, 1.0, func(p float64) { last = p })
+		dir, 1.0, func(p float64) { last = p; called = true })
 	if err != nil {
 		t.Fatalf("%v\n%s", err, tail)
 	}
 	if st, err := os.Stat(out); err != nil || st.Size() == 0 {
 		t.Fatal("no output")
 	}
-	if last < 0 || last > 99.9 {
+	if !called || last < 0 || last > 99.9 {
 		t.Fatalf("progress out of range: %v", last)
 	}
 }

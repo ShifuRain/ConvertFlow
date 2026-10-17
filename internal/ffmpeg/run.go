@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -58,6 +59,8 @@ func Run(ctx context.Context, bin string, args []string, dir string, durationSec
 		}
 		onProgress(pct)
 	}
+	// Drain so ffmpeg can never block on a full stdout pipe if the scanner stopped early.
+	_, _ = io.Copy(io.Discard, stdout)
 	err = cmd.Wait()
 	return tail.String(), err
 }

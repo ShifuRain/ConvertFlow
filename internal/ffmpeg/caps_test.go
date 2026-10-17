@@ -2,8 +2,11 @@ package ffmpeg_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/ShifuRain/convertflow/internal/ffmpeg"
 	"github.com/ShifuRain/convertflow/internal/testutil"
@@ -50,5 +53,54 @@ func TestDetectEncodersRespectsFlavor(t *testing.T) {
 	full, _ := ffmpeg.DetectEncoders(context.Background(), "ffmpeg", "full", "")
 	if !slices.Contains(full, "aac") {
 		t.Errorf("full flavor should advertise native aac: %v", full)
+	}
+}
+
+func fakeFFmpeg(t *testing.T, trialBody string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = \"-encoders\" ]; then cat <<'EOT'\n" + encodersFixture + "EOT\nexit 0; fi; done\n" + trialBody + "\n"
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestDetectEncodersTrialFailureDrops(t *testing.T) {
+	bin := fakeFFmpeg(t, `case "$*" in *libx264*) exit 1;; esac; exit 0`)
+	got, err := ffmpeg.DetectEncoders(context.Background(), bin, "full", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(got, "libx264") {
+		t.Errorf("failed trial must drop encoder: %v", got)
+	}
+	if !slices.Contains(got, "libopus") || !slices.Contains(got, "libsvtav1") {
+		t.Errorf("passing encoders missing: %v", got)
+	}
+}
+
+func TestDetectEncodersTrialTimeout(t *testing.T) {
+	bin := fakeFFmpeg(t, `case "$*" in *libx264*) exec sleep 30;; esac; exit 0`)
+	start := time.Now()
+	got, err := ffmpeg.DetectEncoders(context.Background(), bin, "full", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(got, "libx264") || !slices.Contains(got, "libopus") {
+		t.Errorf("hanging trial must drop only the hung encoder: %v", got)
+	}
+	if time.Since(start) > 30*time.Second {
+		t.Errorf("too slow: %v", time.Since(start))
+	}
+}
+
+func TestDetectEncodersListTimeout(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ffmpeg")
+	_ = os.WriteFile(p, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := ffmpeg.DetectEncoders(ctx, p, "full", ""); err == nil {
+		t.Fatal("expected error")
 	}
 }
