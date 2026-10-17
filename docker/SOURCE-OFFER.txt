@@ -18,4 +18,7 @@ scripts (Dockerfile.worker, docker/ffmpeg.env). Debian packages used at runtime 
 sources via `apt-get source <package>` on a Debian bookworm system.
 
 Patents: the full flavor includes encoders for H.264/H.265, which may be subject to patent
-licensing in your jurisdiction. The lgpl flavor omits them. You are responsible for compliance.
+licensing in your jurisdiction, as may the native AAC encoder. The lgpl flavor omits x264, x265
+and the native AAC encoder (--disable-encoder=aac); FFmpeg's native H.264/H.265/AAC decoders
+remain in both flavors, and whether decoding such inputs needs a patent license in your use
+case is for the operator to decide. You are responsible for compliance.
