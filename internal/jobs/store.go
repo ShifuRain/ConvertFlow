@@ -200,11 +200,18 @@ const ErrNoWorker = "no worker available for this preset"
 // The age counts from the last transition into 'queued' (create or requeue): both set updated_at and
 // nothing else touches a queued row, so a job requeued after a worker crash gets a fresh window
 // instead of expiring on its original created_at.
-func (s *Store) ExpireQueued(ctx context.Context, maxAge time.Duration) ([]Job, error) {
+//
+// Jobs whose preset is in runnable (a live worker can run it) are never expired: a long backlog
+// for a runnable preset is not a stranded job. The check is part of the same guarded statement.
+func (s *Store) ExpireQueued(ctx context.Context, maxAge time.Duration, runnable []string) ([]Job, error) {
+	if runnable == nil {
+		runnable = []string{}
+	}
 	rows, err := s.pool.Query(ctx, `
 UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now()
 WHERE status = 'queued' AND updated_at < now() - make_interval(secs => $1)
-RETURNING id::text, input_path`, maxAge.Seconds(), ErrNoWorker)
+  AND options->>'preset' <> ALL($3::text[])
+RETURNING id::text, input_path`, maxAge.Seconds(), ErrNoWorker, runnable)
 	if err != nil {
 		return nil, err
 	}
@@ -271,19 +278,21 @@ func (s *Store) UpsertWorker(ctx context.Context, id string, encoders []string) 
 ON CONFLICT (id) DO UPDATE SET encoders = EXCLUDED.encoders, seen_at = now()`, id, encoders)
 }
 
-func (s *Store) LiveEncoders(ctx context.Context, within time.Duration) (map[string]bool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT unnest(encoders) FROM workers WHERE seen_at > now() - make_interval(secs => $1)`, within.Seconds())
+// LiveWorkerEncoders returns the encoder list of every live worker, one entry per worker. Capability
+// decisions must be made per worker (one worker has to run the whole job), never on the union.
+func (s *Store) LiveWorkerEncoders(ctx context.Context, within time.Duration) ([][]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT encoders FROM workers WHERE seen_at > now() - make_interval(secs => $1)`, within.Seconds())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]bool{}
+	var out [][]string
 	for rows.Next() {
-		var e string
+		var e []string
 		if err := rows.Scan(&e); err != nil {
 			return nil, err
 		}
-		out[e] = true
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }

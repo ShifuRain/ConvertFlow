@@ -332,18 +332,10 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listPresets(w http.ResponseWriter, r *http.Request) {
-	enc, err := s.store.LiveEncoders(r.Context(), liveWindow)
+	run, err := s.runnablePresets(r.Context())
 	if err != nil {
 		s.readFault(w, r, "live_encoders", err)
 		return
-	}
-	// Workers only advertise flavor-allowed encoders, but the policy is enforced here too so a
-	// stale or misconfigured worker can never widen what the API offers.
-	allowed := make(map[string]bool, len(enc))
-	for e := range enc {
-		if presets.FlavorAllows(s.cfg.Flavor, e) {
-			allowed[e] = true
-		}
 	}
 	type pv struct {
 		ID    string `json:"id"`
@@ -352,7 +344,7 @@ func (s *Server) listPresets(w http.ResponseWriter, r *http.Request) {
 		Ext   string `json:"ext"`
 	}
 	out := []pv{}
-	for _, p := range presets.Available(allowed) {
+	for _, p := range run {
 		out = append(out, pv{p.ID, p.Label, string(p.Kind), p.Ext})
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -401,4 +393,14 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "convertflow_uploads_in_flight %d\n", len(s.uploadSlots))
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
+}
+
+// runnablePresets returns the presets a single live worker can run. The flavor policy is enforced
+// here too, so a stale or misconfigured worker can never widen what the API offers.
+func (s *Server) runnablePresets(ctx context.Context) ([]presets.Preset, error) {
+	ws, err := s.store.LiveWorkerEncoders(ctx, liveWindow)
+	if err != nil {
+		return nil, err
+	}
+	return presets.Runnable(ws, s.cfg.Flavor), nil
 }

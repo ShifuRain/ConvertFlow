@@ -441,3 +441,50 @@ func TestSweepNeverFailsClaimedJobs(t *testing.T) {
 		t.Fatalf("unclaimed job ended as %s", got.Status)
 	}
 }
+
+// A long backlog for a preset that a live worker can run is not "stranded": only jobs whose preset no
+// single live worker can run expire.
+func TestSweepKeepsBacklogOfRunnablePresetAndExpiresUnsupportedOnes(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	e.j.Flavor = "full"
+	ctx := context.Background()
+	if err := e.store.UpsertWorker(ctx, "w1", []string{"pcm_s16le"}); err != nil { // audio-wav only
+		t.Fatal(err)
+	}
+	backlog := e.job(t, "queued") // audio-wav
+	unsupported := uuid.NewString()
+	if err := e.store.Create(ctx, &jobs.Job{ID: unsupported, Filename: "a", InputPath: filepath.Join(e.dir, "in", unsupported), Options: jobs.Options{Preset: "video-vp9"}}); err != nil {
+		t.Fatal(err)
+	}
+	e.backdate(t, backlog, 48*time.Hour)
+	e.backdate(t, unsupported, 48*time.Hour)
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := e.store.Get(ctx, backlog); g.Status != jobs.StatusQueued {
+		t.Errorf("runnable backlog was failed by age: %+v", g)
+	}
+	if g, _ := e.store.Get(ctx, unsupported); g.Status != jobs.StatusFailed || g.Error != jobs.ErrNoWorker {
+		t.Errorf("unsupported preset should expire: %+v", g)
+	}
+}
+
+// Encoders split across two workers do not make a preset runnable (no single worker can run it).
+func TestSweepExpiresPresetOnlySplittableAcrossWorkers(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	e.j.Flavor = "full"
+	ctx := context.Background()
+	_ = e.store.UpsertWorker(ctx, "a", []string{"libvpx-vp9"})
+	_ = e.store.UpsertWorker(ctx, "b", []string{"libopus"})
+	id := uuid.NewString()
+	if err := e.store.Create(ctx, &jobs.Job{ID: id, Filename: "a", InputPath: filepath.Join(e.dir, "in", id), Options: jobs.Options{Preset: "video-vp9"}}); err != nil {
+		t.Fatal(err)
+	}
+	e.backdate(t, id, 48*time.Hour)
+	_ = e.j.Sweep(ctx)
+	if g, _ := e.store.Get(ctx, id); g.Status != jobs.StatusFailed {
+		t.Errorf("job no single worker can run must expire: %+v", g)
+	}
+}

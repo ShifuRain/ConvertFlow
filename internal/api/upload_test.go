@@ -759,3 +759,36 @@ func TestUploadRejectionsAreAudited(t *testing.T) {
 		t.Fatalf("audit: %s", f.log)
 	}
 }
+
+// video-vp9 needs libvpx-vp9 and libopus on ONE worker (that is what Claim requires). Encoders split
+// across two workers must neither be listed nor accepted at upload.
+func TestPresetSplitAcrossWorkersIsRefusedAndNotListed(t *testing.T) {
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) { c.Flavor = "full" })
+	_ = f.store.UpsertWorker(context.Background(), "a", []string{"libvpx-vp9"}) // w1 has libopus
+	body, ct := multipartBody(t, []field{{"preset", "video-vp9"}}, "a.mkv", []byte("data"))
+	if w := post(f.fixture, body, ct); w.Code != 422 {
+		t.Fatalf("split preset: want 422 got %d", w.Code)
+	}
+	if len(inFiles(t, f.fixture)) != 0 {
+		t.Fatal("rejected upload must not leave files")
+	}
+	if strings.Contains(get(f.fixture, "/api/v1/presets").Body.String(), "video-vp9") {
+		t.Fatal("split preset must not be listed")
+	}
+	_ = f.store.UpsertWorker(context.Background(), "c", []string{"libvpx-vp9", "libopus"})
+	body, ct = multipartBody(t, []field{{"preset", "video-vp9"}}, "a.mkv", []byte("data"))
+	if w := post(f.fixture, body, ct); w.Code != 202 {
+		t.Fatalf("single capable worker: want 202 got %d %s", w.Code, w.Body)
+	}
+}
+
+// Upload validation applies the flavor policy too: a stale worker advertising x264 does not make
+// video-h264 acceptable under lgpl.
+func TestUploadAppliesFlavorPolicy(t *testing.T) {
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) { c.Flavor = "lgpl" })
+	_ = f.store.UpsertWorker(context.Background(), "w2", []string{"libx264", "aac"})
+	body, ct := multipartBody(t, []field{{"preset", "video-h264"}}, "a.mp4", []byte("data"))
+	if w := post(f.fixture, body, ct); w.Code != 422 {
+		t.Fatalf("want 422 got %d", w.Code)
+	}
+}

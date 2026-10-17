@@ -217,9 +217,18 @@ func TestWorkersCapabilities(t *testing.T) {
 	_ = s.UpsertWorker(ctx, "w1", []string{"libopus", "pcm_s16le"})
 	_ = s.UpsertWorker(ctx, "w2", []string{"libsvtav1"})
 	_, _ = pool.Exec(ctx, `INSERT INTO workers (id, encoders, seen_at) VALUES ('dead', '{libx264}', now() - interval '1 hour')`)
-	enc, err := s.LiveEncoders(ctx, time.Minute)
-	if err != nil || !enc["libopus"] || !enc["libsvtav1"] || enc["libx264"] {
-		t.Fatalf("got %v %v", enc, err)
+	ws, err := s.LiveWorkerEncoders(ctx, time.Minute)
+	if err != nil || len(ws) != 2 {
+		t.Fatalf("got %v %v", ws, err)
+	}
+	all := map[string][]string{}
+	for _, w := range ws {
+		for _, e := range w {
+			all[e] = w
+		}
+	}
+	if len(all["libopus"]) != 2 || len(all["libsvtav1"]) != 1 || all["libx264"] != nil {
+		t.Fatalf("encoders must stay per worker: %v", ws)
 	}
 	if n, _ := s.LiveWorkers(ctx, time.Minute); n != 2 {
 		t.Fatalf("want 2 live workers, got %d", n)
@@ -420,7 +429,7 @@ func TestExpireQueued(t *testing.T) {
 	if j, _ := s.Claim(ctx, "w", []string{"audio-wav"}); j == nil || j.ID != active.ID {
 		t.Fatalf("setup claim: %v", j)
 	}
-	got, err := s.ExpireQueued(ctx, time.Hour)
+	got, err := s.ExpireQueued(ctx, time.Hour, nil)
 	if err != nil || len(got) != 1 || got[0].ID != old.ID || got[0].InputPath != old.InputPath {
 		t.Fatalf("ExpireQueued = %+v %v", got, err)
 	}
@@ -433,7 +442,7 @@ func TestExpireQueued(t *testing.T) {
 	if j, _ := s.Get(ctx, active.ID); j.Status != jobs.StatusProbing {
 		t.Errorf("claimed: %+v", j)
 	}
-	if again, _ := s.ExpireQueued(ctx, time.Hour); len(again) != 0 {
+	if again, _ := s.ExpireQueued(ctx, time.Hour, nil); len(again) != 0 {
 		t.Errorf("second call: %v", again)
 	}
 }
@@ -467,7 +476,7 @@ func TestExpireQueuedCountsFromLastQueuedTransition(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET created_at = now() - interval '3 hours', updated_at = now() - interval '3 hours' WHERE id = $1::uuid`, stranded.ID); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.ExpireQueued(ctx, time.Hour)
+	got, err := s.ExpireQueued(ctx, time.Hour, nil)
 	if err != nil || len(got) != 1 || got[0].ID != stranded.ID {
 		t.Fatalf("ExpireQueued = %+v %v", got, err)
 	}
@@ -526,5 +535,26 @@ func TestZombieWorkerCannotTouchReclaimedJob(t *testing.T) {
 	// and B itself still can
 	if err := s.Complete(ctx, j.ID, "B", "/o"); err != nil {
 		t.Fatalf("B complete: %v", err)
+	}
+}
+
+func TestExpireQueuedSparesRunnablePresets(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	runnable, other := newJob(), newJob()
+	other.Options.Preset = "video-h264"
+	for _, j := range []*jobs.Job{runnable, other} {
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET updated_at = now() - interval '3 hours'`)
+	got, err := s.ExpireQueued(ctx, time.Hour, []string{runnable.Options.Preset})
+	if err != nil || len(got) != 1 || got[0].ID != other.ID {
+		t.Fatalf("ExpireQueued = %+v %v", got, err)
+	}
+	if j, _ := s.Get(ctx, runnable.ID); j.Status != jobs.StatusQueued {
+		t.Errorf("backlog of a runnable preset was expired: %+v", j)
 	}
 }

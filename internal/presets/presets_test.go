@@ -1,6 +1,7 @@
 package presets_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ShifuRain/convertflow/internal/presets"
@@ -119,5 +120,27 @@ func TestAllEncodersClassified(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestRunnableIsPerWorker(t *testing.T) {
+	ids := func(ps []presets.Preset) string { return strings.Join(presets.IDs(ps), ",") }
+	split := [][]string{{"libvpx-vp9"}, {"libopus"}}
+	// only the audio preset that needs libopus alone is runnable; no video preset may be
+	if got := ids(presets.Runnable(split, "full")); got != "audio-opus" {
+		t.Fatalf("encoders split across workers must not make a video preset runnable: %s", got)
+	}
+	if got := ids(presets.Runnable([][]string{{"libvpx-vp9", "libopus"}, {"libopus"}}, "full")); got != "video-av1,video-vp9,audio-opus" {
+		t.Fatalf("got %s", got)
+	}
+	// flavor policy applies: a worker advertising x264/aac is ignored for them under lgpl
+	if got := presets.Runnable([][]string{{"libx264", "aac", "pcm_s16le"}}, "lgpl"); ids(got) != "audio-wav" {
+		t.Fatalf("lgpl: %s", ids(got))
+	}
+	if got := presets.Runnable([][]string{{"libx264", "aac"}}, "full"); ids(got) != "video-h264,audio-aac" {
+		t.Fatalf("full: %s", ids(got))
+	}
+	if got := presets.Runnable(nil, "full"); len(got) != 0 {
+		t.Fatal("no workers, no presets")
 	}
 }

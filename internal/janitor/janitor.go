@@ -12,6 +12,7 @@ import (
 
 	"github.com/ShifuRain/convertflow/internal/audit"
 	"github.com/ShifuRain/convertflow/internal/jobs"
+	"github.com/ShifuRain/convertflow/internal/presets"
 	"github.com/google/uuid"
 )
 
@@ -44,6 +45,10 @@ type Janitor struct {
 	// MaxQueueAge fails jobs that stayed queued this long (for example because no live worker
 	// offers their preset) and removes their input. Zero disables the check.
 	MaxQueueAge time.Duration
+	// Flavor and LiveWindow decide which presets a live worker can run (see presets.Runnable);
+	// queued jobs of such presets never expire by age. LiveWindow defaults to 30s.
+	Flavor     string
+	LiveWindow time.Duration
 }
 
 func (j *Janitor) Run(ctx context.Context) {
@@ -93,7 +98,15 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 		j.Audit.System("jobs_recovered", "", "requeued", requeued, "failed", failed)
 	}
 	if j.MaxQueueAge > 0 {
-		stranded, err := j.Store.ExpireQueued(ctx, j.MaxQueueAge)
+		window := j.LiveWindow
+		if window <= 0 {
+			window = 30 * time.Second
+		}
+		ws, err := j.Store.LiveWorkerEncoders(ctx, window)
+		if err != nil {
+			return err
+		}
+		stranded, err := j.Store.ExpireQueued(ctx, j.MaxQueueAge, presets.IDs(presets.Runnable(ws, j.Flavor)))
 		if err != nil {
 			return err
 		}

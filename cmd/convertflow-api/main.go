@@ -56,7 +56,7 @@ func run() error {
 	store := jobs.NewStore(pool)
 	al := audit.New(os.Stdout)
 	go (&janitor.Janitor{Store: store, Audit: al, DataDir: cfg.DataDir, Retention: cfg.Retention,
-		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout, MaxQueueAge: cfg.MaxQueueAge,
+		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout, MaxQueueAge: cfg.MaxQueueAge, Flavor: cfg.Flavor,
 		Interval: time.Minute}).Run(ctx)
 
 	shutdownStarted := make(chan struct{})

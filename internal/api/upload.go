@@ -18,7 +18,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/ShifuRain/convertflow/internal/jobs"
-	"github.com/ShifuRain/convertflow/internal/presets"
 	"github.com/google/uuid"
 )
 
@@ -188,15 +187,16 @@ func (s *Server) checkOptions(r *http.Request, o jobs.Options) (string, bool) {
 	if err := o.Validate(); err != nil {
 		return err.Error(), false
 	}
-	enc, err := s.store.LiveEncoders(r.Context(), liveWindow)
+	run, err := s.runnablePresets(r.Context())
 	if err != nil {
 		return "could not determine worker capabilities", false
 	}
-	p, _ := presets.Get(o.Preset)
-	if _, ok := p.Resolve(enc); !ok {
-		return "preset " + o.Preset + " is not available on any running worker", false
+	for _, p := range run {
+		if p.ID == o.Preset {
+			return "", true
+		}
 	}
-	return "", true
+	return "preset " + o.Preset + " is not available on any running worker", false
 }
 
 // idleDeadlineBody extends the connection read deadline before every body read, so a multi-GB

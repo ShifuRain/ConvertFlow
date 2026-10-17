@@ -128,3 +128,30 @@ func IDs(ps []Preset) []string {
 	}
 	return out
 }
+
+// Runnable returns the presets that at least one single live worker can run, given each live
+// worker's advertised encoders. It is the one definition shared by the preset listing, upload
+// validation and the janitor's queue-age expiry. A preset counts only when ONE worker has all the
+// encoders of one candidate, exactly as that worker's Claim decides, so encoders split across two
+// workers never make a preset "available". Encoders the flavor does not allow are ignored.
+func Runnable(workers [][]string, flavor string) []Preset {
+	ok := make(map[string]bool)
+	for _, encs := range workers {
+		set := make(map[string]bool, len(encs))
+		for _, e := range encs {
+			if FlavorAllows(flavor, e) {
+				set[e] = true
+			}
+		}
+		for _, p := range Available(set) {
+			ok[p.ID] = true
+		}
+	}
+	out := []Preset{}
+	for _, p := range all {
+		if ok[p.ID] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
