@@ -78,7 +78,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 // events streams job state as Server-Sent Events. Bounds: at most MaxSSEStreams concurrent
 // streams (503 beyond), one DB read per poll interval per stream, a keepalive comment while
 // nothing changes, a hard maximum lifetime, and a rolling write deadline so a stalled reader
-// cannot pin the connection. The stream ends on terminal status, deletion or client disconnect.
+// cannot pin the connection. The stream ends on terminal status, deletion, client disconnect or server shutdown.
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validID(id) {
@@ -149,6 +149,9 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-life.C:
+			return
+		case <-s.shutdown:
+			send(": shutdown\n\n") // server is going away: tell the client, which reconnects
 			return
 		case <-tick.C:
 		}

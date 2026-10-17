@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -725,5 +728,104 @@ func TestOutputOverRealServerLargeAndRange(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 206 || string(b) != big[1000000:1000016] {
 		t.Fatalf("range: %d %q", resp.StatusCode, b)
+	}
+}
+
+// shutdownFixture serves the handler from a real http.Server wired like main: the server's
+// RegisterOnShutdown closes the channel the handlers watch.
+func shutdownFixture(t *testing.T) (fixture, *httptest.Server, *atomic.Int32) {
+	t.Helper()
+	down := make(chan struct{})
+	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) { d.Shutdown = down })
+	srv := httptest.NewUnstartedServer(f.h)
+	srv.Config.RegisterOnShutdown(func() { close(down) })
+	var active atomic.Int32 // connections currently serving a request
+	var mu sync.Mutex
+	state := map[net.Conn]http.ConnState{}
+	srv.Config.ConnState = func(c net.Conn, s http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		state[c] = s
+		n := int32(0)
+		for _, st := range state {
+			if st == http.StateActive {
+				n++
+			}
+		}
+		active.Store(n)
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return f.fixture, srv, &active
+}
+
+func TestShutdownEndsSSEPromptly(t *testing.T) {
+	f, srv, _ := shutdownFixture(t)
+	id := queuedJob(t, f)
+	resp, err := http.Get(srv.URL + "/api/v1/jobs/" + id + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	waitFor(t, "stream registered", func() bool {
+		return strings.Contains(get(f, "/metrics").Body.String(), "convertflow_sse_streams 1")
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := srv.Config.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("shutdown took %v", d)
+	}
+	b, err := io.ReadAll(resp.Body) // stream must have ended, not hang
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(b), ": shutdown") {
+		t.Fatalf("no final shutdown comment:\n%s", b)
+	}
+}
+
+func TestShutdownDoesNotCutInFlightUpload(t *testing.T) {
+	_, srv, active := shutdownFixture(t)
+	body, ct := okBody(t)
+	raw := body.Bytes()
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest("POST", srv.URL+"/api/v1/jobs", pr)
+	req.Header.Set("Content-Type", ct)
+	type result struct {
+		code int
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		resp.Body.Close()
+		done <- result{code: resp.StatusCode}
+	}()
+	_, _ = pw.Write(raw[:len(raw)/2])
+	waitFor(t, "upload in flight", func() bool { return active.Load() == 1 })
+	shut := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() { shut <- srv.Config.Shutdown(ctx) }()
+	select {
+	case err := <-shut:
+		t.Fatalf("shutdown returned while upload in flight: %v", err)
+	case <-time.After(400 * time.Millisecond):
+	}
+	_, _ = pw.Write(raw[len(raw)/2:])
+	pw.Close()
+	if r := <-done; r.err != nil || r.code != http.StatusAccepted {
+		t.Fatalf("upload cut by shutdown: %+v", r)
+	}
+	if err := <-shut; err != nil {
+		t.Fatalf("shutdown: %v", err)
 	}
 }

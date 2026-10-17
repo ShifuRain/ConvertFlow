@@ -22,6 +22,9 @@ type Deps struct {
 	EventInterval  time.Duration // SSE poll interval; default 1s
 	SSEHeartbeat   time.Duration // idle keepalive comment interval; default 15s
 	SSEMaxLifetime time.Duration // hard cap on one SSE connection; default 10m
+	// Shutdown is closed when the HTTP server starts shutting down (http.Server.RegisterOnShutdown).
+	// SSE streams end then; downloads and uploads are left to finish. Nil means never.
+	Shutdown <-chan struct{}
 
 	// Test seams; nil selects the production implementation.
 	OpenInput func(path string) (io.WriteCloser, error) // creates the exclusive input file
@@ -37,6 +40,7 @@ type Server struct {
 	sseSlots     chan struct{}
 	sseHeartbeat time.Duration
 	sseMaxLife   time.Duration
+	shutdown     <-chan struct{}
 
 	uploadSlots chan struct{}
 	openInput   func(string) (io.WriteCloser, error)
@@ -66,6 +70,7 @@ func NewHandler(d Deps) http.Handler {
 	if s.every <= 0 {
 		s.every = time.Second
 	}
+	s.shutdown = d.Shutdown
 	s.sseSlots = make(chan struct{}, sseCap)
 	s.sseHeartbeat, s.sseMaxLife = d.SSEHeartbeat, d.SSEMaxLifetime
 	if s.sseHeartbeat <= 0 {

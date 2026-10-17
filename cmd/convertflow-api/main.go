@@ -59,9 +59,10 @@ func run() error {
 		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout,
 		Interval: time.Minute}).Run(ctx)
 
+	shutdownStarted := make(chan struct{})
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewHandler(api.Deps{Store: store, Cfg: cfg, Audit: al}),
+		Handler:           api.NewHandler(api.Deps{Store: store, Cfg: cfg, Audit: al, Shutdown: shutdownStarted}),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No ReadTimeout/WriteTimeout: uploads are multi-GB and SSE is long-lived. The upload
 		// handler extends a rolling per-read deadline through http.ResponseController instead.
@@ -69,6 +70,7 @@ func run() error {
 		IdleTimeout:    120 * time.Second,
 		TLSConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
 	}
+	srv.RegisterOnShutdown(func() { close(shutdownStarted) })
 	errc := make(chan error, 1)
 	go func() {
 		slog.Info("api listening", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "")
@@ -85,9 +87,23 @@ func run() error {
 		}
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return shutdownServer(srv, shutdownTimeout)
+}
+
+const shutdownTimeout = 30 * time.Second // in-flight uploads and downloads get this long to finish
+
+// shutdownServer stops accepting connections and waits up to timeout for in-flight requests
+// (SSE streams end on their own via Deps.Shutdown). Past the timeout the remaining connections are
+// closed forcibly; that is logged, not an error, so the process still exits 0.
+func shutdownServer(srv *http.Server, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	err := srv.Shutdown(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		slog.Warn("graceful shutdown timed out; closing remaining connections", "timeout", timeout)
+		return srv.Close()
+	}
+	return err
 }
 
 // healthcheck is used by the container HEALTHCHECK (distroless has no curl).
