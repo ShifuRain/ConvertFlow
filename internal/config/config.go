@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -132,4 +133,20 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		fail("CONVERTFLOW_DATABASE_URL or CONVERTFLOW_DATABASE_URL_FILE is required")
 	}
 	return c, firstErr
+}
+
+// Absolutize makes every filesystem path of the configuration absolute, so later working-directory
+// changes or relative comparisons (the janitor's inside-the-data-dir check) cannot be confused.
+func (c *Config) Absolutize() error {
+	for _, p := range []*string{&c.DataDir, &c.TLSCertFile, &c.TLSKeyFile} {
+		if *p == "" {
+			continue
+		}
+		abs, err := filepath.Abs(*p)
+		if err != nil {
+			return fmt.Errorf("resolving %q: %w", *p, err)
+		}
+		*p = abs
+	}
+	return nil
 }

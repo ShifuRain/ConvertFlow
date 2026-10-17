@@ -31,6 +31,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if err := cfg.Absolutize(); err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -42,10 +45,7 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	dataDir, err := filepath.Abs(cfg.DataDir)
-	if err != nil {
-		return err
-	}
+	dataDir := cfg.DataDir
 	outDir := filepath.Join(dataDir, "out")
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return err

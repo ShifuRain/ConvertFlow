@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -171,5 +172,28 @@ func TestAllowedHosts(t *testing.T) {
 		if _, err := config.Load(env(base), noFile); err == nil || !strings.Contains(err.Error(), "CONVERTFLOW_ALLOWED_HOSTS") {
 			t.Errorf("%q: want error naming the variable, got %v", bad, err)
 		}
+	}
+}
+
+func TestAbsolutize(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "x", "CONVERTFLOW_DATA_DIR": "rel/data",
+		"CONVERTFLOW_TLS_CERT_FILE": "c.pem", "CONVERTFLOW_TLS_KEY_FILE": "k.pem"}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Absolutize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{c.DataDir, c.TLSCertFile, c.TLSKeyFile} {
+		if !filepath.IsAbs(p) {
+			t.Errorf("not absolute: %q", p)
+		}
+	}
+	if !strings.HasSuffix(c.DataDir, "/rel/data") {
+		t.Errorf("DataDir = %q", c.DataDir)
+	}
+	var empty config.Config
+	if err := empty.Absolutize(); err != nil || empty.TLSCertFile != "" {
+		t.Errorf("unset paths must stay unset: %+v %v", empty, err)
 	}
 }
