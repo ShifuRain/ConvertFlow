@@ -16,13 +16,26 @@
 # COMPOSE_FILES may list extra "-f file" arguments (used to demonstrate that a weakened config fails).
 #   tests/container/hardening.sh --self-test   runs the weakened config and asserts the test FAILS.
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+SELF=$(readlink -f "${BASH_SOURCE[0]}")   # absolute, resolved before any cd
+cd "$(dirname "$SELF")/../.."
 RT=${CONTAINER_RUNTIME:-docker}
 if [ "${1:-}" = "--self-test" ]; then
-  if COMPOSE_FILES="-f tests/container/weak.override.yaml" "$0" >/dev/null 2>&1; then
-    echo "SELF-TEST FAIL: weakened config passed the hardening test"; exit 1
-  fi
-  echo "self-test ok: weakened config is rejected"; exit 0
+  # Run the real test against the weakened override and require that it fails for the RIGHT reasons.
+  out=$(COMPOSE_FILES="${SELF_TEST_COMPOSE_FILES--f tests/container/weak.override.yaml}" "$SELF" 2>&1) && rc=0 || rc=$?
+  bad=0
+  [ "$rc" -ne 0 ] || { echo "SELF-TEST FAIL: weakened config exited 0"; bad=1; }
+  grep -q '^ok: ' <<<"$out" || { echo "SELF-TEST FAIL: nested run produced no 'ok:' lines (did not really run)"; bad=1; }
+  if grep -qiE 'command not found|No such file or directory' <<<"$out"; then echo "SELF-TEST FAIL: nested run crashed"; bad=1; fi
+  for want in \
+    "FAIL: every service is read_only" \
+    "FAIL: every service drops ALL capabilities and adds none" \
+    "FAIL: worker has an empty effective capability set" \
+    "FAIL: worker has an empty bounding set" \
+    "FAIL: worker rootfs is read-only"; do
+    if grep -qF "$want" <<<"$out"; then echo "self-test saw expected: $want"; else echo "SELF-TEST FAIL: expected line missing: $want"; bad=1; fi
+  done
+  [ "$bad" = 0 ] && echo "self-test ok: weakened config is rejected for the expected reasons"
+  exit "$bad"
 fi
 PROJECT=convertflow-hardening
 export CONVERTFLOW_PORT=${CONVERTFLOW_HARDENING_PORT:-18081}

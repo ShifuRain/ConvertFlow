@@ -27,7 +27,7 @@ RUN set -eux; \
     elif [ "$FFMPEG_FLAVOR" != "lgpl" ]; then echo "unknown FFMPEG_FLAVOR $FFMPEG_FLAVOR" >&2; exit 1; fi; \
     ./configure $flags; \
     make -j"$(nproc)"; make install; \
-    ! ldd /opt/ffmpeg/bin/ffmpeg | grep 'not found'; \
+    if ldd /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe | grep -q 'not found'; then echo 'unresolved shared libraries' >&2; ldd /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe >&2; exit 1; fi; \
     printf 'ffmpeg %s flavor=%s sha256=%s\n' "$FFMPEG_VERSION" "$FFMPEG_FLAVOR" "$FFMPEG_SHA256" > /opt/ffmpeg/BUILDINFO
 
 FROM docker.io/library/golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS gobuild
@@ -55,12 +55,13 @@ COPY --from=gobuild /out/convertflow-worker /usr/local/bin/convertflow-worker
 # Fail the build if the runtime image cannot actually run the FFmpeg we built (soname drift, missing libs,
 # missing encoders) or if the licence flavor is not what was requested.
 RUN set -eux; \
-    ! ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe | grep 'not found'; \
+    if ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe | grep -q 'not found'; then echo 'unresolved shared libraries' >&2; ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe >&2; exit 1; fi; \
     enc="$(ffmpeg -hide_banner -encoders)"; \
     want="libsvtav1 libaom-av1 libvpx-vp9 libopus libvorbis libmp3lame"; \
     if [ "$FFMPEG_FLAVOR" = "full" ]; then want="$want libx264 libx265"; fi; \
     for e in $want; do printf '%s\n' "$enc" | grep -qw "$e" || { echo "missing encoder $e" >&2; exit 1; }; done; \
     ver="$(ffmpeg -version)"; \
+    printf '%s\n' "$ver" | grep -q '^configuration:' || { echo 'no configuration line in ffmpeg -version' >&2; exit 1; }; \
     if [ "$FFMPEG_FLAVOR" = "lgpl" ]; then \
       if printf '%s\n' "$ver" | grep -Eq -- '--enable-(gpl|nonfree|version3)'; then echo "lgpl image built with GPL/nonfree flags" >&2; exit 1; fi; \
     else printf '%s\n' "$ver" | grep -q -- '--enable-gpl'; fi; \
