@@ -45,6 +45,11 @@ type Worker struct {
 	Limits         ffmpeg.Limits
 	Poll           time.Duration
 	HeartbeatEvery time.Duration
+	// LeaseTimeout is how long heartbeats may keep failing with store errors (for example a
+	// database outage) before the worker assumes the janitor has requeued its job: it then
+	// stops FFmpeg and abandons the job without any terminal write. Set it to the janitor's
+	// STALE_AFTER. Zero disables the check.
+	LeaseTimeout time.Duration
 	// JobTimeout is the wall-clock limit for one FFmpeg run (default 4h). It is the backstop
 	// for inputs whose duration is unknown to ffprobe.
 	JobTimeout time.Duration
@@ -169,7 +174,7 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 	switch {
 	case st.canceled.Load():
 		removeIf(outPath)
-		werr = w.Store.MarkCanceled(bg, j.ID)
+		werr = w.Store.MarkCanceled(bg, j.ID, w.ID)
 		w.logStoreErr("mark_canceled", j.ID, werr)
 		if werr == nil {
 			w.Audit.System("job_canceled", j.ID, "worker", w.ID)
@@ -177,13 +182,13 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 	case err != nil:
 		removeIf(outPath)
 		msg := ffmpeg.Sanitize(err.Error(), filepath.Dir(j.InputPath), w.OutDir, w.ScratchDir)
-		werr = w.Store.Fail(bg, j.ID, msg)
+		werr = w.Store.Fail(bg, j.ID, w.ID, msg)
 		w.logStoreErr("fail", j.ID, werr)
 		if werr == nil {
 			w.Audit.System("job_failed", j.ID, "worker", w.ID, "error", msg)
 		}
 	default:
-		werr = w.Store.Complete(bg, j.ID, outPath)
+		werr = w.Store.Complete(bg, j.ID, w.ID, outPath)
 		w.logStoreErr("complete", j.ID, werr)
 		if werr == nil {
 			w.Audit.System("job_finished", j.ID, "worker", w.ID, "encoder", j.EncoderUsed)
@@ -231,19 +236,40 @@ func (w *Worker) Watch(ctx context.Context, id string, cancel context.CancelFunc
 func (w *Worker) watch(ctx context.Context, id string, cancel context.CancelFunc, st *jobState) {
 	t := time.NewTicker(w.HeartbeatEvery)
 	defer t.Stop()
+	lastOK := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			req, err := w.Store.Heartbeat(ctx, id)
+			hctx, hcancel := ctx, context.CancelFunc(func() {})
+			if w.LeaseTimeout > 0 { // a hung database connection must not stall the lease check
+				hctx, hcancel = context.WithTimeout(ctx, max(w.HeartbeatEvery, w.LeaseTimeout/3))
+			}
+			req, err := w.Store.Heartbeat(hctx, id, w.ID)
+			hcancel()
 			if errors.Is(err, jobs.ErrNotFound) {
 				st.lost.Store(true)
 				cancel()
 				return
 			}
-			if err == nil && req {
-				st.canceled.Store(true)
+			if err == nil {
+				lastOK = time.Now()
+				if req {
+					st.canceled.Store(true)
+					cancel()
+					return
+				}
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			// The janitor requeues a job after STALE_AFTER without heartbeat, so after that long
+			// without a successful one this worker must assume it lost the job.
+			if w.LeaseTimeout > 0 && time.Since(lastOK) >= w.LeaseTimeout {
+				slog.Error("heartbeat failing past the lease timeout; abandoning job", "job_id", id, "worker", w.ID, "err", err)
+				st.lost.Store(true)
 				cancel()
 				return
 			}
@@ -261,7 +287,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	if err := pr.Validate(w.Limits); err != nil {
 		return "", err
 	}
-	if err := w.Store.SetProbe(ctx, j.ID, raw); err != nil {
+	if err := w.Store.SetProbe(ctx, j.ID, w.ID, raw); err != nil {
 		if errors.Is(err, jobs.ErrNotFound) {
 			st.lost.Store(true)
 			return "", errLeaseLost
@@ -287,7 +313,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	if cand.Video != "" {
 		encoder = cand.Video
 	}
-	if err := w.Store.SetRunning(ctx, j.ID, encoder); err != nil {
+	if err := w.Store.SetRunning(ctx, j.ID, w.ID, encoder); err != nil {
 		if errors.Is(err, jobs.ErrNotFound) {
 			st.lost.Store(true)
 			return "", errLeaseLost
@@ -350,7 +376,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	tail, err := ffmpeg.Run(runCtx, w.FFmpegBin, args, w.ScratchDir, dur, func(p float64) {
 		if time.Since(last) >= time.Second {
 			last = time.Now()
-			e := w.Store.UpdateProgress(ctx, j.ID, p)
+			e := w.Store.UpdateProgress(ctx, j.ID, w.ID, p)
 			if errors.Is(e, jobs.ErrNotFound) {
 				st.lost.Store(true)
 				cancel()

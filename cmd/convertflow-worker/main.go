@@ -65,7 +65,8 @@ func run() error {
 		OutDir: outDir, ScratchDir: scratch,
 		Limits: ffmpeg.Limits{MaxDurationSec: cfg.MaxDurationSec, MaxPixels: cfg.MaxPixels, MaxStreams: cfg.MaxStreams},
 		Poll:   cfg.WorkerPoll, HeartbeatEvery: 2 * time.Second,
-		JobTimeout: cfg.JobTimeout, MaxOutputBytes: cfg.MaxOutputBytes,
+		LeaseTimeout: cfg.StaleAfter,
+		JobTimeout:   cfg.JobTimeout, MaxOutputBytes: cfg.MaxOutputBytes,
 	}
 	slog.Info("worker starting", "id", w.ID, "flavor", cfg.Flavor)
 	return w.Run(ctx)

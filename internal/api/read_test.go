@@ -61,10 +61,10 @@ func seedDone(t *testing.T, f fixture, filename, preset, content string) string 
 	if _, err := f.store.Claim(ctx, "w1", presets.IDs(presets.All())); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.store.SetRunning(ctx, id, "pcm_s16le"); err != nil {
+	if err := f.store.SetRunning(ctx, id, "w1", "pcm_s16le"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.store.Complete(ctx, id, out); err != nil {
+	if err := f.store.Complete(ctx, id, "w1", out); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -212,7 +212,7 @@ func TestOutputNotReady(t *testing.T) {
 	id := uuid.NewString()
 	_ = f.store.Create(ctx, &jobs.Job{ID: id, Filename: "f", InputPath: "/x", Options: jobs.Options{Preset: "audio-wav"}})
 	_, _ = f.store.Claim(ctx, "w1", presets.IDs(presets.All()))
-	_ = f.store.Fail(ctx, id, "boom")
+	_ = f.store.Fail(ctx, id, "w1", "boom")
 	if w := get(f, "/api/v1/jobs/"+id+"/output"); w.Code != 409 {
 		t.Fatalf("failed job: want 409 got %d", w.Code)
 	}
@@ -244,7 +244,7 @@ func TestDeleteSemantics(t *testing.T) {
 	if w := del(f, "/api/v1/jobs/"+rid); w.Code != 202 {
 		t.Fatalf("want 202 got %d", w.Code)
 	}
-	if cancel, _ := f.store.Heartbeat(ctx, rid); !cancel {
+	if cancel, _ := f.store.Heartbeat(ctx, rid, "w1"); !cancel {
 		t.Fatal("cancel flag should be set")
 	}
 	w := del(f, "/api/v1/jobs/"+uuid.NewString())
@@ -517,10 +517,10 @@ func TestSSEStreamsUntilDone(t *testing.T) {
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		_, _ = f.store.Claim(ctx, "w1", presets.IDs(presets.All()))
-		_ = f.store.SetRunning(ctx, id, "pcm_s16le")
-		_ = f.store.UpdateProgress(ctx, id, 50)
+		_ = f.store.SetRunning(ctx, id, "w1", "pcm_s16le")
+		_ = f.store.UpdateProgress(ctx, id, "w1", 50)
 		time.Sleep(100 * time.Millisecond)
-		_ = f.store.Complete(ctx, id, "/out")
+		_ = f.store.Complete(ctx, id, "w1", "/out")
 	}()
 
 	req, _ := http.NewRequest("GET", srv.URL+"/api/v1/jobs/"+id+"/events", nil)

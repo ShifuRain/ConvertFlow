@@ -318,7 +318,7 @@ func TestWatchStopsWhenLeaseLost(t *testing.T) {
 	if _, err := e.store.Claim(ctx, "w1", presets.IDs(presets.All())); err != nil {
 		t.Fatal(err)
 	}
-	_ = e.store.Fail(ctx, id, "x")
+	_ = e.store.Fail(ctx, id, "w1", "x")
 	cctx, cancel := context.WithCancel(ctx)
 	var canceled atomic.Bool
 	done := make(chan struct{})
@@ -484,5 +484,83 @@ func TestPerAttemptOutputNamesDiffer(t *testing.T) {
 	}
 	if !exists(j1.OutputPath) || !exists(j2.OutputPath) {
 		t.Fatal("both attempts' outputs should exist (cleanup is the janitor's job)")
+	}
+}
+
+// The late terminal write of a zombie worker must neither change the re-claimed job nor delete its input.
+func TestZombieTerminalWriteKeepsInputAndJob(t *testing.T) {
+	e := setup(t, defaultLimits)
+	ctx := context.Background()
+	src := testutil.MakeClip(t, t.TempDir(), "a.wav", "audio")
+	id := e.enqueue(t, src, "audio-wav")
+	j, err := e.store.Claim(ctx, "w1", presets.IDs(presets.All()))
+	if err != nil || j == nil {
+		t.Fatal(err)
+	}
+	// the janitor requeues (lease expired) and another worker claims the job
+	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
+	if r, _, err := e.store.RequeueStale(ctx, time.Minute, 3); err != nil || r != 1 {
+		t.Fatalf("requeue %d %v", r, err)
+	}
+	if c, err := e.store.Claim(ctx, "other", presets.IDs(presets.All())); err != nil || c == nil {
+		t.Fatalf("claim: %v %v", c, err)
+	}
+	// worker w1 (zombie) finishes its attempt: process() must find the lease lost
+	e.w.ProcessClaimed(ctx, j)
+	got, _ := e.store.Get(ctx, id)
+	if got.Status != jobs.StatusProbing || got.WorkerID != "other" {
+		t.Fatalf("other worker's job was touched: %+v", got)
+	}
+	if _, err := os.Stat(j.InputPath); err != nil {
+		t.Fatalf("zombie deleted the input of the re-claimed job: %v", err)
+	}
+}
+
+// If heartbeats keep failing with store errors (database outage) for longer than LeaseTimeout the worker
+// must assume the janitor requeued the job: stop FFmpeg, remove its partial output, keep the input and
+// write nothing.
+func TestWorkerAbandonsJobWhenHeartbeatsFailPastLeaseTimeout(t *testing.T) {
+	e := setup(t, defaultLimits)
+	ctx := context.Background()
+	flaky, err := pgxpool.NewWithConfig(ctx, e.pool.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer flaky.Close()
+	w := &worker.Worker{
+		ID: "w2", Store: jobs.NewStore(flaky), Audit: audit.New(&strings.Builder{}),
+		FFmpegBin: "ffmpeg", FFprobeBin: "ffprobe", Flavor: "full",
+		OutDir: e.w.OutDir, ScratchDir: t.TempDir(), Limits: defaultLimits,
+		Poll: 50 * time.Millisecond, HeartbeatEvery: 50 * time.Millisecond, LeaseTimeout: 600 * time.Millisecond,
+	}
+	if err := w.RegisterCapabilities(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id := e.enqueue(t, longClip(t, 60), "video-vp9")
+	go func() {
+		for i := 0; i < 600; i++ {
+			if j, err := e.store.Get(ctx, id); err == nil && j.Status == jobs.StatusRunning {
+				flaky.Close() // the worker loses its database connection mid-run
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	start := time.Now()
+	if ok, err := w.ProcessOne(ctx); !ok || err != nil {
+		t.Fatalf("ProcessOne: %v %v", ok, err)
+	}
+	if time.Since(start) > 20*time.Second {
+		t.Fatal("worker did not stop ffmpeg after heartbeats failed past the lease timeout")
+	}
+	j, _ := e.store.Get(ctx, id)
+	if j.Status != jobs.StatusRunning || j.Error != "" {
+		t.Fatalf("a worker without database access cannot have written anything: %+v", j)
+	}
+	if _, err := os.Stat(j.InputPath); err != nil {
+		t.Fatal("input must be kept for the requeue")
+	}
+	if len(e.outFiles(t)) != 0 {
+		t.Fatal("partial output must be removed")
 	}
 }

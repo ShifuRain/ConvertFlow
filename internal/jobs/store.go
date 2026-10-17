@@ -112,38 +112,44 @@ func (s *Store) guarded(ctx context.Context, q string, args ...any) error {
 	return nil
 }
 
-func (s *Store) SetProbe(ctx context.Context, id string, probe []byte) error {
-	return s.guarded(ctx, `UPDATE jobs SET probe = $2, updated_at = now() WHERE id = $1::uuid AND status = 'probing'`, id, probe)
+// The worker-side writes below are fenced by worker_id as well as status: worker ids are unique per
+// process and a worker handles one job at a time, so a zombie worker whose job was requeued and
+// claimed by another worker (RequeueStale clears worker_id, Claim sets it) matches no row and gets
+// ErrNotFound instead of touching the new owner's job.
+
+func (s *Store) SetProbe(ctx context.Context, id, workerID string, probe []byte) error {
+	return s.guarded(ctx, `UPDATE jobs SET probe = $3, updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status = 'probing'`, id, workerID, probe)
 }
 
-func (s *Store) SetRunning(ctx context.Context, id, encoder string) error {
-	return s.guarded(ctx, `UPDATE jobs SET status = 'running', encoder_used = $2, updated_at = now() WHERE id = $1::uuid AND status = 'probing'`, id, encoder)
+func (s *Store) SetRunning(ctx context.Context, id, workerID, encoder string) error {
+	return s.guarded(ctx, `UPDATE jobs SET status = 'running', encoder_used = $3, updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status = 'probing'`, id, workerID, encoder)
 }
 
-func (s *Store) UpdateProgress(ctx context.Context, id string, pct float64) error {
-	return s.guarded(ctx, `UPDATE jobs SET progress = $2, updated_at = now() WHERE id = $1::uuid AND status = 'running'`, id, pct)
+func (s *Store) UpdateProgress(ctx context.Context, id, workerID string, pct float64) error {
+	return s.guarded(ctx, `UPDATE jobs SET progress = $3, updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status = 'running'`, id, workerID, pct)
 }
 
 // Heartbeat refreshes the liveness timestamp and reports whether cancellation was requested.
-func (s *Store) Heartbeat(ctx context.Context, id string) (bool, error) {
+func (s *Store) Heartbeat(ctx context.Context, id, workerID string) (bool, error) {
 	var c bool
-	err := s.pool.QueryRow(ctx, `UPDATE jobs SET heartbeat_at = now() WHERE id = $1::uuid AND status IN ('probing','running') RETURNING cancel_requested`, id).Scan(&c)
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET heartbeat_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running') RETURNING cancel_requested`, id, workerID).Scan(&c)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrNotFound
 	}
 	return c, err
 }
 
-func (s *Store) Complete(ctx context.Context, id, outputPath string) error {
-	return s.guarded(ctx, `UPDATE jobs SET status = 'done', progress = 100, output_path = $2, finished_at = now(), updated_at = now() WHERE id = $1::uuid AND status = 'running'`, id, outputPath)
+func (s *Store) Complete(ctx context.Context, id, workerID, outputPath string) error {
+	return s.guarded(ctx, `UPDATE jobs SET status = 'done', progress = 100, output_path = $3, finished_at = now(), updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status = 'running'`, id, workerID, outputPath)
 }
 
-func (s *Store) Fail(ctx context.Context, id, msg string) error {
-	return s.guarded(ctx, `UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now() WHERE id = $1::uuid AND status IN ('probing','running')`, id, msg)
+func (s *Store) Fail(ctx context.Context, id, workerID, msg string) error {
+	return s.guarded(ctx, `UPDATE jobs SET status = 'failed', error = $3, finished_at = now(), updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running')`, id, workerID, msg)
 }
 
-func (s *Store) MarkCanceled(ctx context.Context, id string) error {
-	return s.guarded(ctx, `UPDATE jobs SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id = $1::uuid AND status IN ('queued','probing','running')`, id)
+// MarkCanceled is the worker's acknowledgement of a cancel request for an active job it owns.
+func (s *Store) MarkCanceled(ctx context.Context, id, workerID string) error {
+	return s.guarded(ctx, `UPDATE jobs SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running')`, id, workerID)
 }
 
 // RequestCancel cancels a queued job immediately and flags an active one for its worker.

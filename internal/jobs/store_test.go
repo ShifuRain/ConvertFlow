@@ -90,17 +90,17 @@ func TestLifecycleAndCancel(t *testing.T) {
 	if c.Status != jobs.StatusProbing || c.Attempts != 1 || c.WorkerID != "w1" {
 		t.Fatalf("bad claim %+v", c)
 	}
-	_ = s.SetRunning(ctx, j.ID, "libsvtav1")
-	_ = s.UpdateProgress(ctx, j.ID, 42.5)
-	cancel, err := s.Heartbeat(ctx, j.ID)
+	_ = s.SetRunning(ctx, j.ID, "w1", "libsvtav1")
+	_ = s.UpdateProgress(ctx, j.ID, "w1", 42.5)
+	cancel, err := s.Heartbeat(ctx, j.ID, "w1")
 	if err != nil || cancel {
 		t.Fatalf("heartbeat %v %v", cancel, err)
 	}
 	_ = s.RequestCancel(ctx, j.ID)
-	if cancel, _ = s.Heartbeat(ctx, j.ID); !cancel {
+	if cancel, _ = s.Heartbeat(ctx, j.ID, "w1"); !cancel {
 		t.Fatal("cancel flag not visible to heartbeat")
 	}
-	_ = s.MarkCanceled(ctx, j.ID)
+	_ = s.MarkCanceled(ctx, j.ID, "w1")
 	got, _ := s.Get(ctx, j.ID)
 	if got.Status != jobs.StatusCanceled || got.FinishedAt == nil || got.EncoderUsed != "libsvtav1" {
 		t.Fatalf("bad final %+v", got)
@@ -127,11 +127,11 @@ func TestCompleteAndFail(t *testing.T) {
 	_ = s.Create(ctx, b)
 	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // a
 	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All())) // b
-	_ = s.SetRunning(ctx, a.ID, "pcm_s16le")
-	if err := s.Complete(ctx, a.ID, "/data/out/x.wav"); err != nil {
+	_ = s.SetRunning(ctx, a.ID, "w", "pcm_s16le")
+	if err := s.Complete(ctx, a.ID, "w", "/data/out/x.wav"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Fail(ctx, b.ID, "boom"); err != nil {
+	if err := s.Fail(ctx, b.ID, "w", "boom"); err != nil {
 		t.Fatal(err)
 	}
 	ga, _ := s.Get(ctx, a.ID)
@@ -195,8 +195,8 @@ func TestExpiredAndExists(t *testing.T) {
 	_ = s.Create(ctx, fresh)
 	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
-	_ = s.Fail(ctx, old.ID, "x")
-	_ = s.Fail(ctx, fresh.ID, "x")
+	_ = s.Fail(ctx, old.ID, "w", "x")
+	_ = s.Fail(ctx, fresh.ID, "w", "x")
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET finished_at = now() - interval '2 days' WHERE id = $1::uuid`, old.ID)
 	exp, err := s.Expired(ctx, 24*time.Hour)
 	if err != nil || len(exp) != 1 || exp[0].ID != old.ID {
@@ -248,13 +248,13 @@ func TestZombieWritesAfterRequeue(t *testing.T) {
 		t.Fatalf("requeue %d %v", r, err)
 	}
 	checks := map[string]error{
-		"SetProbe":       s.SetProbe(ctx, j.ID, []byte(`{}`)),
-		"SetRunning":     s.SetRunning(ctx, j.ID, "x"),
-		"UpdateProgress": s.UpdateProgress(ctx, j.ID, 5),
-		"Complete":       s.Complete(ctx, j.ID, "/o"),
-		"Fail":           s.Fail(ctx, j.ID, "x"),
+		"SetProbe":       s.SetProbe(ctx, j.ID, "w", []byte(`{}`)),
+		"SetRunning":     s.SetRunning(ctx, j.ID, "w", "x"),
+		"UpdateProgress": s.UpdateProgress(ctx, j.ID, "w", 5),
+		"Complete":       s.Complete(ctx, j.ID, "w", "/o"),
+		"Fail":           s.Fail(ctx, j.ID, "w", "x"),
 	}
-	_, hbErr := s.Heartbeat(ctx, j.ID)
+	_, hbErr := s.Heartbeat(ctx, j.ID, "w")
 	checks["Heartbeat"] = hbErr
 	for name, err := range checks {
 		if !errors.Is(err, jobs.ErrNotFound) {
@@ -272,9 +272,9 @@ func TestZombieLeavesJobQueued(t *testing.T) {
 	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
 	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
 	_, _, _ = s.RequeueStale(ctx, time.Minute, 3)
-	_ = s.SetRunning(ctx, j.ID, "x")
-	_ = s.Complete(ctx, j.ID, "/o")
-	_ = s.Fail(ctx, j.ID, "x")
+	_ = s.SetRunning(ctx, j.ID, "w", "x")
+	_ = s.Complete(ctx, j.ID, "w", "/o")
+	_ = s.Fail(ctx, j.ID, "w", "x")
 	got, _ := s.Get(ctx, j.ID)
 	if got.Status != jobs.StatusQueued || got.OutputPath != "" {
 		t.Fatalf("job mutated by zombie: %+v", got)
@@ -287,9 +287,9 @@ func TestMarkCanceledOnDoneIsNotFound(t *testing.T) {
 	j := newJob()
 	_ = s.Create(ctx, j)
 	_, _ = s.Claim(ctx, "w", presets.IDs(presets.All()))
-	_ = s.SetRunning(ctx, j.ID, "x")
-	_ = s.Complete(ctx, j.ID, "/o")
-	if err := s.MarkCanceled(ctx, j.ID); !errors.Is(err, jobs.ErrNotFound) {
+	_ = s.SetRunning(ctx, j.ID, "w", "x")
+	_ = s.Complete(ctx, j.ID, "w", "/o")
+	if err := s.MarkCanceled(ctx, j.ID, "w"); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	got, _ := s.Get(ctx, j.ID)
@@ -300,7 +300,7 @@ func TestMarkCanceledOnDoneIsNotFound(t *testing.T) {
 
 func TestHeartbeatMissingRow(t *testing.T) {
 	s := jobs.NewStore(dbtest.New(t))
-	if _, err := s.Heartbeat(context.Background(), uuid.NewString()); !errors.Is(err, jobs.ErrNotFound) {
+	if _, err := s.Heartbeat(context.Background(), uuid.NewString(), "w"); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -356,7 +356,7 @@ func TestCountActive(t *testing.T) {
 			break
 		}
 	}
-	if err := s.Fail(ctx, claimed.ID, "boom"); err != nil {
+	if err := s.Fail(ctx, claimed.ID, "w1", "boom"); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := s.CountActive(ctx); n != 2 {
@@ -473,5 +473,58 @@ func TestExpireQueuedCountsFromLastQueuedTransition(t *testing.T) {
 	}
 	if j, _ := s.Get(ctx, requeued.ID); j.Status != jobs.StatusQueued {
 		t.Errorf("requeued job was expired: %+v", j)
+	}
+}
+
+// A zombie worker A (its lease expired during a long database outage) must not be able to write to the
+// job after the janitor requeued it and worker B claimed it.
+func TestZombieWorkerCannotTouchReclaimedJob(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	if c, err := s.Claim(ctx, "A", presets.IDs(presets.All())); err != nil || c == nil {
+		t.Fatalf("claim A: %v %v", c, err)
+	}
+	if err := s.SetRunning(ctx, j.ID, "A", "pcm_s16le"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET heartbeat_at = now() - interval '10 minutes'`)
+	if r, _, err := s.RequeueStale(ctx, time.Minute, 3); err != nil || r != 1 {
+		t.Fatalf("requeue %d %v", r, err)
+	}
+	if c, err := s.Claim(ctx, "B", presets.IDs(presets.All())); err != nil || c == nil || c.WorkerID != "B" {
+		t.Fatalf("claim B: %+v %v", c, err)
+	}
+	if err := s.SetRunning(ctx, j.ID, "B", "pcm_s16le"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := s.Get(ctx, j.ID)
+
+	checks := map[string]error{
+		"SetProbe":       s.SetProbe(ctx, j.ID, "A", []byte(`{"zombie":true}`)),
+		"SetRunning":     s.SetRunning(ctx, j.ID, "A", "x"),
+		"UpdateProgress": s.UpdateProgress(ctx, j.ID, "A", 99),
+		"Complete":       s.Complete(ctx, j.ID, "A", "/zombie"),
+		"Fail":           s.Fail(ctx, j.ID, "A", "zombie"),
+		"MarkCanceled":   s.MarkCanceled(ctx, j.ID, "A"),
+	}
+	_, hbErr := s.Heartbeat(ctx, j.ID, "A")
+	checks["Heartbeat"] = hbErr
+	for name, err := range checks {
+		if !errors.Is(err, jobs.ErrNotFound) {
+			t.Errorf("%s: want ErrNotFound, got %v", name, err)
+		}
+	}
+	after, _ := s.Get(ctx, j.ID)
+	if after.Status != jobs.StatusRunning || after.WorkerID != "B" || after.Progress != before.Progress ||
+		after.OutputPath != "" || after.Error != "" || after.EncoderUsed != "pcm_s16le" || string(after.Probe) != string(before.Probe) ||
+		!after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("B's job was touched: before %+v after %+v", before, after)
+	}
+	// and B itself still can
+	if err := s.Complete(ctx, j.ID, "B", "/o"); err != nil {
+		t.Fatalf("B complete: %v", err)
 	}
 }

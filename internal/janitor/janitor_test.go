@@ -70,12 +70,12 @@ func (e *env) job(t *testing.T, state string) string {
 		mustClaim(t, e.store)
 	case "running":
 		mustClaim(t, e.store)
-		if err := e.store.SetRunning(ctx, id, "x"); err != nil {
+		if err := e.store.SetRunning(ctx, id, "w", "x"); err != nil {
 			t.Fatal(err)
 		}
 	case "failed":
 		mustClaim(t, e.store)
-		if err := e.store.Fail(ctx, id, "boom"); err != nil {
+		if err := e.store.Fail(ctx, id, "w", "boom"); err != nil {
 			t.Fatal(err)
 		}
 	default:
@@ -95,7 +95,7 @@ func (e *env) done(t *testing.T, outName func(string) string) string {
 	t.Helper()
 	ctx := context.Background()
 	id := e.job(t, "running")
-	if err := e.store.Complete(ctx, id, filepath.Join(e.dir, "out", outName(id))); err != nil {
+	if err := e.store.Complete(ctx, id, "w", filepath.Join(e.dir, "out", outName(id))); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -110,8 +110,8 @@ func TestSweepRemovesExpiredJobsAndOrphans(t *testing.T) {
 	out := filepath.Join(e.dir, "out", id+".wav")
 	_ = os.WriteFile(out, []byte("x"), 0o600)
 	_ = e.store.Create(ctx, &jobs.Job{ID: id, Filename: "a", InputPath: filepath.Join(e.dir, "in", id), Options: jobs.Options{Preset: "audio-wav"}})
-	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET status='running'`)
-	_ = e.store.Complete(ctx, id, out)
+	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET status='running', worker_id='w'`)
+	_ = e.store.Complete(ctx, id, "w", out)
 	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET finished_at = now() - interval '2 days'`)
 
 	oldOrphan := e.file(t, "in", uuid.NewString(), 48*time.Hour)
@@ -233,7 +233,7 @@ func TestInputRules(t *testing.T) {
 	if !exists(qIn) {
 		t.Fatal("input of a queued job must be kept")
 	}
-	_ = e.store.MarkCanceled(context.Background(), queued)
+	_ = e.store.RequestCancel(context.Background(), queued)
 	if err := e.j.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -331,8 +331,8 @@ func TestRetentionRefusesPathsOutsideDataDir(t *testing.T) {
 	_ = os.WriteFile(outside, []byte("keep"), 0o600)
 	id := uuid.NewString()
 	_ = e.store.Create(ctx, &jobs.Job{ID: id, Filename: "a", InputPath: outside, Options: jobs.Options{Preset: "audio-wav"}})
-	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET status='running'`)
-	_ = e.store.Complete(ctx, id, outside)
+	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET status='running', worker_id='w'`)
+	_ = e.store.Complete(ctx, id, "w", outside)
 	_, _ = e.pool.Exec(ctx, `UPDATE jobs SET finished_at = now() - interval '2 days'`)
 	if err := e.j.Sweep(ctx); err != nil {
 		t.Fatal(err)
