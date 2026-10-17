@@ -19,3 +19,15 @@ build re-checks the hash and fails closed; it never contacts a keyserver.
 
 The API listens on `127.0.0.1:8080` only; change the host IP in `compose.yaml` deliberately.
 The worker and database sit on an internal network with no egress.
+
+## Notes and limits
+
+- Only **rootless podman 6.x** (with the docker-compose provider) has been verified. The Docker engine is NOT verified.
+- Pinned base-image digests go stale. Run `scripts/pin-digests.sh` before each release (CI should check this).
+- `scripts/smoke.sh` and `tests/container/hardening.sh` use their own compose projects (`convertflow-smoke`,
+  `convertflow-hardening`) and host ports (18080 / 18081); they refuse `down -v` for any other project and never touch a
+  real `convertflow` deployment. `tests/container/hardening.sh --self-test` proves a weakened config is rejected.
+- Worker images are tagged per flavor: `convertflow-worker:dev-lgpl` / `:dev-full`. `FFMPEG_FLAVOR` is shared with the API
+  (it filters presets by flavor) through one compose anchor together with job timeout / retention / stale settings.
+- The final worker image build fails if ffmpeg/ffprobe have unresolved libraries, expected encoders are missing, or an lgpl
+  build shows `--enable-gpl`/`--enable-nonfree`/`--enable-version3`.
