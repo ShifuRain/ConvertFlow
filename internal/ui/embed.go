@@ -5,6 +5,7 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"strings"
 )
 
 //go:embed all:dist
@@ -15,5 +16,15 @@ func Handler() http.Handler {
 	if err != nil {
 		panic(err)
 	}
-	return http.FileServer(http.FS(sub))
+	files := http.FileServer(http.FS(sub))
+	// The embedded directory carries a .gitkeep placeholder; dotfiles are never served.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, seg := range strings.Split(r.URL.Path, "/") {
+			if strings.HasPrefix(seg, ".") {
+				http.NotFound(w, r)
+				return
+			}
+		}
+		files.ServeHTTP(w, r)
+	})
 }

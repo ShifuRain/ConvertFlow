@@ -97,3 +97,13 @@ func TestNoUnsafeDOMSinks(t *testing.T) {
 		}
 	}
 }
+
+func TestDotfilesAreNotServed(t *testing.T) {
+	for _, p := range []string{"/.gitkeep", "/.", "/a/.hidden", "/%2egitkeep"} {
+		w := httptest.NewRecorder()
+		ui.Handler().ServeHTTP(w, httptest.NewRequest("GET", p, nil))
+		if w.Code == 200 {
+			t.Errorf("%s served with 200", p)
+		}
+	}
+}
