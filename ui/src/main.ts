@@ -1,3 +1,5 @@
+import { av1Notice } from "./notice";
+
 interface Job {
   id: string; status: string; filename: string; preset: string; progress: number;
   encoder_used: string; error?: string; output_url?: string;
@@ -89,10 +91,11 @@ async function loadPresets() {
     if (presets.length === 0) {
       n.textContent = "No encoder worker is running, so there are no presets and uploads are disabled. Start a worker and this page will update.";
       n.hidden = false;
-    } else if (presets.some(p => p.id === "video-av1")) {
-      n.textContent = "Not all players can decode AV1. VP9 and MP4 (H.264/H.265) presets remain available if you need wider compatibility.";
-      n.hidden = false;
-    } else n.hidden = true;
+    } else {
+      const note = av1Notice(presets);
+      n.textContent = note;
+      n.hidden = note === "";
+    }
   } catch (e) {
     n.textContent = `Could not load presets: ${e instanceof Error ? e.message : String(e)}`;
     n.hidden = false;

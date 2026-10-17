@@ -58,6 +58,8 @@ jobs:
         run: make ui
       - name: UI type check
         run: npm --prefix ui run typecheck
+      - name: UI unit tests
+        run: npm --prefix ui test
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
