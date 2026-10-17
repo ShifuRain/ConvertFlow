@@ -329,7 +329,7 @@ The default image does **not** include hardware encoders: FFmpeg is configured w
 
 1. Build a custom worker image with FFmpeg compiled for the hardware (the relevant `--enable-*` flags and driver libraries) by modifying `Dockerfile.worker`.
 2. Pass the device (`devices: ["/dev/dri:/dev/dri"]`, and `group_add` for the render group so that uid 65532 can open it) or the vendor runtime to the `worker` service in an override file, and set `CONVERTFLOW_VAAPI_DEVICE` if the device is not `/dev/dri/renderD128`.
-3. At start each worker runs a short trial encode per candidate encoder and advertises only those that work, so presets fall back to software automatically. Check `GET /api/v1/presets` and the job's `encoder_used`.
+3. At start each worker runs a short trial encode per candidate encoder and advertises only those that work (it repeats this at most hourly, and after a job failed inside FFmpeg, at most once a minute; every 15 s it only refreshes its liveness row without starting FFmpeg), so presets fall back to software automatically. Check `GET /api/v1/presets` and the job's `encoder_used`.
 
 Passing a device conflicts with the hardening policy: `tests/container/hardening.sh` fails if any service has `devices`. Document the deviation in your risk assessment and adapt the test deliberately.
 

@@ -564,3 +564,87 @@ func TestWorkerAbandonsJobWhenHeartbeatsFailPastLeaseTimeout(t *testing.T) {
 		t.Fatal("partial output must be removed")
 	}
 }
+
+// countingFFmpeg is a fake ffmpeg that records every invocation and advertises a few encoders.
+func countingFFmpeg(t *testing.T) (bin, counter string) {
+	t.Helper()
+	d := t.TempDir()
+	counter = filepath.Join(d, "calls")
+	bin = filepath.Join(d, "ffmpeg")
+	script := "#!/bin/sh\necho x >> " + counter + "\nfor a in \"$@\"; do if [ \"$a\" = \"-encoders\" ]; then cat <<'EOT'\n" +
+		" Encoders:\n ------\n A....D pcm_s16le   PCM\n A....D libopus     Opus\n A....D flac        FLAC\nEOT\nexit 0; fi; done\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, counter
+}
+
+func calls(t *testing.T, counter string) int {
+	t.Helper()
+	b, err := os.ReadFile(counter)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(b), "x\n")
+}
+
+func TestCapabilityTickDoesNotSpawnFFmpeg(t *testing.T) {
+	pool := dbtest.New(t)
+	bin, counter := countingFFmpeg(t)
+	w := &worker.Worker{ID: "wt", Store: jobs.NewStore(pool), Audit: audit.New(&strings.Builder{}), FFmpegBin: bin, Flavor: "lgpl",
+		DetectEvery: time.Hour, FailureRedetectGap: time.Hour}
+	ctx := context.Background()
+	if err := w.RegisterCapabilities(ctx); err != nil {
+		t.Fatal(err)
+	}
+	base := calls(t, counter)
+	if base < 3 { // -encoders plus one trial encode per advertised encoder
+		t.Fatalf("startup detection ran %d ffmpeg processes", base)
+	}
+	_, _ = pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '1 hour' WHERE id = 'wt'`)
+	for i := 0; i < 5; i++ {
+		w.Tick(ctx)
+	}
+	if got := calls(t, counter); got != base {
+		t.Fatalf("ticks spawned ffmpeg: %d -> %d", base, got)
+	}
+	var fresh bool
+	_ = pool.QueryRow(ctx, `SELECT seen_at > now() - interval '1 minute' AND cardinality(encoders) = 3 FROM workers WHERE id = 'wt'`).Scan(&fresh)
+	if !fresh {
+		t.Fatal("tick must refresh seen_at and keep the encoder list")
+	}
+	// A failed job asks for a re-detection, but not within the minimum gap...
+	w.FlagRedetect()
+	w.Tick(ctx)
+	if got := calls(t, counter); got != base {
+		t.Fatalf("re-detection ignored the gap: %d -> %d", base, got)
+	}
+}
+
+func TestCapabilityRedetectionWhenDueOrAfterFailure(t *testing.T) {
+	pool := dbtest.New(t)
+	bin, counter := countingFFmpeg(t)
+	w := &worker.Worker{ID: "wt", Store: jobs.NewStore(pool), Audit: audit.New(&strings.Builder{}), FFmpegBin: bin, Flavor: "lgpl",
+		DetectEvery: 150 * time.Millisecond, FailureRedetectGap: 50 * time.Millisecond}
+	ctx := context.Background()
+	if err := w.RegisterCapabilities(ctx); err != nil {
+		t.Fatal(err)
+	}
+	base := calls(t, counter)
+	time.Sleep(200 * time.Millisecond)
+	w.Tick(ctx) // older than DetectEvery
+	afterDue := calls(t, counter)
+	if afterDue <= base {
+		t.Fatalf("due detection did not run: %d -> %d", base, afterDue)
+	}
+	w.DetectEvery = time.Hour
+	time.Sleep(80 * time.Millisecond)
+	w.FlagRedetect()
+	w.Tick(ctx) // failure flag, gap elapsed
+	if got := calls(t, counter); got <= afterDue {
+		t.Fatalf("failure-triggered detection did not run: %d -> %d", afterDue, got)
+	}
+}

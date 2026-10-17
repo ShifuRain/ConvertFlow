@@ -56,10 +56,26 @@ type Worker struct {
 	// MaxOutputBytes kills a run whose output file grows beyond it (default 16 GiB).
 	MaxOutputBytes int64
 
-	mu        sync.RWMutex
-	encoders  map[string]bool
-	presetIDs []string // presets resolvable with encoders; guarded by mu
+	// DetectEvery is the longest time between full capability detections (which run a trial
+	// encode per encoder); default 1h. FailureRedetectGap is the minimum time between two
+	// detections triggered by a failed job; default 1m.
+	DetectEvery        time.Duration
+	FailureRedetectGap time.Duration
+
+	redetect atomic.Bool // set after a job failed inside FFmpeg: capabilities may have changed
+
+	mu           sync.RWMutex
+	encoders     map[string]bool
+	encoderList  []string // as advertised; re-sent by the cheap refresh. guarded by mu
+	presetIDs    []string // presets resolvable with encoders; guarded by mu
+	lastDetected time.Time
 }
+
+const (
+	capabilityTick            = 15 * time.Second
+	defaultDetectEvery        = time.Hour
+	defaultFailureRedetectGap = time.Minute
+)
 
 func (w *Worker) RegisterCapabilities(ctx context.Context) error {
 	encs, err := ffmpeg.DetectEncoders(ctx, w.FFmpegBin, w.Flavor, w.VAAPIDevice)
@@ -73,9 +89,39 @@ func (w *Worker) RegisterCapabilities(ctx context.Context) error {
 	ids := presets.IDs(presets.Available(set))
 	w.mu.Lock()
 	w.encoders = set
+	w.encoderList = encs
 	w.presetIDs = ids
+	w.lastDetected = time.Now()
 	w.mu.Unlock()
 	return w.Store.UpsertWorker(ctx, w.ID, encs)
+}
+
+// tick runs every capabilityTick. It normally only refreshes the worker's liveness row
+// (seen_at) from the cached encoder list, which spawns no process. The full detection with trial
+// encodes runs only when it is older than DetectEvery, or (at most every FailureRedetectGap)
+// after a job failed inside FFmpeg.
+func (w *Worker) tick(ctx context.Context) {
+	every, gap := w.DetectEvery, w.FailureRedetectGap
+	if every <= 0 {
+		every = defaultDetectEvery
+	}
+	if gap <= 0 {
+		gap = defaultFailureRedetectGap
+	}
+	w.mu.RLock()
+	age := time.Since(w.lastDetected)
+	encs := w.encoderList
+	w.mu.RUnlock()
+	if age >= every || (w.redetect.Load() && age >= gap) {
+		w.redetect.Store(false)
+		if err := w.RegisterCapabilities(ctx); err != nil {
+			slog.Warn("capability detection failed", "err", err)
+		}
+		return
+	}
+	if err := w.Store.UpsertWorker(ctx, w.ID, encs); err != nil {
+		slog.Warn("capability refresh failed", "err", err)
+	}
 }
 
 func (w *Worker) claimable() []string {
@@ -90,22 +136,21 @@ func (w *Worker) snapshot() map[string]bool {
 	return w.encoders
 }
 
-// Run registers capabilities, refreshes them periodically and processes jobs until ctx ends.
+// Run registers capabilities (full detection at startup), keeps the registration alive and
+// re-detects hourly or after a failed job (see tick), and processes jobs until ctx ends.
 func (w *Worker) Run(ctx context.Context) error {
 	if err := w.RegisterCapabilities(ctx); err != nil {
 		return fmt.Errorf("detecting encoders: %w", err)
 	}
 	go func() {
-		t := time.NewTicker(15 * time.Second)
+		t := time.NewTicker(capabilityTick)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if err := w.RegisterCapabilities(ctx); err != nil {
-					slog.Warn("capability refresh failed", "err", err)
-				}
+				w.tick(ctx)
 			}
 		}
 	}()
@@ -181,6 +226,9 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 		}
 	case err != nil:
 		removeIf(outPath)
+		if !errors.Is(err, errTimeout) && !errors.Is(err, errOversize) && j.EncoderUsed != "" {
+			w.redetect.Store(true) // FFmpeg itself failed: an encoder may have stopped working
+		}
 		msg := ffmpeg.Sanitize(err.Error(), filepath.Dir(j.InputPath), w.OutDir, w.ScratchDir)
 		werr = w.Store.Fail(bg, j.ID, w.ID, msg)
 		w.logStoreErr("fail", j.ID, werr)
