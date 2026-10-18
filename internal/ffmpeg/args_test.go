@@ -276,3 +276,23 @@ func TestVideoMapExcludesAttachedPictures(t *testing.T) {
 		t.Fatalf("output video is not the real video stream: %q %v", out, err)
 	}
 }
+
+// Uncapped SVT-AV1 exceeds the container pids_limit on many-core hosts (encoder fails or hangs at start-up).
+func TestSVTAV1ThreadsCapped(t *testing.T) {
+	c := presets.Candidate{Video: "libsvtav1", Audio: "libopus"}
+	s := spec(t, "video-av1", c, jobs.Options{}, true, true)
+	s.Threads = 3
+	if a := build(t, s); !hasSeq(a, "-svtav1-params", "lp=3") {
+		t.Fatalf("explicit threads: %v", a)
+	}
+	s.Threads = 0
+	a := build(t, s)
+	i := slices.Index(a, "-svtav1-params")
+	if i < 0 {
+		t.Fatalf("default: no -svtav1-params in %v", a)
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(a[i+1], "lp="))
+	if err != nil || n < 1 || n > 8 {
+		t.Fatalf("default lp = %q, want 1..8", a[i+1])
+	}
+}

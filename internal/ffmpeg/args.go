@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -29,7 +30,13 @@ type Spec struct {
 	// A run that stops at the cap yields a truncated file; callers must treat
 	// size >= MaxOutputBytes as over-limit.
 	MaxOutputBytes int64
+	// Threads caps SVT-AV1 logical processors (lp). 0 means min(NumCPU, maxSVTThreads). Without a cap
+	// SVT-AV1 spawns threads proportional to the host's cores, which exceeds the container pids_limit
+	// on many-core hosts and makes the encoder fail or hang at start-up.
+	Threads int
 }
+
+const maxSVTThreads = 8
 
 var x26xPresets = []string{"veryslow", "slower", "slow", "medium", "medium", "fast", "fast", "faster", "veryfast", "superfast", "ultrafast"}
 
@@ -81,7 +88,7 @@ func BuildArgs(s Spec) ([]string, error) {
 		a = append(a, "-an")
 	}
 	if video {
-		a = append(a, videoArgs(s.Cand.Video, s.Opts)...)
+		a = append(a, videoArgs(s.Cand.Video, s.Opts, svtThreads(s.Threads))...)
 	}
 	if s.HasAudio {
 		a = append(a, audioArgs(s.Cand.Audio, s.Opts)...)
@@ -93,7 +100,14 @@ func BuildArgs(s Spec) ([]string, error) {
 	return a, nil
 }
 
-func videoArgs(enc string, o jobs.Options) []string {
+func svtThreads(n int) int {
+	if n <= 0 {
+		n = min(runtime.NumCPU(), maxSVTThreads)
+	}
+	return max(n, 1)
+}
+
+func videoArgs(enc string, o jobs.Options, threads int) []string {
 	speed := 6
 	if o.Speed != nil {
 		speed = *o.Speed
@@ -111,7 +125,7 @@ func videoArgs(enc string, o jobs.Options) []string {
 	var enc_ []string
 	switch enc {
 	case "libsvtav1":
-		enc_ = []string{"-c:v", enc, "-preset", strconv.Itoa(4 + speed*8/10), "-crf", c, "-pix_fmt", "yuv420p"}
+		enc_ = []string{"-c:v", enc, "-preset", strconv.Itoa(4 + speed*8/10), "-crf", c, "-pix_fmt", "yuv420p", "-svtav1-params", "lp=" + strconv.Itoa(threads)}
 	case "libvpx-vp9":
 		enc_ = []string{"-c:v", enc, "-b:v", "0", "-crf", c, "-cpu-used", strconv.Itoa(speed * 8 / 10), "-row-mt", "1", "-pix_fmt", "yuv420p"}
 	case "libx264":
