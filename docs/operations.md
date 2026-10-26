@@ -75,6 +75,18 @@ services:
 | `CONVERTFLOW_MAX_QUEUED_JOBS` | `100` | api | Maximum active jobs (queued + probing + running); excess uploads get `503`. |
 | `CONVERTFLOW_MIN_FREE_BYTES` | 2 x `MAX_UPLOAD_BYTES` (16 GiB by default) | api | Free space required on the data volume before an upload is accepted (plus the announced upload size when the client sends `Content-Length`); below it uploads get `507`. Default leaves room for one maximum-size upload and a similarly sized output. |
 | `CONVERTFLOW_MAX_SSE_STREAMS` | `64` | api | Simultaneous progress streams; excess get `503`. |
+| `CONVERTFLOW_STORAGE` | `local` | api, worker | Where inputs and outputs live: `local` (`CONVERTFLOW_DATA_DIR`) or `s3` (an S3-compatible bucket, configured by the S3 variables below, which are ignored in `local` mode). Anything else is a start error. |
+| `CONVERTFLOW_S3_ENDPOINT` | none | api, worker | `s3` only, required: `host` or `host:port` of the object store as reached by api and worker (no scheme, no path). |
+| `CONVERTFLOW_S3_PUBLIC_ENDPOINT` | `https://` (or `http://` without TLS) + the endpoint | api | `s3` only: `scheme://host[:port]` of the object store as reached by **browsers**; presigned upload and download URLs are signed for this host. No path. |
+| `CONVERTFLOW_S3_BUCKET` | none | api, worker | `s3` only, required: existing bucket (it is never created). S3 naming rules apply. |
+| `CONVERTFLOW_S3_REGION` | `us-east-1` | api, worker | `s3` only: signing region. |
+| `CONVERTFLOW_S3_USE_SSL` | `true` | api, worker | `s3` only: TLS to the endpoint (`true`/`false`). |
+| `CONVERTFLOW_S3_PATH_STYLE` | `true` | api, worker | `s3` only: path-style bucket addressing (`false` selects virtual-host style). |
+| `CONVERTFLOW_S3_PRESIGN_TTL` | `15m` | api (and janitor) | `s3` only: lifetime of presigned upload and download URLs, `1s` to `1h`. Uploads not completed within this time plus a grace period are failed by the janitor. |
+| `CONVERTFLOW_S3_ACCESS_KEY_FILE` | none | api, worker | `s3` only, required: file containing the access key id. |
+| `CONVERTFLOW_S3_SECRET_KEY_FILE` | none | api, worker | `s3` only, required: file containing the secret key. |
+| `CONVERTFLOW_S3_ACCESS_KEY` | not accepted | api, worker | Setting it is a start error: credentials are read from files only (`_FILE` variables). |
+| `CONVERTFLOW_S3_SECRET_KEY` | not accepted | api, worker | Setting it is a start error: credentials are read from files only (`_FILE` variables). |
 
 ### MAX_QUEUE_AGE: how long a job nobody can run is kept
 
