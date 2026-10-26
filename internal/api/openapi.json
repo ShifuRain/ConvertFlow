@@ -472,6 +472,18 @@
                   }
                 }
               }
+            },
+            "headers": {
+              "ConvertFlow-Upload-Mode": {
+                "description": "How browsers should upload: \"presigned\" (JSON create, form POST straight to the object store, then POST /api/v1/jobs/{id}/complete) or \"multipart\" (multipart/form-data POST /api/v1/jobs). Non-browser clients may use either mode whenever the server supports it.",
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "presigned",
+                    "multipart"
+                  ]
+                }
+              }
             }
           },
           "421": {

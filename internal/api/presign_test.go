@@ -36,6 +36,7 @@ type fakePresign struct {
 	upMax    int64
 	statErr  error
 	statHits int
+	origin   string // UploadOrigin; "" selects https://bucket.example
 }
 
 const (
@@ -101,6 +102,13 @@ func (f *fakePresign) Remove(ctx context.Context, loc string) error {
 		return nil
 	}
 	return f.LocalFS.Remove(ctx, loc)
+}
+
+func (f *fakePresign) UploadOrigin() string {
+	if f.origin == "" {
+		return "https://bucket.example"
+	}
+	return f.origin
 }
 
 func (f *fakePresign) FreeBytes(context.Context) (int64, error) { return 0, errors.ErrUnsupported }
@@ -580,5 +588,81 @@ func TestMultipartAbortsStreamingStoreOnRejection(t *testing.T) {
 	}
 	if !last.aborted || last.closed {
 		t.Fatal("interrupted upload must be aborted")
+	}
+}
+
+func TestCSPOriginValidation(t *testing.T) {
+	good := map[string]string{
+		"https://s3.example.com":        "https://s3.example.com",
+		"http://127.0.0.1:9000":         "http://127.0.0.1:9000",
+		"HTTPS://Bucket.S3.Example.COM": "https://bucket.s3.example.com",
+		"https://s3.example.com/":       "https://s3.example.com",
+		"http://[::1]:9000":             "http://[::1]:9000",
+	}
+	for in, want := range good {
+		if got, ok := api.CSPOrigin(in); !ok || got != want {
+			t.Errorf("CSPOrigin(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"", "s3.example.com", "ftp://s3.example.com", "https://*.example.com", "https://*",
+		"https://s3.example.com; script-src *", "https://s3.example.com 'unsafe-inline'", "https://u:p@s3.example.com",
+		"https://s3.example.com/bucket", "https://s3.example.com?x=1", "https://s3.example.com#f", "javascript:alert(1)",
+		"https://s3.example.com:9000:1", "https://-bad.example.com", "https://a..b", "data:text/html,x", "https://s3.example.com,https://evil"} {
+		if got, ok := api.CSPOrigin(in); ok {
+			t.Errorf("CSPOrigin(%q) accepted as %q", in, got)
+		}
+	}
+}
+
+// Local mode keeps the original policy and advertises multipart uploads; a presigning store adds
+// its upload origin to connect-src and form-action only, and advertises presigned uploads.
+func TestCSPAndUploadModeFollowTheStore(t *testing.T) {
+	local := newFixture(t, 1<<20)
+	for _, p := range []string{"/", "/api/v1/presets"} {
+		if got := get(local, p).Header().Get("Content-Security-Policy"); got != api.BaseCSP {
+			t.Fatalf("local %s CSP %q", p, got)
+		}
+	}
+	if m := get(local, "/api/v1/presets").Header().Get(api.UploadModeHeader); m != "multipart" {
+		t.Fatalf("local upload mode %q", m)
+	}
+
+	pf := newPresignFixture(t, 1<<20, nil)
+	want := strings.Replace(strings.Replace(api.BaseCSP, "connect-src 'self';", "connect-src 'self' https://bucket.example;", 1),
+		"form-action 'self';", "form-action 'self' https://bucket.example;", 1)
+	if want == api.BaseCSP {
+		t.Fatal("test expectation did not change the base policy")
+	}
+	for _, p := range []string{"/", "/api/v1/presets", "/api/v1/jobs"} {
+		if got := get(pf.fixture, p).Header().Get("Content-Security-Policy"); got != want {
+			t.Fatalf("presign %s CSP\n got %q\nwant %q", p, got, want)
+		}
+	}
+	if m := get(pf.fixture, "/api/v1/presets").Header().Get(api.UploadModeHeader); m != "presigned" {
+		t.Fatalf("presign upload mode %q", m)
+	}
+}
+
+// An origin that cannot be placed in the CSP safely is not added, the UI is told to upload through
+// the API, and the JSON API keeps working for non-browser clients.
+func TestUnsafeUploadOriginFallsBackToMultipart(t *testing.T) {
+	for _, origin := range []string{"https://*.example.com", "https://x.example; script-src *", "not a url"} {
+		var fake *fakePresign
+		f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
+			c.S3.PresignTTL = time.Minute
+			fake = newFakePresign(c.DataDir)
+			fake.origin = origin
+			d.Blob = fake
+		})
+		w := get(f.fixture, "/api/v1/presets")
+		if got := w.Header().Get("Content-Security-Policy"); got != api.BaseCSP {
+			t.Fatalf("origin %q: CSP %q", origin, got)
+		}
+		if m := w.Header().Get(api.UploadModeHeader); m != "multipart" {
+			t.Fatalf("origin %q: upload mode %q", origin, m)
+		}
+		if c := postJSON(f.fixture, "/api/v1/jobs", `{"preset":"audio-flac","filename":"a.wav","size":10}`).Code; c != 201 {
+			t.Fatalf("origin %q: JSON create %d", origin, c)
+		}
 	}
 }

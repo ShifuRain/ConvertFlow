@@ -190,3 +190,22 @@ func TestS3PresignUploadPolicy(t *testing.T) {
 		t.Error("ttl 0 must be refused")
 	}
 }
+
+// The CSP origin comes from a real signature, so it follows the addressing style.
+func TestS3UploadOrigin(t *testing.T) {
+	if got := offlineS3(t).UploadOrigin(); got != "https://files.example.org:9443" {
+		t.Fatalf("path-style origin %q", got)
+	}
+	vh, err := blob.NewS3(blob.S3Options{Endpoint: "127.0.0.1:1", PublicEndpoint: "https://files.example.org",
+		Bucket: "cf-bucket", Region: "eu-central-1", AccessKey: "AKIDEXAMPLE", SecretKey: "s3cr3t-value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vh.UploadOrigin(); got != "https://cf-bucket.files.example.org" {
+		t.Fatalf("virtual-host origin %q", got)
+	}
+	pp, err := vh.PresignUpload(ctx, tid, 10, time.Minute)
+	if err != nil || !strings.HasPrefix(pp.URL, vh.UploadOrigin()+"/") {
+		t.Fatalf("upload URL %q does not start with the origin %q (%v)", pp.URL, vh.UploadOrigin(), err)
+	}
+}

@@ -10,3 +10,9 @@ func ValidID(id string) bool { return validID(id) }
 
 // RoutePatterns lists every registered "METHOD /path" route (with {id}-style wildcards).
 func RoutePatterns() []string { return routePatterns() }
+
+// CSPOrigin exposes the upload-origin validator used for the Content-Security-Policy.
+func CSPOrigin(raw string) (string, bool) { return cspOrigin(raw) }
+
+// BaseCSP is the policy without an upload origin.
+const BaseCSP = csp

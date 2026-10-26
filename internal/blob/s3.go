@@ -29,6 +29,7 @@ type S3 struct {
 	bucket   string
 	scratch  string
 	maxInput int64
+	origin   string // origin of presigned upload URLs (see UploadOrigin)
 }
 
 // S3Options configures an S3 store.
@@ -105,8 +106,29 @@ func NewS3(o S3Options) (*S3, error) {
 	if scratch == "" {
 		scratch = os.TempDir()
 	}
-	return &S3{c: c, pub: pub, bucket: o.Bucket, scratch: scratch, maxInput: o.MaxInputBytes}, nil
+	s := &S3{c: c, pub: pub, bucket: o.Bucket, scratch: scratch, maxInput: o.MaxInputBytes}
+	s.origin = s.signedOrigin()
+	return s, nil
 }
+
+// signedOrigin signs a throwaway upload form (a local computation: the region is set, so no
+// request is made) and returns the origin of its URL. Deriving the origin from a real signature
+// rather than from the configuration keeps it right for both path-style (host) and
+// virtual-host-style (bucket.host) addressing.
+func (s *S3) signedOrigin() string {
+	pp, err := s.PresignUpload(context.Background(), "00000000-0000-0000-0000-000000000000", 1, time.Minute)
+	if err != nil {
+		return ""
+	}
+	u, err := url.Parse(pp.URL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// UploadOrigin returns the origin presigned upload forms are posted to ("" if it is unknown).
+func (s *S3) UploadOrigin() string { return s.origin }
 
 func newMinio(endpoint string, secure bool, o S3Options) (*minio.Client, error) {
 	lookup := minio.BucketLookupDNS

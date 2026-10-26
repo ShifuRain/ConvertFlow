@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
@@ -12,7 +13,37 @@ import (
 const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
 	"connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
-func securityHeaders(hsts bool, next http.Handler) http.Handler {
+// cspFor returns the policy for a deployment whose browsers post uploads to uploadOrigin (""
+// for none). The origin is added to connect-src (the XHR to the bucket) and form-action only;
+// every other directive is unchanged.
+func cspFor(uploadOrigin string) string {
+	if uploadOrigin == "" {
+		return csp
+	}
+	return "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+		"connect-src 'self' " + uploadOrigin + "; base-uri 'none'; form-action 'self' " + uploadOrigin + "; frame-ancestors 'none'"
+}
+
+// originHost is a DNS name or IPv4 address with an optional port, or a bracketed IPv6 literal
+// with an optional port: nothing that could end or extend a CSP source expression.
+var originHost = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$`)
+
+// cspOrigin validates an upload origin for use in the CSP: http(s), a plain host[:port], no
+// path, query, fragment, credentials or wildcard. It returns the normalized (lowercase) origin.
+func cspOrigin(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Opaque != "" ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return "", false
+	}
+	host := strings.ToLower(u.Host)
+	if !originHost.MatchString(host) {
+		return "", false
+	}
+	return u.Scheme + "://" + host, true
+}
+
+func securityHeaders(csp string, hsts bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Content-Security-Policy", csp)

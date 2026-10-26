@@ -336,6 +336,9 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// UploadModeHeader on GET /api/v1/presets tells the UI how to upload ("presigned" or "multipart").
+const UploadModeHeader = "ConvertFlow-Upload-Mode"
+
 func (s *Server) listPresets(w http.ResponseWriter, r *http.Request) {
 	run, err := s.runnablePresets(r.Context())
 	if err != nil {
@@ -352,6 +355,13 @@ func (s *Server) listPresets(w http.ResponseWriter, r *http.Request) {
 	for _, p := range run {
 		out = append(out, pv{p.ID, p.Label, string(p.Kind), p.Ext})
 	}
+	// The UI reads the upload mode here (it loads presets anyway): "presigned" makes it upload
+	// straight to the bucket (JSON create, form POST, /complete), "multipart" through the API.
+	mode := "multipart"
+	if s.directUpload {
+		mode = "presigned"
+	}
+	w.Header().Set(UploadModeHeader, mode)
 	writeJSON(w, http.StatusOK, out)
 }
 

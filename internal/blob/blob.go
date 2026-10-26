@@ -107,4 +107,8 @@ type Presigner interface {
 	// PresignDownload returns a GET URL for a recorded output that is valid for ttl and makes the
 	// store answer with the given headers.
 	PresignDownload(ctx context.Context, locator string, h DownloadHeaders, ttl time.Duration) (string, error)
+	// UploadOrigin is the origin (scheme://host[:port]) that presigned upload forms are posted
+	// to, so the API can allow exactly that origin in its Content-Security-Policy. "" means
+	// unknown: the API then does not offer direct uploads.
+	UploadOrigin() string
 }
