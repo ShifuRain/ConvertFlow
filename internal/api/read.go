@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 	"github.com/ShifuRain/convertflow/internal/presets"
 )
@@ -232,9 +233,9 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 		gone()
 		return
 	}
-	f, err := os.Open(j.OutputPath)
+	f, info, err := s.blob.OpenOutput(r.Context(), j.OutputPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) { // missing or not a regular file
 			gone()
 		} else {
 			s.readFault(w, r, "open_output", err)
@@ -242,15 +243,6 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		s.readFault(w, r, "stat_output", err)
-		return
-	}
-	if !st.Mode().IsRegular() {
-		gone()
-		return
-	}
 	ctype, ext := "application/octet-stream", strings.TrimPrefix(filepath.Ext(j.OutputPath), ".")
 	if p, ok := presets.Get(j.Options.Preset); ok {
 		ext = p.Ext
@@ -266,26 +258,21 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Type", ctype)
 	h.Set("Content-Disposition", ContentDisposition(name))
 	h.Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(deadlineWriter{w, http.NewResponseController(w)}, r, "", st.ModTime(), f)
+	http.ServeContent(deadlineWriter{w, http.NewResponseController(w)}, r, "", info.ModTime, f)
 }
 
-// removeData deletes a file recorded on a job, but only inside the data directory, and treats an
-// already-missing file as success. Failures are logged (never sent to the client).
-func (s *Server) removeData(id, p string) {
-	if p == "" {
+// removeData deletes a file recorded on a job through the blob store, which refuses anything
+// outside the data directory and treats an already-missing file as success. Failures are logged
+// (never sent to the client).
+func (s *Server) removeData(ctx context.Context, id, loc string) {
+	if loc == "" {
 		return
 	}
-	root, err1 := filepath.Abs(s.cfg.DataDir)
-	abs, err2 := filepath.Abs(p)
-	if err1 != nil || err2 != nil {
-		return
-	}
-	if rel, err := filepath.Rel(root, abs); err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	err := s.blob.Remove(context.WithoutCancel(ctx), loc)
+	switch {
+	case errors.Is(err, blob.ErrOutsideRoot):
 		slog.Warn("refusing to remove path outside the data dir", "job_id", id)
-		return
-	}
-	// #nosec G703 -- abs was verified above to lie strictly inside the data dir
-	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+	case err != nil:
 		slog.Error("removing job file failed", "job_id", id, "err", err)
 	}
 }
@@ -299,8 +286,8 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 	j, err := s.store.Delete(r.Context(), id)
 	switch {
 	case err == nil:
-		s.removeData(id, j.InputPath)
-		s.removeData(id, j.OutputPath)
+		s.removeData(r.Context(), id, j.InputPath)
+		s.removeData(r.Context(), id, j.OutputPath)
 		s.audit.Event(r, "job_deleted", id)
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, jobs.ErrNotFound):

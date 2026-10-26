@@ -3,7 +3,6 @@ package api
 
 import (
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/hostcheck"
 	"github.com/ShifuRain/convertflow/internal/jobs"
@@ -28,9 +28,9 @@ type Deps struct {
 	// SSE streams end then; downloads and uploads are left to finish. Nil means never.
 	Shutdown <-chan struct{}
 
-	// Test seams; nil selects the production implementation.
-	OpenInput func(path string) (io.WriteCloser, error) // creates the exclusive input file
-	FreeBytes func(dir string) (uint64, error)          // free space on the data volume
+	// Blob stores job inputs and outputs. Nil selects a blob.LocalFS at Cfg.DataDir (which must
+	// already contain in/ and out/).
+	Blob blob.Store
 }
 
 type Server struct {
@@ -46,8 +46,7 @@ type Server struct {
 	shutdown     <-chan struct{}
 
 	uploadSlots chan struct{}
-	openInput   func(string) (io.WriteCloser, error)
-	freeBytes   func(string) (uint64, error)
+	blob        blob.Store
 }
 
 const liveWindow = 30 * time.Second // a worker is "live" if it was seen this recently
@@ -69,12 +68,9 @@ func NewHandler(d Deps) http.Handler {
 	if sseCap <= 0 {
 		sseCap = defaultMaxSSEStreams
 	}
-	s.openInput, s.freeBytes = d.OpenInput, d.FreeBytes
-	if s.openInput == nil {
-		s.openInput = DefaultOpenInput
-	}
-	if s.freeBytes == nil {
-		s.freeBytes = diskFree
+	s.blob = d.Blob
+	if s.blob == nil {
+		s.blob = blob.OpenLocalFS(d.Cfg.DataDir)
 	}
 	if s.every <= 0 {
 		s.every = time.Second

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/db/dbtest"
 	"github.com/ShifuRain/convertflow/internal/janitor"
 	"github.com/ShifuRain/convertflow/internal/jobs"
@@ -37,7 +38,7 @@ func newEnv(t *testing.T) *env {
 			t.Fatal(err)
 		}
 	}
-	e.j = &janitor.Janitor{Store: e.store, Audit: audit.New(e.log), DataDir: e.dir,
+	e.j = &janitor.Janitor{Store: e.store, Audit: audit.New(e.log), Blob: blob.OpenLocalFS(e.dir),
 		Retention: 24 * time.Hour, StaleAfter: time.Minute, MaxAttempts: 3, Interval: time.Hour,
 		OrphanGrace: 6 * time.Hour, JobTimeout: 4 * time.Hour}
 	return e

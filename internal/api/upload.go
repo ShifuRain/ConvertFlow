@@ -8,9 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -128,21 +126,6 @@ func (t tagWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// DefaultOpenInput creates a new input file, failing if it already exists.
-func DefaultOpenInput(path string) (io.WriteCloser, error) {
-	// #nosec G304 -- path is server-generated under the data dir (never client-supplied); O_EXCL prevents overwrite
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-}
-
-func diskFree(dir string) (uint64, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(dir, &st); err != nil {
-		return 0, err
-	}
-	// #nosec G115 -- Bsize is a positive block size reported by statfs
-	return st.Bavail * uint64(st.Bsize), nil
-}
-
 // reject answers a refused upload and writes an audit record (client IP, status, reason; never content).
 func (s *Server) reject(w http.ResponseWriter, r *http.Request, status int, title, detail, reason string) {
 	s.audit.Event(r, "upload_rejected", "", "status", status, "reason", reason)
@@ -240,14 +223,14 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.cfg.MinFreeBytes > 0 {
-		free, err := s.freeBytes(s.cfg.DataDir)
+		free, err := s.blob.FreeBytes(r.Context())
 		if err != nil {
 			s.serverFault(w, r, "", "statfs", err)
 			return
 		}
-		need := uint64(s.cfg.MinFreeBytes)
+		need := s.cfg.MinFreeBytes
 		if r.ContentLength > 0 {
-			need += uint64(r.ContentLength)
+			need += r.ContentLength
 		}
 		if free < need {
 			s.reject(w, r, http.StatusInsufficientStorage, "Insufficient storage", "The server does not have enough free storage.", "insufficient storage")
@@ -261,15 +244,17 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		s.reject(w, r, http.StatusBadRequest, "Bad request", "expected multipart/form-data", "not multipart")
 		return
 	}
-	id := uuid.NewString()
-	inPath := filepath.Join(s.cfg.DataDir, "in", id) // server-generated; the client filename is never a path
+	id := uuid.NewString() // server-generated; the client filename is never part of the stored name
+	var inLoc string       // set once the input exists in the blob store
 	var opts jobs.Options
 	var filename string
 	haveOpts := false
-	opened, created := false, false
+	created := false
 	defer func() {
-		if opened && !created {
-			_ = os.Remove(inPath)
+		if inLoc != "" && !created {
+			if err := s.blob.Remove(context.WithoutCancel(r.Context()), inLoc); err != nil {
+				slog.Error("removing partial upload failed", "job_id", id, "err", err)
+			}
 		}
 	}()
 
@@ -320,12 +305,12 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			filename = SanitizeFilename(part.FileName())
-			f, err := s.openInput(inPath)
+			f, loc, err := s.blob.CreateInput(r.Context(), id)
 			if err != nil {
 				s.serverFault(w, r, id, "open_input", err)
 				return
 			}
-			opened = true
+			inLoc = loc
 			n, err := io.Copy(tagWriter{f}, io.LimitReader(part, s.cfg.MaxUploadBytes+1))
 			cerr := f.Close()
 			switch {
@@ -356,7 +341,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	// disconnect racing the insert, so the DB work is detached from the request context.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
 	defer cancel()
-	j := &jobs.Job{ID: id, Filename: filename, InputPath: inPath, Options: opts}
+	j := &jobs.Job{ID: id, Filename: filename, InputPath: inLoc, Options: opts}
 	if err := s.store.Create(ctx, j); err != nil {
 		s.serverFault(w, r, id, "create_job", err)
 		return
