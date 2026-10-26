@@ -20,6 +20,7 @@ import (
 
 	"github.com/ShifuRain/convertflow/internal/api"
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/db/dbtest"
 	"github.com/ShifuRain/convertflow/internal/jobs"
@@ -534,6 +535,28 @@ func newFixtureWith(t *testing.T, maxUpload int64, mod func(*config.Config, *api
 	return auditFixture{fixture{api.NewHandler(d), store, dir}, &logBuf}
 }
 
+// hookBlob wraps the real local store and overrides input creation and free space for fault
+// injection.
+type hookBlob struct {
+	*blob.LocalFS
+	create func(ctx context.Context, id string) (io.WriteCloser, string, error)
+	free   func(ctx context.Context) (int64, error)
+}
+
+func (h hookBlob) CreateInput(ctx context.Context, id string) (io.WriteCloser, string, error) {
+	if h.create != nil {
+		return h.create(ctx, id)
+	}
+	return h.LocalFS.CreateInput(ctx, id)
+}
+
+func (h hookBlob) FreeBytes(ctx context.Context) (int64, error) {
+	if h.free != nil {
+		return h.free(ctx)
+	}
+	return h.LocalFS.FreeBytes(ctx)
+}
+
 func okBody(t *testing.T) (*bytes.Buffer, string) {
 	return multipartBody(t, []field{{"preset", "audio-wav"}}, "a.wav", []byte("data"))
 }
@@ -581,12 +604,13 @@ func TestUploadSemaphoreReleasedOnEveryExitPath(t *testing.T) {
 	panicNext := false
 	f := newFixtureWith(t, 1000, func(c *config.Config, d *api.Deps) {
 		c.MaxConcurrentUploads = 1
-		d.OpenInput = func(p string) (io.WriteCloser, error) {
+		local := blob.OpenLocalFS(c.DataDir)
+		d.Blob = hookBlob{LocalFS: local, create: func(ctx context.Context, id string) (io.WriteCloser, string, error) {
 			if panicNext {
 				panic("boom")
 			}
-			return api.DefaultOpenInput(p)
-		}
+			return local.CreateInput(ctx, id)
+		}}
 	})
 	ok := func(step string) {
 		t.Helper()
@@ -638,10 +662,10 @@ func TestUploadQueueCap(t *testing.T) {
 }
 
 func TestUploadInsufficientDiskSpace(t *testing.T) {
-	free := uint64(100)
+	free := int64(100)
 	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
 		c.MinFreeBytes = 1000
-		d.FreeBytes = func(string) (uint64, error) { return free, nil }
+		d.Blob = hookBlob{LocalFS: blob.OpenLocalFS(c.DataDir), free: func(context.Context) (int64, error) { return free, nil }}
 	})
 	b, c := okBody(t)
 	w := post(f.fixture, b, c)
@@ -663,7 +687,7 @@ func TestUploadInsufficientDiskSpace(t *testing.T) {
 }
 
 type failWriter struct {
-	f   *os.File
+	f   io.WriteCloser
 	err error
 	n   int
 }
@@ -687,10 +711,14 @@ func TestUploadDiskFullAndWriteErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
-			d.OpenInput = func(p string) (io.WriteCloser, error) {
-				file, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-				return &failWriter{f: file, err: tc.err}, err
-			}
+			local := blob.OpenLocalFS(c.DataDir)
+			d.Blob = hookBlob{LocalFS: local, create: func(ctx context.Context, id string) (io.WriteCloser, string, error) {
+				file, loc, err := local.CreateInput(ctx, id)
+				if err != nil {
+					return nil, "", err
+				}
+				return &failWriter{f: file, err: tc.err}, loc, nil
+			}}
 		})
 		body, ct := multipartBody(t, []field{{"preset", "audio-wav"}}, "a.wav", bytes.Repeat([]byte("x"), 5000))
 		w := post(f.fixture, body, ct)
@@ -712,7 +740,9 @@ func TestUploadDiskFullAndWriteErrors(t *testing.T) {
 
 func TestUploadOpenFileFailureIs500(t *testing.T) {
 	f := newFixtureWith(t, 1<<20, func(c *config.Config, d *api.Deps) {
-		d.OpenInput = func(string) (io.WriteCloser, error) { return nil, errors.New("open /secret/dir: denied") }
+		d.Blob = hookBlob{LocalFS: blob.OpenLocalFS(c.DataDir), create: func(context.Context, string) (io.WriteCloser, string, error) {
+			return nil, "", errors.New("open /secret/dir: denied")
+		}}
 	})
 	b, c := okBody(t)
 	w := post(f.fixture, b, c)
