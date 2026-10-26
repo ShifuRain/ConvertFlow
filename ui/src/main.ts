@@ -1,4 +1,8 @@
 import { av1Notice } from "./notice";
+import {
+  completeRetryable, parsePresigned, presignBody, problemText, storeErrorMessage, storeRetryable, uploadForm, uploadMode,
+  UPLOAD_MODE_HEADER, type UploadMode,
+} from "./upload";
 
 interface Job {
   id: string; status: string; filename: string; preset: string; progress: number;
@@ -17,15 +21,17 @@ const MAX_STREAMS = 4; // client-side cap on EventSources; the rest of the activ
 const POLL_MS = 3000;
 const BACKOFF_BASE_MS = 3000;
 const BACKOFF_MAX_MS = 60000;
+const MAX_COMPLETE_TRIES = 4;
 const OUTPUT_URL = /^\/api\/v1\/jobs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/output$/;
 
-interface Item { file: File; preset: string; field: { name: string; value: string }; tries: number }
+interface Item { file: File; preset: string; field: { name: string; value: string }; tries: number; canceled?: boolean }
 const pending: Item[] = [];
 let uploading = 0;
 const failures = new Map<string, number>(); // consecutive stream failures per job
 const retryAt = new Map<string, number>(); // earliest time a stream may be reopened
 let globalFails = 0; // consecutive stream failures across all jobs (server-wide trouble, e.g. 503 cap)
 let globalRetryAt = 0;
+let mode: UploadMode = "multipart"; // from the presets answer; refreshed with it
 
 // All server-provided strings (filenames, errors, encoder names) go through textContent only.
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", cls = ""): HTMLElementTagNameMap[K] {
@@ -59,16 +65,6 @@ async function problem(res: Response): Promise<string> {
   } catch { return res.statusText || `HTTP ${res.status}`; }
 }
 
-function problemText(status: number, body: string): string {
-  try {
-    const p = JSON.parse(body);
-    const t = p.detail || p.title;
-    if (t) return String(t);
-  } catch { /* not JSON */ }
-  if (status === 413) return "File is larger than the server's upload limit.";
-  return `Upload failed (HTTP ${status})`;
-}
-
 function setEmpty() { $("empty").hidden = rows.size > 0 || uploading > 0 || pending.length > 0; }
 
 async function loadPresets() {
@@ -77,6 +73,7 @@ async function loadPresets() {
   try {
     const res = await fetch("/api/v1/presets");
     if (!res.ok) throw new Error(await problem(res));
+    mode = uploadMode(res.headers.get(UPLOAD_MODE_HEADER));
     const presets: Preset[] = await res.json();
     const prev = sel.value;
     sel.replaceChildren();
@@ -275,18 +272,28 @@ function pump() {
   setEmpty();
 }
 
+// A temporary row for an upload in progress; it is replaced by the job's row once the job is queued.
+function uploadRow(item: Item): Row {
+  const r = makeRow();
+  r.name.textContent = item.file.name;
+  r.preset.textContent = item.preset;
+  r.status.textContent = "uploading";
+  r.bar.max = 100;
+  r.bar.value = 0;
+  r.bar.setAttribute("aria-label", `Upload progress of ${item.file.name}`);
+  $("jobs").prepend(r.tr);
+  $("empty").hidden = true;
+  return r;
+}
+
 function send(item: Item): Promise<void> {
+  return mode === "presigned" ? sendDirect(item) : sendMultipart(item);
+}
+
+function sendMultipart(item: Item): Promise<void> {
   return new Promise((resolve) => {
-    const { file, preset } = item;
-    const r = makeRow();
-    r.name.textContent = file.name;
-    r.preset.textContent = preset;
-    r.status.textContent = "uploading";
-    r.bar.max = 100;
-    r.bar.value = 0;
-    r.bar.setAttribute("aria-label", `Upload progress of ${file.name}`);
-    $("jobs").prepend(r.tr);
-    $("empty").hidden = true;
+    const { file } = item;
+    const r = uploadRow(item);
     const done = () => { r.tr.remove(); resolve(); };
     const fail = (msg: string) => { addError(`${file.name}: ${msg}`); announce(`${file.name}: upload failed`); done(); };
 
@@ -298,7 +305,7 @@ function send(item: Item): Promise<void> {
     const cancel = el("button", "Cancel");
     cancel.type = "button";
     cancel.setAttribute("aria-label", `Cancel upload of ${file.name}`);
-    cancel.onclick = () => { item.tries = MAX_UPLOAD_RETRIES + 1; xhr.abort(); };
+    cancel.onclick = () => { item.canceled = true; xhr.abort(); };
     r.act.append(cancel);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable && e.total > 0) r.bar.value = (e.loaded / e.total) * 100; };
     xhr.onload = () => {
@@ -307,10 +314,7 @@ function send(item: Item): Promise<void> {
         r.tr.remove();
         resolve();
       } else if (xhr.status === 503 && item.tries < MAX_UPLOAD_RETRIES) {
-        // Server busy (too many uploads / queue full): wait and retry.
-        item.tries++;
-        r.status.textContent = "server busy, retrying";
-        setTimeout(() => { r.tr.remove(); pending.unshift(item); resolve(); }, 3000 * item.tries);
+        retryLater(item, r, resolve); // server busy (too many uploads / queue full)
       } else fail(problemText(xhr.status, xhr.responseText));
     };
     xhr.onerror = () => fail("network error");
@@ -318,6 +322,111 @@ function send(item: Item): Promise<void> {
     xhr.open("POST", "/api/v1/jobs");
     xhr.send(fd);
   });
+}
+
+// Requeue an item after a "server busy" answer, with a linear backoff (as the multipart path does).
+function retryLater(item: Item, r: Row, resolve: () => void) {
+  item.tries++;
+  r.status.textContent = "server busy, retrying";
+  setTimeout(() => {
+    r.tr.remove();
+    if (item.canceled) announce(`${item.file.name}: upload canceled`);
+    else pending.unshift(item);
+    resolve();
+  }, 3000 * item.tries);
+}
+
+const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
+// POST a form with upload progress. Resolves with status 0 on a network error (including a CORS or
+// CSP block, which browsers do not distinguish) and rejects only when aborted.
+function postForm(url: string, body: FormData, onProgress: (pct: number) => void, register: (abort: () => void) => void): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    register(() => xhr.abort());
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && e.total > 0) onProgress((e.loaded / e.total) * 100); };
+    xhr.onload = () => resolve({ status: xhr.status, body: xhr.responseText });
+    xhr.onerror = () => resolve({ status: 0, body: "" });
+    xhr.onabort = () => reject(new DOMException("aborted", "AbortError"));
+    xhr.open("POST", url);
+    xhr.withCredentials = false; // the store needs no cookies; its form fields are the credential
+    xhr.send(body);
+  });
+}
+
+// Direct upload: create the job (JSON) -> POST the signed form fields, then the file, to the object
+// store -> /complete queues the job. A job created here and not completed (failure or cancel) is
+// deleted; the server's janitor would expire it otherwise.
+async function sendDirect(item: Item): Promise<void> {
+  const { file } = item;
+  const r = uploadRow(item);
+  r.status.textContent = "preparing upload";
+  let canceled = false;
+  let abort: () => void = () => {};
+  const ctl = new AbortController();
+  const cancel = el("button", "Cancel");
+  cancel.type = "button";
+  cancel.setAttribute("aria-label", `Cancel upload of ${file.name}`);
+  cancel.onclick = () => { canceled = item.canceled = true; ctl.abort(); abort(); };
+  r.act.append(cancel);
+  let id = "";
+  const discard = () => { if (id) void fetch(`/api/v1/jobs/${id}`, { method: "DELETE" }).catch(() => {}); };
+  const fail = (msg: string) => { discard(); addError(`${file.name}: ${msg}`); announce(`${file.name}: upload failed`); r.tr.remove(); };
+  const canceledNow = () => { discard(); announce(`${file.name}: upload canceled`); r.tr.remove(); };
+
+  try {
+    // 1. create
+    const res = await fetch("/api/v1/jobs", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: presignBody(item.field, file), signal: ctl.signal,
+    });
+    const text = await res.text();
+    if (res.status === 503 && item.tries < MAX_UPLOAD_RETRIES) {
+      await new Promise<void>((resolve) => retryLater(item, r, resolve));
+      return;
+    }
+    if (res.status !== 201) { fail(problemText(res.status, text)); return; }
+    const p = parsePresigned(text);
+    if (!p) { fail("unexpected server response"); return; }
+    id = p.id;
+    if (canceled) { canceledNow(); return; }
+
+    // 2. upload to the store (the same form may be repeated while it is valid)
+    r.status.textContent = "uploading";
+    let up = { status: 0, body: "" };
+    for (let t = 0; ; t++) {
+      up = await postForm(p.url, uploadForm(p.fields, file, file.name), (pct) => { r.bar.value = pct; }, (a) => { abort = a; });
+      if (up.status >= 200 && up.status < 300) break;
+      if (t >= MAX_UPLOAD_RETRIES || !storeRetryable(up.status, up.body)) { fail(storeErrorMessage(up.status, up.body)); return; }
+      r.status.textContent = "storage busy, retrying";
+      await sleep(3000 * (t + 1));
+      if (canceled) { canceledNow(); return; }
+    }
+
+    // 3. complete (idempotent, so it is retried on network or server faults)
+    r.status.textContent = "finishing upload";
+    for (let t = 1; ; t++) {
+      let status = 0, body = "";
+      try {
+        const c = await fetch(`/api/v1/jobs/${id}/complete`, { method: "POST", signal: ctl.signal });
+        status = c.status;
+        body = await c.text();
+      } catch (e) {
+        if (canceled) throw e;
+      }
+      if (status === 200) {
+        try { render(JSON.parse(body)); } catch { fail("unexpected server response"); return; }
+        announce(`${file.name}: uploaded`);
+        r.tr.remove();
+        return;
+      }
+      if (!completeRetryable(status) || t >= MAX_COMPLETE_TRIES) { fail(status ? problemText(status, body) : "network error"); return; }
+      await sleep(2000 * t);
+      if (canceled) { canceledNow(); return; }
+    }
+  } catch (e) {
+    if (canceled || (e instanceof DOMException && e.name === "AbortError")) { canceledNow(); return; }
+    fail(e instanceof TypeError ? "network error" : String(e));
+  }
 }
 
 // Collect dropped files; reject folders (they would upload as empty/invalid files).
