@@ -558,3 +558,81 @@ func TestExpireQueuedSparesRunnablePresets(t *testing.T) {
 		t.Errorf("backlog of a runnable preset was expired: %+v", j)
 	}
 }
+
+func TestUploadingLifecycle(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	j := newJob()
+	j.Status, j.DeclaredSize = jobs.StatusUploading, 4242
+	if err := s.Create(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, j.ID)
+	if err != nil || got.Status != jobs.StatusUploading || got.DeclaredSize != 4242 {
+		t.Fatalf("got %+v %v", got, err)
+	}
+	// Uploading jobs are never claimed, and count against the queue cap.
+	if c, _ := s.Claim(ctx, "w", []string{"audio-wav"}); c != nil {
+		t.Fatal("an uploading job must not be claimable")
+	}
+	if n, _ := s.CountActive(ctx); n != 1 {
+		t.Fatalf("CountActive = %d, want 1", n)
+	}
+	if err := s.MarkUploaded(ctx, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkUploaded(ctx, j.ID); !errors.Is(err, jobs.ErrNotFound) {
+		t.Fatalf("second MarkUploaded = %v, want ErrNotFound", err)
+	}
+	if c, _ := s.Claim(ctx, "w", []string{"audio-wav"}); c == nil || c.ID != j.ID {
+		t.Fatal("a completed upload must be claimable")
+	}
+	// Multipart-created jobs have no declared size.
+	m := newJob()
+	_ = s.Create(ctx, m)
+	if got, _ := s.Get(ctx, m.ID); got.Status != jobs.StatusQueued || got.DeclaredSize != 0 {
+		t.Fatalf("multipart job %+v", got)
+	}
+	// An uploading job can be deleted.
+	d := newJob()
+	d.Status = jobs.StatusUploading
+	_ = s.Create(ctx, d)
+	if _, err := s.Delete(ctx, d.ID); err != nil {
+		t.Fatalf("Delete(uploading) = %v", err)
+	}
+}
+
+func TestExpireUploading(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	old, fresh, queued := newJob(), newJob(), newJob()
+	old.Status, fresh.Status = jobs.StatusUploading, jobs.StatusUploading
+	for _, j := range []*jobs.Job{old, fresh, queued} {
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{old.ID, queued.ID} {
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET updated_at = now() - interval '2 hours' WHERE id = $1::uuid`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ExpireUploading(ctx, time.Hour)
+	if err != nil || len(got) != 1 || got[0].ID != old.ID || got[0].InputPath != old.InputPath {
+		t.Fatalf("ExpireUploading = %+v %v", got, err)
+	}
+	j, _ := s.Get(ctx, old.ID)
+	if j.Status != jobs.StatusFailed || j.Error != jobs.ErrUploadExpired || j.FinishedAt == nil {
+		t.Fatalf("expired job %+v", j)
+	}
+	for _, id := range []string{fresh.ID, queued.ID} {
+		if j, _ := s.Get(ctx, id); j.Status == jobs.StatusFailed {
+			t.Fatalf("job %s must not expire", id)
+		}
+	}
+	if err := s.MarkUploaded(ctx, old.ID); !errors.Is(err, jobs.ErrNotFound) {
+		t.Fatal("an expired upload must not be completable")
+	}
+}
