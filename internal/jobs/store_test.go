@@ -636,3 +636,34 @@ func TestExpireUploading(t *testing.T) {
 		t.Fatal("an expired upload must not be completable")
 	}
 }
+
+// ReleaseForRetry hands a job back through the stale/attempt mechanism: the next RequeueStale
+// requeues it (or fails it once attempts are exhausted); a foreign worker cannot release it.
+func TestReleaseForRetry(t *testing.T) {
+	s := jobs.NewStore(dbtest.New(t))
+	ctx := context.Background()
+	j := newJob()
+	_ = s.Create(ctx, j)
+	if _, err := s.Claim(ctx, "w1", []string{"audio-wav"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseForRetry(ctx, j.ID, "w2"); !errors.Is(err, jobs.ErrNotFound) {
+		t.Fatalf("foreign release = %v", err)
+	}
+	if err := s.ReleaseForRetry(ctx, j.ID, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Get(ctx, j.ID); got.Status != jobs.StatusProbing {
+		t.Fatalf("release must not change the status itself: %s", got.Status)
+	}
+	if rq, failed, err := s.RequeueStale(ctx, time.Hour, 2); err != nil || rq != 1 || failed != 0 {
+		t.Fatalf("RequeueStale = %d %d %v", rq, failed, err)
+	}
+	if _, err := s.Claim(ctx, "w1", []string{"audio-wav"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.ReleaseForRetry(ctx, j.ID, "w1")
+	if rq, failed, err := s.RequeueStale(ctx, time.Hour, 2); err != nil || rq != 0 || failed != 1 {
+		t.Fatalf("exhausted: RequeueStale = %d %d %v", rq, failed, err)
+	}
+}

@@ -194,6 +194,14 @@ func (s *Store) MarkCanceled(ctx context.Context, id, workerID string) error {
 	return s.guarded(ctx, `UPDATE jobs SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running')`, id, workerID)
 }
 
+// ReleaseForRetry gives up a job the worker owns without a terminal write, for failures that
+// are not the job's fault (for example a storage outage): its lease is expired at once, so the
+// janitor's next RequeueStale pass requeues it, or fails it once MaxAttempts is reached, exactly
+// as if the worker had died. ErrNotFound means the lease was already lost.
+func (s *Store) ReleaseForRetry(ctx context.Context, id, workerID string) error {
+	return s.guarded(ctx, `UPDATE jobs SET heartbeat_at = '-infinity', updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running')`, id, workerID)
+}
+
 // RequestCancel cancels a queued job immediately and flags an active one for its worker.
 func (s *Store) RequestCancel(ctx context.Context, id string) error {
 	return s.exec(ctx, `

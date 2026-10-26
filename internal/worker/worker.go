@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -27,10 +28,11 @@ const (
 
 // Errors whose text is stored on the job; they must never contain paths.
 var (
-	errTimeout   = errors.New("conversion timed out")
-	errOversize  = errors.New("output exceeds size limit")
-	errInternal  = errors.New("internal error")
-	errLeaseLost = errors.New("lease lost") // never shown: the worker aborts quietly
+	errTimeout       = errors.New("conversion timed out")
+	errOversize      = errors.New("output exceeds size limit")
+	errInternal      = errors.New("internal error")
+	errInputTooLarge = errors.New("input exceeds the upload size limit")
+	errLeaseLost     = errors.New("lease lost") // never shown: the worker aborts quietly
 )
 
 type Worker struct {
@@ -200,38 +202,71 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 
 	w.Audit.System("job_started", j.ID, "worker", w.ID, "attempt", j.Attempts)
 	var out output
+	transient := false // a storage failure that is not the job's fault: retry instead of failing
 	inPath, releaseIn, err := w.Blob.LocalInput(jobCtx, j.InputPath, w.ScratchDir)
 	if err != nil {
 		if jobCtx.Err() == nil {
 			slog.Error("input unavailable", "job_id", j.ID, "worker", w.ID, "err", err)
+			transient = transientStorageErr(err)
 		}
-		err = errInternal
+		if errors.Is(err, blob.ErrTooLarge) {
+			err = errInputTooLarge
+		} else {
+			err = errInternal
+		}
 	} else {
 		defer releaseIn()
 		out, err = w.run(jobCtx, cancel, &st, j, inPath)
 	}
+	// Publish the finished output while the heartbeat still runs (an upload to an object store
+	// can take longer than STALE_AFTER); for the local store this is a no-op. A cancel request or
+	// a lost lease cancels jobCtx and so the upload.
+	var outLoc string
+	if err == nil && jobCtx.Err() == nil {
+		cctx, ccancel := context.WithTimeout(jobCtx, w.jobTimeout())
+		outLoc, err = out.commit(cctx)
+		ccancel()
+		if err != nil {
+			if jobCtx.Err() == nil {
+				slog.Error("publishing output failed", "job_id", j.ID, "worker", w.ID, "err", err)
+				transient = transientStorageErr(err)
+			}
+			err = errInternal
+		}
+	}
 	cancel()
 	<-watchDone
 
-	if ctx.Err() != nil { // worker shutting down: leave the job (and its input) for requeue
+	bg, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer bgCancel()
+	// dropOutput removes this attempt's output: the local file and, once committed, the stored
+	// object (per-attempt names: no other attempt's output is ever touched).
+	dropOutput := func() {
 		removeIf(out.path)
+		if outLoc != "" {
+			_ = w.Blob.Remove(bg, outLoc)
+		}
+	}
+	if ctx.Err() != nil { // worker shutting down: leave the job (and its input) for requeue
+		dropOutput()
 		return
 	}
 	if st.lost.Load() { // requeued, canceled or deleted behind our back: abort quietly
-		removeIf(out.path)
+		dropOutput()
 		w.Audit.System("job_lease_lost", j.ID, "worker", w.ID)
 		return
 	}
-	bg, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer bgCancel()
 
-	// Publish the finished output (a no-op for the local store, where it already lies in out/).
-	var outLoc string
-	if err == nil && !st.canceled.Load() {
-		if outLoc, err = out.commit(bg); err != nil {
-			slog.Error("publishing output failed", "job_id", j.ID, "worker", w.ID, "err", err)
-			err = errInternal
+	if transient && !st.canceled.Load() {
+		// Release the job for retry through the stale/attempt mechanism: no terminal write, the
+		// input is kept, only this attempt's output is removed.
+		dropOutput()
+		rerr := w.Store.ReleaseForRetry(bg, j.ID, w.ID)
+		w.logStoreErr("release", j.ID, rerr)
+		if rerr == nil {
+			w.Audit.System("job_released", j.ID, "worker", w.ID, "reason", "storage_unavailable")
 		}
+		return
 	}
 
 	// The input is deleted only after the fenced terminal write succeeds; if that write
@@ -240,7 +275,7 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 	var werr error
 	switch {
 	case st.canceled.Load():
-		removeIf(out.path)
+		dropOutput()
 		werr = w.Store.MarkCanceled(bg, j.ID, w.ID)
 		w.logStoreErr("mark_canceled", j.ID, werr)
 		if werr == nil {
@@ -248,10 +283,10 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 		}
 	case err != nil:
 		removeIf(out.path)
-		if !errors.Is(err, errTimeout) && !errors.Is(err, errOversize) && !errors.Is(err, errInternal) && j.EncoderUsed != "" {
+		if !errors.Is(err, errTimeout) && !errors.Is(err, errOversize) && !errors.Is(err, errInternal) && !errors.Is(err, errInputTooLarge) && j.EncoderUsed != "" {
 			w.redetect.Store(true) // FFmpeg itself failed: an encoder may have stopped working
 		}
-		msg := ffmpeg.Sanitize(err.Error(), dirOf(j.InputPath), dirOf(inPath), dirOf(out.path), w.ScratchDir)
+		msg := ffmpeg.Sanitize(err.Error(), w.stripPaths(j.InputPath, inPath, out.path)...)
 		werr = w.Store.Fail(bg, j.ID, w.ID, msg)
 		w.logStoreErr("fail", j.ID, werr)
 		if werr == nil {
@@ -263,8 +298,7 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 		if werr == nil {
 			w.Audit.System("job_finished", j.ID, "worker", w.ID, "encoder", j.EncoderUsed)
 		} else {
-			_ = w.Blob.Remove(bg, outLoc)
-			removeIf(out.path)
+			dropOutput()
 		}
 	}
 	if werr == nil {
@@ -278,12 +312,38 @@ type output struct {
 	commit func(context.Context) (string, error)
 }
 
-// dirOf returns the directory of p, or "" for an empty p (so Sanitize never strips ".").
-func dirOf(p string) string {
-	if p == "" {
-		return ""
+// stripPaths lists what Sanitize removes from a message stored on the job: the directory of
+// every local (absolute) path, the scratch directory, and any other locator (an object key such as
+// in/<id>) in full. Only directories of absolute paths are stripped: the directory of a key ("in")
+// would mangle ordinary words.
+func (w *Worker) stripPaths(paths ...string) []string {
+	out := make([]string, 0, len(paths)+1)
+	for _, p := range paths {
+		switch {
+		case p == "":
+		case filepath.IsAbs(p):
+			out = append(out, filepath.Dir(p))
+		default:
+			out = append(out, p)
+		}
 	}
-	return filepath.Dir(p)
+	if w.ScratchDir != "" {
+		out = append(out, w.ScratchDir)
+	}
+	return out
+}
+
+// transientStorageErr reports whether a blob store error may go away on retry. A missing input,
+// a locator the store does not own and an oversized input are permanent.
+func transientStorageErr(err error) bool {
+	return !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, blob.ErrInvalidLocator) && !errors.Is(err, blob.ErrTooLarge)
+}
+
+func (w *Worker) jobTimeout() time.Duration {
+	if w.JobTimeout <= 0 {
+		return defaultJobTimeout
+	}
+	return w.JobTimeout
 }
 
 func maxOutBytes(v int64) int64 {
@@ -427,10 +487,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 		return output{}, err
 	}
 
-	timeout := w.JobTimeout
-	if timeout <= 0 {
-		timeout = defaultJobTimeout
-	}
+	timeout := w.jobTimeout()
 	maxOut := maxOutBytes(w.MaxOutputBytes)
 	runCtx, runCancel := context.WithTimeout(ctx, timeout)
 	defer runCancel()
@@ -495,7 +552,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 	case err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return out, errTimeout
 	case err != nil:
-		return out, fmt.Errorf("transcode failed: %s", ffmpeg.Sanitize(tail, dirOf(j.InputPath), dirOf(inPath), filepath.Dir(outPath), w.ScratchDir))
+		return out, fmt.Errorf("transcode failed: %s", ffmpeg.Sanitize(tail, w.stripPaths(j.InputPath, inPath, outPath)...))
 	}
 	return out, nil
 }
