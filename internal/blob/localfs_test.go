@@ -231,3 +231,32 @@ func TestKindString(t *testing.T) {
 		t.Fatal("kind names")
 	}
 }
+
+// Reads are confined to the data directory like Remove: a recorded path outside it (a tampered or
+// foreign row) is refused before the file is opened.
+func TestReadsRefuseLocatorsOutsideRoot(t *testing.T) {
+	l, root := newFS(t)
+	outside := filepath.Join(filepath.Dir(root), "secret")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, loc := range []string{outside, "/etc/passwd", root, filepath.Join(root, "..", "secret"), filepath.Join(root, "out", "..", "..", "secret")} {
+		if _, _, err := l.OpenOutput(ctx, loc); !errors.Is(err, blob.ErrOutsideRoot) || !errors.Is(err, blob.ErrInvalidLocator) {
+			t.Errorf("OpenOutput(%q) = %v, want ErrOutsideRoot", loc, err)
+		}
+		if _, _, err := l.LocalInput(ctx, loc, t.TempDir()); !errors.Is(err, blob.ErrOutsideRoot) {
+			t.Errorf("LocalInput(%q) = %v, want ErrOutsideRoot", loc, err)
+		}
+	}
+	// Inside the root still works.
+	w, loc, err := l.CreateInput(ctx, "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	if p, done, err := l.LocalInput(ctx, loc, ""); err != nil || p != loc {
+		t.Fatalf("LocalInput inside root: %q %v", p, err)
+	} else {
+		done()
+	}
+}

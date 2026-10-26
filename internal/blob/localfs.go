@@ -64,12 +64,31 @@ func (l *LocalFS) CreateInput(_ context.Context, id string) (io.WriteCloser, str
 	return f, p, nil
 }
 
+// inside returns the absolute form of locator if it lies strictly inside the data directory,
+// else ErrOutsideRoot. The check is lexical (symlinks inside the root are not resolved here; reads
+// refuse non-regular files and Remove refuses symlinks).
+func (l *LocalFS) inside(locator string) (string, error) {
+	abs, err := filepath.Abs(locator)
+	if err != nil {
+		return "", err
+	}
+	if rel, err := filepath.Rel(l.root, abs); err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", ErrOutsideRoot
+	}
+	return abs, nil
+}
+
+// OpenOutput refuses locators outside the data directory with ErrOutsideRoot.
 func (l *LocalFS) OpenOutput(_ context.Context, locator string) (io.ReadSeekCloser, Info, error) {
 	if locator == "" {
 		return nil, Info{}, fs.ErrNotExist
 	}
-	// #nosec G304 -- locator is a server-recorded output path (jobs.output_path), never client input
-	f, err := os.Open(locator)
+	p, err := l.inside(locator)
+	if err != nil {
+		return nil, Info{}, err
+	}
+	// #nosec G304 -- p is a server-recorded output path (jobs.output_path) verified to lie inside the data dir
+	f, err := os.Open(p)
 	if err != nil {
 		return nil, Info{}, err
 	}
@@ -85,11 +104,17 @@ func (l *LocalFS) OpenOutput(_ context.Context, locator string) (io.ReadSeekClos
 	return f, Info{Size: st.Size(), ModTime: st.ModTime()}, nil
 }
 
+// LocalInput returns the input file itself (no copy). Locators outside the data directory are
+// refused with ErrOutsideRoot.
 func (l *LocalFS) LocalInput(_ context.Context, locator, _ string) (string, func(), error) {
 	if locator == "" {
 		return "", nil, fs.ErrNotExist
 	}
-	return locator, func() {}, nil
+	p, err := l.inside(locator)
+	if err != nil {
+		return "", nil, err
+	}
+	return p, func() {}, nil
 }
 
 func (l *LocalFS) NewOutput(_ context.Context, jobID string, attempt int, ext string) (string, func(context.Context) (string, error), error) {
@@ -108,12 +133,9 @@ func (l *LocalFS) Remove(_ context.Context, locator string) error {
 	if locator == "" {
 		return nil
 	}
-	abs, err := filepath.Abs(locator)
+	abs, err := l.inside(locator)
 	if err != nil {
 		return err
-	}
-	if rel, err := filepath.Rel(l.root, abs); err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ErrOutsideRoot
 	}
 	st, err := os.Lstat(abs)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -132,9 +154,10 @@ func (l *LocalFS) Remove(_ context.Context, locator string) error {
 	return nil
 }
 
-// Errors returned by LocalFS.Remove when it refuses a locator.
+// Errors returned by LocalFS when it refuses a locator. ErrOutsideRoot satisfies
+// errors.Is(err, ErrInvalidLocator).
 var (
-	ErrOutsideRoot = errors.New("blob: path is outside the data dir")
+	ErrOutsideRoot = fmt.Errorf("%w: path is outside the data dir", ErrInvalidLocator)
 	ErrNotRegular  = errors.New("blob: not a regular file")
 )
 
