@@ -10,12 +10,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/api"
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/db"
 	"github.com/ShifuRain/convertflow/internal/janitor"
@@ -51,21 +51,20 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	for _, d := range []string{"in", "out"} {
-		if err := os.MkdirAll(filepath.Join(cfg.DataDir, d), 0o700); err != nil {
-			return err
-		}
+	bs, err := blob.NewLocalFS(cfg.DataDir) // creates in/ and out/ (0700)
+	if err != nil {
+		return err
 	}
 	store := jobs.NewStore(pool)
 	al := audit.New(os.Stdout)
-	go (&janitor.Janitor{Store: store, Audit: al, DataDir: cfg.DataDir, Retention: cfg.Retention,
+	go (&janitor.Janitor{Store: store, Audit: al, Blob: bs, Retention: cfg.Retention,
 		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout, MaxQueueAge: cfg.MaxQueueAge, Flavor: cfg.Flavor,
 		Interval: time.Minute}).Run(ctx)
 
 	shutdownStarted := make(chan struct{})
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewHandler(api.Deps{Store: store, Cfg: cfg, Audit: al, Shutdown: shutdownStarted}),
+		Handler:           api.NewHandler(api.Deps{Store: store, Cfg: cfg, Audit: al, Blob: bs, Shutdown: shutdownStarted}),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No ReadTimeout/WriteTimeout: uploads are multi-GB and SSE is long-lived. The upload
 		// handler extends a rolling per-read deadline through http.ResponseController instead.

@@ -4,13 +4,14 @@ package janitor
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 	"github.com/ShifuRain/convertflow/internal/presets"
 	"github.com/google/uuid"
@@ -31,7 +32,7 @@ const (
 type Janitor struct {
 	Store       *jobs.Store
 	Audit       *audit.Logger
-	DataDir     string
+	Blob        blob.Store // where job inputs and outputs live
 	Retention   time.Duration
 	StaleAfter  time.Duration
 	Interval    time.Duration
@@ -111,7 +112,7 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 			return err
 		}
 		for _, e := range stranded {
-			j.removeData(e.ID, e.InputPath)
+			j.removeData(ctx, e.ID, e.InputPath)
 			j.Audit.System("job_queue_expired", e.ID)
 		}
 	}
@@ -131,32 +132,27 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 			slog.Error("janitor delete expired job", "job_id", e.ID, "err", err)
 			continue
 		}
-		j.removeData(deleted.ID, deleted.InputPath)
-		j.removeData(deleted.ID, deleted.OutputPath)
+		j.removeData(ctx, deleted.ID, deleted.InputPath)
+		j.removeData(ctx, deleted.ID, deleted.OutputPath)
 		j.Audit.System("job_expired", e.ID)
 	}
-	for _, sub := range []string{"in", "out"} {
-		j.sweepDir(ctx, sub)
+	for _, kind := range []blob.Kind{blob.KindIn, blob.KindOut} {
+		j.sweepKind(ctx, kind)
 	}
 	return nil
 }
 
-// removeData deletes a file recorded on a job, but only strictly inside the data directory.
-// A missing file is success; other failures are logged and skipped.
-func (j *Janitor) removeData(id, p string) {
-	if p == "" {
+// removeData deletes a file recorded on a job through the blob store, which refuses anything
+// outside the data directory. A missing file is success; other failures are logged and skipped.
+func (j *Janitor) removeData(ctx context.Context, id, loc string) {
+	if loc == "" {
 		return
 	}
-	root, err1 := filepath.Abs(j.DataDir)
-	abs, err2 := filepath.Abs(p)
-	if err1 != nil || err2 != nil {
-		return
-	}
-	if rel, err := filepath.Rel(root, abs); err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	err := j.Blob.Remove(ctx, loc)
+	switch {
+	case errors.Is(err, blob.ErrOutsideRoot):
 		slog.Warn("janitor refusing to remove path outside the data dir", "job_id", id)
-		return
-	}
-	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+	case err != nil:
 		slog.Error("janitor removing job file failed", "job_id", id, "err", err)
 	}
 }
@@ -176,21 +172,23 @@ func fileJobID(sub, name string) (string, bool) {
 	return id, true
 }
 
-// sweepDir removes orphaned, superseded and finished-job files from DataDir/<sub>.
+// sweepKind removes orphaned, superseded and finished-job files from one blob namespace
+// (DataDir/in or DataDir/out for the local store).
 //
 // Safety rules, all of which err on the side of keeping a file:
-//   - only regular files are considered (entries come from ReadDir, which does not follow
-//     symlinks); directories, symlinks and anything not named like our files are ignored;
+//   - only regular files are considered (the store lists without following symlinks and skips
+//     directories, symlinks and other non-regular entries); anything not named like our files is
+//     ignored;
 //   - a file is never touched until its mtime is older than the grace period: uploads and FFmpeg
 //     keep modifying their file, and a worker's attempt output (<id>.<attempt>.<ext>) is not
 //     recorded in the DB until Complete, so freshness is the only signal that it is in use;
 //   - files of queued/probing/running jobs: an input is kept (it is needed to run or retry); an
 //     output of a probing/running job is kept until it is older than JobTimeout+margin.
-func (j *Janitor) sweepDir(ctx context.Context, sub string) {
-	dir := filepath.Join(j.DataDir, sub)
-	ents, err := os.ReadDir(dir)
+func (j *Janitor) sweepKind(ctx context.Context, kind blob.Kind) {
+	sub := kind.String()
+	ents, err := j.Blob.List(ctx, kind)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+		if !errors.Is(err, fs.ErrNotExist) && ctx.Err() == nil {
 			slog.Error("janitor reading data dir", "dir", sub, "err", err)
 		}
 		return
@@ -199,37 +197,27 @@ func (j *Janitor) sweepDir(ctx context.Context, sub string) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !e.Type().IsRegular() { // DirEntry type comes from lstat semantics: symlinks are not regular
-			continue
-		}
-		id, ok := fileJobID(sub, e.Name())
+		id, ok := fileJobID(sub, e.Name)
 		if !ok {
 			continue // not ours
 		}
-		info, err := e.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			continue // vanished or replaced concurrently
-		}
-		age := time.Since(info.ModTime())
+		age := time.Since(e.Info.ModTime)
 		if age < j.grace() {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		reason, remove := j.decide(ctx, sub, path, id, age)
+		reason, remove := j.decide(ctx, sub, e.Locator, id, age)
 		if !remove {
 			continue
 		}
-		if err := os.Remove(path); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				slog.Error("janitor removing file failed", "job_id", id, "err", err)
-			}
+		if err := j.Blob.Remove(ctx, e.Locator); err != nil {
+			slog.Error("janitor removing file failed", "job_id", id, "err", err)
 			continue
 		}
 		j.Audit.System("orphan_removed", id, "dir", sub, "reason", reason)
 	}
 }
 
-func (j *Janitor) decide(ctx context.Context, sub, path, id string, age time.Duration) (string, bool) {
+func (j *Janitor) decide(ctx context.Context, sub, loc, id string, age time.Duration) (string, bool) {
 	job, err := j.Store.Get(ctx, id)
 	if errors.Is(err, jobs.ErrNotFound) {
 		return "no_job", true
@@ -248,7 +236,7 @@ func (j *Janitor) decide(ctx context.Context, sub, path, id string, age time.Dur
 	if active && age < j.activeLimit() {
 		return "", false // a worker may be writing this attempt's output
 	}
-	if job.OutputPath != "" && filepath.Clean(job.OutputPath) == filepath.Clean(path) {
+	if job.OutputPath != "" && filepath.Clean(job.OutputPath) == filepath.Clean(loc) {
 		return "", false // the recorded output; retention removes it with the row
 	}
 	return "superseded", true

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/janitor"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 )
@@ -185,7 +186,7 @@ func TestWorkerCrashRequeue(t *testing.T) {
 		t.Fatal("requeued job produced different audio")
 	}
 
-	j := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: 24 * time.Hour,
+	j := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), Blob: blob.OpenLocalFS(s.dir), Retention: 24 * time.Hour,
 		StaleAfter: time.Hour, MaxAttempts: 3, OrphanGrace: time.Hour}
 	if err := j.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
@@ -237,7 +238,7 @@ func TestRetentionJanitor(t *testing.T) {
 	if len(s.names("out")) != 2 {
 		t.Fatalf("want 2 outputs before sweep, got %v", s.names("out"))
 	}
-	j := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: retention,
+	j := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), Blob: blob.OpenLocalFS(s.dir), Retention: retention,
 		StaleAfter: time.Hour, MaxAttempts: 3}
 	if err := j.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
@@ -507,7 +508,7 @@ func TestUnsupportedPresetStaysQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(1500 * time.Millisecond)
-	jan := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: time.Hour,
+	jan := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), Blob: blob.OpenLocalFS(s.dir), Retention: time.Hour,
 		StaleAfter: time.Hour, MaxAttempts: 3, MaxQueueAge: time.Hour}
 	if err := jan.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
@@ -541,7 +542,7 @@ func TestStrandedQueuedJobExpires(t *testing.T) {
 		t.Fatalf("queue cap should refuse: %d %v", code, v)
 	}
 	time.Sleep(700 * time.Millisecond)
-	jan := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), DataDir: s.dir, Retention: time.Hour,
+	jan := &janitor.Janitor{Store: s.store, Audit: audit.New(s.logs), Blob: blob.OpenLocalFS(s.dir), Retention: time.Hour,
 		StaleAfter: time.Hour, MaxAttempts: 3, MaxQueueAge: 500 * time.Millisecond}
 	if err := jan.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
