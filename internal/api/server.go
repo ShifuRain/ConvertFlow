@@ -29,7 +29,8 @@ type Deps struct {
 	Shutdown <-chan struct{}
 
 	// Blob stores job inputs and outputs. Nil selects a blob.LocalFS at Cfg.DataDir (which must
-	// already contain in/ and out/).
+	// already contain in/ and out/). A store that also implements blob.Presigner enables direct
+	// uploads (JSON POST /api/v1/jobs + /complete) and redirects downloads to presigned URLs.
 	Blob blob.Store
 }
 
@@ -47,6 +48,8 @@ type Server struct {
 
 	uploadSlots chan struct{}
 	blob        blob.Store
+	presign     blob.Presigner // non-nil when the store supports direct uploads/downloads
+	presignTTL  time.Duration
 }
 
 const liveWindow = 30 * time.Second // a worker is "live" if it was seen this recently
@@ -72,6 +75,13 @@ func NewHandler(d Deps) http.Handler {
 	if s.blob == nil {
 		s.blob = blob.OpenLocalFS(d.Cfg.DataDir)
 	}
+	if p, ok := s.blob.(blob.Presigner); ok {
+		s.presign = p
+	}
+	s.presignTTL = d.Cfg.S3.PresignTTL
+	if s.presignTTL <= 0 {
+		s.presignTTL = defaultPresignTTL
+	}
 	if s.every <= 0 {
 		s.every = time.Second
 	}
@@ -95,6 +105,7 @@ type route struct {
 func (s *Server) routeTable() []route {
 	return []route{
 		{"POST", "/api/v1/jobs", s.createJob},
+		{"POST", "/api/v1/jobs/{id}/complete", s.completeUpload},
 		{"GET", "/api/v1/jobs", s.listJobs},
 		{"GET", "/api/v1/jobs/{id}", s.getJob},
 		{"DELETE", "/api/v1/jobs/{id}", s.deleteJob},

@@ -13,8 +13,8 @@
     "/api/v1/jobs": {
       "post": {
         "operationId": "createJob",
-        "summary": "Upload a file and create a job",
-        "description": "multipart/form-data. Send exactly one of `preset` (a preset id) or `options` (a JSON object, see JobOptions) BEFORE the `file` part. Unknown fields are rejected. The file is streamed to disk; its name is only used for display.",
+        "summary": "Create a job: upload a file (multipart) or request a direct upload form (JSON)",
+        "description": "multipart/form-data. Send exactly one of `preset` (a preset id) or `options` (a JSON object, see JobOptions) BEFORE the `file` part. Unknown fields are rejected. The file is streamed to disk; its name is only used for display. Alternatively, when the server stores media in an S3-compatible bucket, send application/json (PresignRequest): the request is validated exactly like a multipart upload (options, size limit, queue cap, upload slot), the job is created with status `uploading` and the response (201) carries a presigned POST form for the job's input. The client POSTs the form fields followed by the file (field `file`, last) to `upload.url`, then calls POST /api/v1/jobs/{id}/complete. With local storage a JSON request is refused like any non-multipart request (400).",
         "requestBody": {
           "required": true,
           "content": {
@@ -39,10 +39,33 @@
                   }
                 }
               }
+            },
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PresignRequest"
+              }
             }
           }
         },
         "responses": {
+          "201": {
+            "description": "Direct upload form issued (JSON request); the job is `uploading`",
+            "headers": {
+              "Location": {
+                "description": "URL of the new job",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresignResponse"
+                }
+              }
+            }
+          },
           "202": {
             "description": "Job accepted",
             "headers": {
@@ -208,6 +231,65 @@
         }
       }
     },
+    "/api/v1/jobs/{id}/complete": {
+      "post": {
+        "operationId": "completeUpload",
+        "summary": "Queue a job after its direct upload",
+        "description": "Checks the uploaded object (its stored size must be 1..MAX_UPLOAD_BYTES and equal the announced size) and moves the job from `uploading` to `queued`. Idempotent: a job that already left `uploading` is returned unchanged (200). A rejected object is deleted, so the client may upload again while the form is valid. Only available with S3 storage (404 otherwise).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/JobId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job (queued, or its later state)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The uploaded file is empty",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/CrossOrigin"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Nothing uploaded yet, size differs from the announced size, or the upload expired",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        }
+      }
+    },
     "/api/v1/jobs/{id}/events": {
       "get": {
         "operationId": "streamJobEvents",
@@ -248,7 +330,7 @@
       "get": {
         "operationId": "downloadOutput",
         "summary": "Download the result (supports Range requests)",
-        "description": "Only jobs with status `done` are downloadable. The Content-Type is derived from the preset's container, the response is an attachment and carries `X-Content-Type-Options: nosniff`.",
+        "description": "Only jobs with status `done` are downloadable. The Content-Type is derived from the preset's container, the response is an attachment and carries `X-Content-Type-Options: nosniff`. With S3 storage the response is a 302 redirect (Cache-Control: no-store) to a short-lived presigned URL of the object store, which serves the same Content-Type and Content-Disposition.",
         "parameters": [
           {
             "$ref": "#/components/parameters/JobId"
@@ -318,6 +400,16 @@
                 "schema": {
                   "type": "string",
                   "format": "binary"
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "S3 storage: redirect to a presigned download URL",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -649,6 +741,7 @@
           "status": {
             "type": "string",
             "enum": [
+              "uploading",
               "queued",
               "probing",
               "running",
@@ -722,6 +815,70 @@
           },
           "ext": {
             "type": "string"
+          }
+        }
+      },
+      "PresignRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "size"
+        ],
+        "description": "Exactly one of preset and options.",
+        "properties": {
+          "preset": {
+            "type": "string"
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          },
+          "filename": {
+            "type": "string",
+            "description": "Display name only"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Size of the file in bytes; must match the uploaded object"
+          }
+        }
+      },
+      "PresignResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "upload",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "upload": {
+            "type": "object",
+            "required": [
+              "url",
+              "fields"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Form target (the object store)"
+              },
+              "fields": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Form fields to send before the file, unchanged"
+              }
+            }
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The form is refused by the store after this time"
           }
         }
       }

@@ -13,11 +13,12 @@ There is **no authentication**. State-changing requests (`POST`, `DELETE`) that 
 | Method and path | Purpose | Success | Notes |
 |---|---|---|---|
 | `POST /api/v1/jobs` | Upload a file and create a job | `202` + job JSON, `Location` header | multipart/form-data, see below |
+| `POST /api/v1/jobs/{id}/complete` | S3 storage only: queue a job after its direct upload (JSON `POST /api/v1/jobs`) | `200` + job JSON | `409` nothing uploaded, size mismatch or expired; `404` with local storage |
 | `GET /api/v1/jobs` | Most recent jobs, newest first, at most 200 | `200` | JSON array |
 | `GET /api/v1/jobs/{id}` | Status, progress, metadata | `200` | `404` for unknown or malformed ids |
 | `DELETE /api/v1/jobs/{id}` | Delete an idle job and its files, or request cancellation of an active one | `204` or `202` | see "Cancel and delete" |
 | `GET /api/v1/jobs/{id}/events` | Server-Sent Events progress stream | `200` | `503` when the stream limit is reached |
-| `GET /api/v1/jobs/{id}/output` | Download the result | `200` / `206` | Range requests supported; `409` not ready, `410` removed |
+| `GET /api/v1/jobs/{id}/output` | Download the result | `200` / `206` (S3 storage: `302` to a presigned URL) | Range requests supported; `409` not ready, `410` removed |
 | `GET /api/v1/presets` | Presets runnable on the currently live workers | `200` | only presets some live worker can encode (after the flavor policy) |
 | `GET /api/openapi.json` | The OpenAPI document | `200` | |
 | `GET /healthz` | Liveness with a short database ping | `200` body `ok` | `503` when the database is unreachable |

@@ -233,6 +233,11 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 		gone()
 		return
 	}
+	name, ctype := outputName(j)
+	if s.presign != nil {
+		s.redirectOutput(w, r, j, name, ctype)
+		return
+	}
 	f, info, err := s.blob.OpenOutput(r.Context(), j.OutputPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) { // missing or not a regular file
@@ -243,6 +248,17 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	h := w.Header()
+	h.Set("Content-Type", ctype)
+	h.Set("Content-Disposition", ContentDisposition(name))
+	h.Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(deadlineWriter{w, http.NewResponseController(w)}, r, "", info.ModTime, f)
+}
+
+// outputName returns the download file name (the upload's name with the preset's extension) and
+// the fixed media type of the preset's container. Neither depends on the stored locator's form
+// beyond its extension as a fallback.
+func outputName(j *jobs.Job) (name, ctype string) {
 	ctype, ext := "application/octet-stream", strings.TrimPrefix(filepath.Ext(j.OutputPath), ".")
 	if p, ok := presets.Get(j.Options.Preset); ok {
 		ext = p.Ext
@@ -250,15 +266,17 @@ func (s *Server) output(w http.ResponseWriter, r *http.Request) {
 			ctype = t
 		}
 	}
-	name := strings.TrimSuffix(j.Filename, filepath.Ext(j.Filename))
+	name = strings.TrimSuffix(j.Filename, filepath.Ext(j.Filename))
 	if ext != "" {
 		name += "." + ext
 	}
-	h := w.Header()
-	h.Set("Content-Type", ctype)
-	h.Set("Content-Disposition", ContentDisposition(name))
-	h.Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(deadlineWriter{w, http.NewResponseController(w)}, r, "", info.ModTime, f)
+	return name, ctype
+}
+
+// downloadHeaders are the headers a presigned download makes the store send: the same sanitized
+// attachment disposition and fixed media type as a download served by the API.
+func downloadHeaders(name, ctype string) blob.DownloadHeaders {
+	return blob.DownloadHeaders{ContentDisposition: ContentDisposition(name), ContentType: ctype}
 }
 
 // removeData deletes a file recorded on a job through the blob store, which refuses anything
@@ -270,8 +288,8 @@ func (s *Server) removeData(ctx context.Context, id, loc string) {
 	}
 	err := s.blob.Remove(context.WithoutCancel(ctx), loc)
 	switch {
-	case errors.Is(err, blob.ErrOutsideRoot):
-		slog.Warn("refusing to remove path outside the data dir", "job_id", id)
+	case errors.Is(err, blob.ErrInvalidLocator):
+		slog.Warn("refusing to remove a locator that does not belong to the store", "job_id", id)
 	case err != nil:
 		slog.Error("removing job file failed", "job_id", id, "err", err)
 	}
@@ -369,7 +387,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	var b strings.Builder
 	b.WriteString("# HELP convertflow_jobs Jobs by status.\n# TYPE convertflow_jobs gauge\n")
-	for _, st := range []string{"queued", "probing", "running", "done", "failed", "canceled"} {
+	for _, st := range []string{"uploading", "queued", "probing", "running", "done", "failed", "canceled"} {
 		fmt.Fprintf(&b, "convertflow_jobs{status=%q} %d\n", st, counts[st])
 	}
 	b.WriteString("# HELP convertflow_workers_live Workers seen recently.\n# TYPE convertflow_workers_live gauge\n")
