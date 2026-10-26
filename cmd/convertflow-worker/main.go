@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/db"
 	"github.com/ShifuRain/convertflow/internal/ffmpeg"
@@ -45,9 +46,8 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	dataDir := cfg.DataDir
-	outDir := filepath.Join(dataDir, "out")
-	if err := os.MkdirAll(outDir, 0o700); err != nil {
+	bs, err := blob.NewLocalFS(cfg.DataDir) // ensures in/ and out/ exist (0700)
+	if err != nil {
 		return err
 	}
 	scratch, err := os.MkdirTemp("", "cf-scratch-")
@@ -62,7 +62,7 @@ func run() error {
 	w := &worker.Worker{
 		ID: fmt.Sprintf("%s-%s", host, uuid.NewString()[:8]), Store: jobs.NewStore(pool), Audit: audit.New(os.Stdout),
 		FFmpegBin: "ffmpeg", FFprobeBin: "ffprobe", Flavor: cfg.Flavor, VAAPIDevice: cfg.VAAPIDevice,
-		OutDir: outDir, ScratchDir: scratch,
+		Blob: bs, ScratchDir: scratch,
 		Limits: ffmpeg.Limits{MaxDurationSec: cfg.MaxDurationSec, MaxPixels: cfg.MaxPixels, MaxStreams: cfg.MaxStreams},
 		Poll:   cfg.WorkerPoll, HeartbeatEvery: 2 * time.Second,
 		LeaseTimeout: cfg.StaleAfter,

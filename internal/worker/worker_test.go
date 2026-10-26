@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/db/dbtest"
 	"github.com/ShifuRain/convertflow/internal/ffmpeg"
 	"github.com/ShifuRain/convertflow/internal/jobs"
@@ -40,7 +41,7 @@ func setup(t *testing.T, lim ffmpeg.Limits) env {
 	w := &worker.Worker{
 		ID: "w1", Store: store, Audit: audit.New(&strings.Builder{}),
 		FFmpegBin: "ffmpeg", FFprobeBin: "ffprobe", Flavor: "full",
-		OutDir: filepath.Join(dir, "out"), ScratchDir: t.TempDir(), Limits: lim,
+		Blob: blob.OpenLocalFS(dir), ScratchDir: t.TempDir(), Limits: lim,
 		Poll: 50 * time.Millisecond, HeartbeatEvery: 50 * time.Millisecond,
 	}
 	if err := w.RegisterCapabilities(context.Background()); err != nil {
@@ -530,7 +531,7 @@ func TestWorkerAbandonsJobWhenHeartbeatsFailPastLeaseTimeout(t *testing.T) {
 	w := &worker.Worker{
 		ID: "w2", Store: jobs.NewStore(flaky), Audit: audit.New(&strings.Builder{}),
 		FFmpegBin: "ffmpeg", FFprobeBin: "ffprobe", Flavor: "full",
-		OutDir: e.w.OutDir, ScratchDir: t.TempDir(), Limits: defaultLimits,
+		Blob: e.w.Blob, ScratchDir: t.TempDir(), Limits: defaultLimits,
 		Poll: 50 * time.Millisecond, HeartbeatEvery: 50 * time.Millisecond, LeaseTimeout: 600 * time.Millisecond,
 	}
 	if err := w.RegisterCapabilities(ctx); err != nil {

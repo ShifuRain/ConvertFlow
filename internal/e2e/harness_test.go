@@ -39,6 +39,7 @@ import (
 
 	"github.com/ShifuRain/convertflow/internal/api"
 	"github.com/ShifuRain/convertflow/internal/audit"
+	"github.com/ShifuRain/convertflow/internal/blob"
 	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/db/dbtest"
 	"github.com/ShifuRain/convertflow/internal/ffmpeg"
@@ -346,7 +347,7 @@ func (s *stack) addWorker(id string, wo workerOpts) *workerHandle {
 	scratch := s.t.TempDir()
 	w := &worker.Worker{
 		ID: id, Store: s.store, Audit: audit.New(s.logs), FFmpegBin: ffb, FFprobeBin: fpb, Flavor: "full",
-		OutDir: filepath.Join(s.dir, "out"), ScratchDir: scratch, Limits: s.limits,
+		Blob: blob.OpenLocalFS(s.dir), ScratchDir: scratch, Limits: s.limits,
 		Poll: 50 * time.Millisecond, HeartbeatEvery: 100 * time.Millisecond,
 		JobTimeout: s.o.jobTimeout, MaxOutputBytes: s.o.maxOutputBytes,
 	}
