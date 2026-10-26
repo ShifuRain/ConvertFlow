@@ -489,3 +489,69 @@ func TestSweepExpiresPresetOnlySplittableAcrossWorkers(t *testing.T) {
 		t.Errorf("job no single worker can run must expire: %+v", g)
 	}
 }
+
+func (e *env) uploading(t *testing.T, age time.Duration) string {
+	t.Helper()
+	ctx := context.Background()
+	id := uuid.NewString()
+	if err := e.store.Create(ctx, &jobs.Job{ID: id, Status: jobs.StatusUploading, Filename: "a", InputPath: filepath.Join(e.dir, "in", id),
+		Options: jobs.Options{Preset: "audio-wav"}, DeclaredSize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `UPDATE jobs SET updated_at = now() - make_interval(secs => $2) WHERE id = $1::uuid`, id, age.Seconds()); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// Uploads never completed are failed after UploadTTL+UploadGrace and their object removed;
+// younger ones and (with UploadTTL unset) all of them are kept.
+func TestSweepExpiresAbandonedUploads(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	old := e.uploading(t, 15*time.Minute+janitor.UploadGrace+time.Minute)
+	young := e.uploading(t, 15*time.Minute)
+	oldIn := e.file(t, "in", old, time.Minute)
+	youngIn := e.file(t, "in", young, time.Minute)
+
+	if err := e.j.Sweep(ctx); err != nil { // UploadTTL unset: nothing happens
+		t.Fatal(err)
+	}
+	if j, _ := e.store.Get(ctx, old); j.Status != jobs.StatusUploading {
+		t.Fatalf("UploadTTL=0 must not expire uploads, got %s", j.Status)
+	}
+
+	e.j.UploadTTL = 15 * time.Minute
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := e.store.Get(ctx, old)
+	if j.Status != jobs.StatusFailed || j.Error != jobs.ErrUploadExpired {
+		t.Fatalf("abandoned upload: %+v", j)
+	}
+	if _, err := os.Stat(oldIn); !os.IsNotExist(err) {
+		t.Fatal("abandoned upload's object must be removed")
+	}
+	if j, _ := e.store.Get(ctx, young); j.Status != jobs.StatusUploading {
+		t.Fatalf("young upload expired: %s", j.Status)
+	}
+	if _, err := os.Stat(youngIn); err != nil {
+		t.Fatal("young upload's object removed")
+	}
+	if !strings.Contains(e.log.String(), `"event":"job_upload_expired"`) || !strings.Contains(e.log.String(), old) {
+		t.Fatalf("missing audit: %s", e.log)
+	}
+}
+
+// The orphan sweep keeps the input of an uploading job however old it is.
+func TestSweepKeepsInputOfUploadingJob(t *testing.T) {
+	e := newEnv(t)
+	id := e.uploading(t, time.Minute)
+	in := e.file(t, "in", id, 7*time.Hour)
+	if err := e.j.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(in); err != nil {
+		t.Fatal("input of an uploading job removed by the orphan sweep")
+	}
+}

@@ -27,6 +27,10 @@ const (
 	DefaultJobTimeout = 4 * time.Hour
 	// activeMargin is added to JobTimeout before a probing/running job's files are considered dead.
 	activeMargin = 30 * time.Minute
+	// UploadGrace is added to UploadTTL before an uploading job is failed: an object store checks
+	// the form's expiry when an upload starts, so a large upload begun just before expiry may still
+	// be arriving afterwards.
+	UploadGrace = time.Hour
 )
 
 type Janitor struct {
@@ -50,6 +54,10 @@ type Janitor struct {
 	// queued jobs of such presets never expire by age. LiveWindow defaults to 30s.
 	Flavor     string
 	LiveWindow time.Duration
+	// UploadTTL is the lifetime of presigned upload forms (S3 storage). Jobs still 'uploading'
+	// UploadTTL+UploadGrace after they were created are failed and whatever was uploaded is
+	// removed. Zero disables the check (local storage has no uploading jobs).
+	UploadTTL time.Duration
 }
 
 func (j *Janitor) Run(ctx context.Context) {
@@ -116,6 +124,16 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 			j.Audit.System("job_queue_expired", e.ID)
 		}
 	}
+	if j.UploadTTL > 0 {
+		abandoned, err := j.Store.ExpireUploading(ctx, j.UploadTTL+UploadGrace)
+		if err != nil {
+			return err
+		}
+		for _, e := range abandoned {
+			j.removeData(ctx, e.ID, e.InputPath)
+			j.Audit.System("job_upload_expired", e.ID)
+		}
+	}
 	expired, err := j.Store.Expired(ctx, j.Retention)
 	if err != nil {
 		return err
@@ -150,8 +168,8 @@ func (j *Janitor) removeData(ctx context.Context, id, loc string) {
 	}
 	err := j.Blob.Remove(ctx, loc)
 	switch {
-	case errors.Is(err, blob.ErrOutsideRoot):
-		slog.Warn("janitor refusing to remove path outside the data dir", "job_id", id)
+	case errors.Is(err, blob.ErrInvalidLocator):
+		slog.Warn("janitor refusing to remove a locator that does not belong to the store", "job_id", id)
 	case err != nil:
 		slog.Error("janitor removing job file failed", "job_id", id, "err", err)
 	}
@@ -231,7 +249,7 @@ func (j *Janitor) decide(ctx context.Context, sub, loc, id string, age time.Dura
 		if job.Status.Terminal() {
 			return "job_finished", true
 		}
-		return "", false // queued or active: still needed
+		return "", false // uploading, queued or active: still needed
 	}
 	if active && age < j.activeLimit() {
 		return "", false // a worker may be writing this attempt's output
