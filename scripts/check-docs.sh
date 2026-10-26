@@ -30,7 +30,9 @@ if [ "${1:-}" = "--self-test" ]; then
   done
   # things that are correctly documented must NOT be reported
   for nowant in "table of docs/operations.md: CONVERTFLOW_LISTEN" "code span: GET /healthz" "code span: POST /api/v1/jobs"; do
-    ! grep -qF "$nowant" <<<"$out" || { echo "SELF-TEST FAIL: false positive: $nowant"; bad=1; }
+    # whole-line suffix match: "POST /api/v1/jobs" must not match the report for "POST /api/v1/jobs/{id}/complete"
+    ! awk -v s="$nowant" 'length($0) >= length(s) && substr($0, length($0) - length(s) + 1) == s { f = 1 } END { exit !f }' <<<"$out" \
+      || { echo "SELF-TEST FAIL: false positive: $nowant"; bad=1; }
   done
   [ "$bad" = 0 ] && echo "self-test ok: all seeded defects were reported"
   exit "$bad"
