@@ -2,6 +2,7 @@ package ffmpeg_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,5 +78,77 @@ func TestSanitizeCollapsesAndTruncates(t *testing.T) {
 	}
 	if n := len(ffmpeg.Sanitize(strings.Repeat("x", 5000))); n > 500 {
 		t.Fatalf("not truncated: %d", n)
+	}
+}
+
+// stub writes an executable shell script that stands in for ffmpeg.
+func stub(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func runStub(t *testing.T, body string, stall time.Duration) (string, error, time.Duration) {
+	t.Helper()
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tail, err := ffmpeg.RunWith(ctx, stub(t, body), nil, t.TempDir(), ffmpeg.RunOpts{StallTimeout: stall})
+	return tail, err, time.Since(start)
+}
+
+func TestStallWatchdogKillsSilentProcess(t *testing.T) {
+	// An encoder that failed to start but did not exit: no progress, no CPU.
+	tail, err, took := runStub(t, "echo 'encoder init failed' >&2\nexec sleep 30\n", 500*time.Millisecond)
+	if !errors.Is(err, ffmpeg.ErrStalled) {
+		t.Fatalf("want ErrStalled, got %v", err)
+	}
+	if took > 5*time.Second {
+		t.Fatalf("watchdog took %s", took)
+	}
+	if !strings.Contains(tail, "encoder init failed") {
+		t.Fatalf("stderr tail lost: %q", tail)
+	}
+}
+
+func TestStallWatchdogIgnoresRepeatedReportsAndStderrChatter(t *testing.T) {
+	// FFmpeg repeats its progress block every stats period even when nothing moves, and a stuck
+	// pipeline can keep printing warnings: neither is progress.
+	body := "while :; do printf 'frame=7\\nout_time_us=1000\\ntotal_size=48\\nprogress=continue\\n'; echo 'Past duration too large' >&2; sleep 0.1; done\n"
+	_, err, took := runStub(t, body, 700*time.Millisecond)
+	if !errors.Is(err, ffmpeg.ErrStalled) {
+		t.Fatalf("want ErrStalled, got %v", err)
+	}
+	if took > 6*time.Second {
+		t.Fatalf("watchdog took %s", took)
+	}
+}
+
+func TestStallWatchdogSparesSlowButProgressingRun(t *testing.T) {
+	// One report every 300ms with a growing counter, 3s in total, against a 700ms stall timeout.
+	body := "i=0; while [ $i -lt 10 ]; do i=$((i+1)); printf 'frame=%d\\nout_time_us=N/A\\nprogress=continue\\n' $i; sleep 0.3; done\nprintf 'progress=end\\n'\n"
+	_, err, _ := runStub(t, body, 700*time.Millisecond)
+	if err != nil {
+		t.Fatalf("progressing run was killed: %v", err)
+	}
+}
+
+func TestStallWatchdogSparesBusyProcessWithoutReports(t *testing.T) {
+	// A slow encoder working on its first frames (lookahead on a huge frame) reports nothing for a
+	// long time but keeps a core busy: that is not a stall.
+	body := "end=$(( $(date +%s) + 3 )); while [ $(date +%s) -lt $end ]; do :; done\n"
+	_, err, _ := runStub(t, body, 700*time.Millisecond)
+	if err != nil {
+		t.Fatalf("busy run was killed: %v", err)
+	}
+}
+
+func TestStallWatchdogDisabled(t *testing.T) {
+	_, err, _ := runStub(t, "sleep 1\n", 0)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
