@@ -653,3 +653,44 @@ func TestSweepPrunesOldWorkerRegistrations(t *testing.T) {
 		t.Fatalf("want only the recent registration, got %v", ids)
 	}
 }
+
+func TestSweepExpiresIdleSessionsAndPrunesRateEvents(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	idle, active := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	for _, k := range [][]byte{idle, active} {
+		if err := e.store.CreateSession(ctx, k, []byte("mint-key"), 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.pool.Exec(ctx, `UPDATE sessions SET last_seen = now() - interval '31 days' WHERE key = $1`, idle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `UPDATE rate_events SET at = now() - interval '2 hours' WHERE ctid = (SELECT min(ctid) FROM rate_events)`); err != nil {
+		t.Fatal(err)
+	}
+	// SessionTTL zero (sessions off/header mode): sessions untouched, rate events still pruned
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	count := func(q string) int {
+		var n int
+		if err := e.pool.QueryRow(ctx, q).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if count(`SELECT count(*) FROM sessions`) != 2 || count(`SELECT count(*) FROM rate_events`) != 1 {
+		t.Fatal("first sweep")
+	}
+	e.j.SessionTTL = 30 * 24 * time.Hour
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count(`SELECT count(*) FROM sessions`) != 1 || count(`SELECT count(*) FROM sessions WHERE key = '\x0202020202020202020202020202020202020202020202020202020202020202'::bytea`) != 1 {
+		t.Fatal("idle session not removed, or the active one was")
+	}
+	if !strings.Contains(e.log.String(), `"event":"sessions_expired"`) {
+		t.Fatalf("no audit: %s", e.log)
+	}
+}

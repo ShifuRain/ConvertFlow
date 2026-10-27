@@ -3,7 +3,7 @@
   "info": {
     "title": "ConvertFlow API",
     "version": "1.0.0",
-    "description": "Transcode video and audio with FFmpeg. There is no authentication: the service is intended for isolated networks. Errors use RFC 9457 application/problem+json. Unknown /api paths answer 404 and unsupported methods 405 (with an Allow header), both as problem+json. Every route answers 421 when the request's Host header is not allowed (default: localhost and IP literals; see CONVERTFLOW_ALLOWED_HOSTS).",
+    "description": "Transcode video and audio with FFmpeg. There is no authentication: the service is intended for isolated networks. Optionally (CONVERTFLOW_SESSIONS) jobs belong to an owner: an anonymous session (cookie `cf_session`, issued by the server on GET /api/v1/presets, GET /api/v1/quota or the first job creation) or a user id set by a trusted reverse proxy. Then every job route only matches the caller's own jobs: another owner's job answers 404 exactly like a missing one, and the job list contains only the caller's jobs. Ownership is isolation between users, not authentication. Errors use RFC 9457 application/problem+json. Unknown /api paths answer 404 and unsupported methods 405 (with an Allow header), both as problem+json. Every route answers 421 when the request's Host header is not allowed (default: localhost and IP literals; see CONVERTFLOW_ALLOWED_HOSTS).",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -14,7 +14,7 @@
       "post": {
         "operationId": "createJob",
         "summary": "Create a job: upload a file (multipart) or request a direct upload form (JSON)",
-        "description": "multipart/form-data. Send exactly one of `preset` (a preset id) or `options` (a JSON object, see JobOptions) BEFORE the `file` part. Unknown fields are rejected. The file is streamed to disk; its name is only used for display. Alternatively, when the server stores media in an S3-compatible bucket, send application/json (PresignRequest): the request is validated exactly like a multipart upload (options, size limit, queue cap, upload slot), the job is created with status `uploading` and the response (201) carries a presigned POST form for the job's input. The client POSTs the form fields followed by the file (field `file`, last) to `upload.url`, then calls POST /api/v1/jobs/{id}/complete. With local storage a JSON request is refused like any non-multipart request (400).",
+        "description": "multipart/form-data. Send exactly one of `preset` (a preset id) or `options` (a JSON object, see JobOptions) BEFORE the `file` part. Unknown fields are rejected. The file is streamed to disk; its name is only used for display. Alternatively, when the server stores media in an S3-compatible bucket, send application/json (PresignRequest): the request is validated exactly like a multipart upload (options, size limit, queue cap, upload slot), the job is created with status `uploading` and the response (201) carries a presigned POST form for the job's input. The client POSTs the form fields followed by the file (field `file`, last) to `upload.url`, then calls POST /api/v1/jobs/{id}/complete. With local storage a JSON request is refused like any non-multipart request (400). With sessions on, the job belongs to the caller (in cookie mode a session is created and its cookie set when the request has none). Quotas (CONVERTFLOW_QUOTA_*) are checked before any upload byte is stored where possible and again atomically when the job row is written: 429 with Retry-After when exceeded, 413 when the single file is larger than the queued-bytes quota.",
         "requestBody": {
           "required": true,
           "content": {
@@ -87,6 +87,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "403": {
             "$ref": "#/components/responses/CrossOrigin"
           },
@@ -98,6 +101,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/QuotaExceeded"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -112,7 +118,7 @@
       },
       "get": {
         "operationId": "listJobs",
-        "summary": "List the most recent jobs (newest first, at most 200)",
+        "summary": "List the most recent jobs (newest first, at most 200); with sessions on only the caller's jobs",
         "responses": {
           "200": {
             "description": "Array of jobs",
@@ -126,6 +132,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "421": {
             "$ref": "#/components/responses/MisdirectedRequest"
@@ -155,6 +164,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -205,6 +217,9 @@
           },
           "204": {
             "description": "Deleted"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
             "$ref": "#/components/responses/CrossOrigin"
@@ -262,6 +277,9 @@
               }
             }
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "403": {
             "$ref": "#/components/responses/CrossOrigin"
           },
@@ -310,6 +328,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -414,6 +435,9 @@
               }
             }
           },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
@@ -485,6 +509,35 @@
                 }
               }
             }
+          },
+          "421": {
+            "$ref": "#/components/responses/MisdirectedRequest"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "description": "In cookie session mode this is the page's first API call and creates the session (and sets its cookie) when the request has none, unless the per-IP session limit is reached; the presets are answered either way."
+      }
+    },
+    "/api/v1/quota": {
+      "get": {
+        "operationId": "getQuota",
+        "summary": "The caller's quota limits and current usage",
+        "description": "In cookie mode this creates a session (and sets its cookie) when the request has none, unless the per-IP session limit is reached. Available in every session mode; with sessions off only the per-IP figures apply.",
+        "responses": {
+          "200": {
+            "description": "Limits and usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quota"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "421": {
             "$ref": "#/components/responses/MisdirectedRequest"
@@ -597,7 +650,7 @@
         }
       },
       "NotFound": {
-        "description": "No such job or endpoint",
+        "description": "No such job or endpoint (with sessions on, also a job of another owner)",
         "content": {
           "application/problem+json": {
             "schema": {
@@ -607,7 +660,7 @@
         }
       },
       "TooLarge": {
-        "description": "The file exceeds the configured upload limit",
+        "description": "The file exceeds the configured upload limit, or is larger than the caller's queued-bytes quota",
         "content": {
           "application/problem+json": {
             "schema": {
@@ -680,6 +733,34 @@
           "application/problem+json": {
             "schema": {
               "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Header session mode only: the request carries no user identity from a trusted reverse proxy (the user header is missing, invalid, or the peer is not in CONVERTFLOW_TRUSTED_PROXIES).",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "QuotaExceeded": {
+        "description": "A per-owner or per-IP quota is exhausted (unfinished jobs, queued bytes, jobs per hour, active jobs per IP, or new sessions per IP). Retry after the indicated time; see GET /api/v1/quota.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        },
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying",
+            "schema": {
+              "type": "integer"
             }
           }
         }
@@ -893,6 +974,79 @@
             "description": "The form is refused by the store after this time"
           }
         }
+      },
+      "QuotaCounts": {
+        "type": "object",
+        "required": [
+          "active_jobs",
+          "queued_bytes",
+          "jobs_per_hour",
+          "active_jobs_per_ip"
+        ],
+        "properties": {
+          "active_jobs": {
+            "type": "integer",
+            "description": "Unfinished (uploading, queued, probing, running) jobs of the caller"
+          },
+          "queued_bytes": {
+            "type": "integer",
+            "description": "Summed input bytes of the caller's unfinished jobs"
+          },
+          "jobs_per_hour": {
+            "type": "integer",
+            "description": "Jobs the caller created in the trailing hour (counted only while that limit is set)"
+          },
+          "active_jobs_per_ip": {
+            "type": "integer",
+            "description": "Unfinished jobs created from the caller's IP address (IPv6: its /64; counted only while that limit is set)"
+          }
+        }
+      },
+      "Quota": {
+        "type": "object",
+        "required": [
+          "sessions",
+          "owner",
+          "limits",
+          "usage"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "string",
+            "enum": [
+              "off",
+              "cookie",
+              "header"
+            ]
+          },
+          "owner": {
+            "type": "boolean",
+            "description": "Whether the caller has an owner (a session or a proxy user). Without one the per-owner usage is zero."
+          },
+          "limits": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/QuotaCounts"
+              }
+            ],
+            "description": "Configured limits; 0 means unlimited"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/QuotaCounts"
+          },
+          "jobs_per_hour_resets_in_seconds": {
+            "type": "integer",
+            "description": "Seconds until the oldest job of the trailing hour stops counting (absent when none counts)"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "cf_session",
+        "description": "Cookie session mode only. Issued by the server (HttpOnly, SameSite=Strict, Path=/api/, Secure over TLS); a client-chosen value is never accepted. Optional: without it the caller simply has no jobs."
       }
     }
   }

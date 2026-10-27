@@ -73,6 +73,9 @@ type Janitor struct {
 	// UploadTTL+UploadGrace after they were created are failed and whatever was uploaded is
 	// removed. Zero disables the check (local storage has no uploading jobs).
 	UploadTTL time.Duration
+	// SessionTTL removes cookie sessions idle for longer than this. Zero disables it (sessions
+	// off or header mode keep no session rows).
+	SessionTTL time.Duration
 }
 
 func (j *Janitor) Run(ctx context.Context) {
@@ -162,6 +165,18 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 		retention = DefaultWorkerRetention
 	}
 	if _, err := j.Store.PruneWorkers(ctx, retention); err != nil {
+		return err
+	}
+	if j.SessionTTL > 0 {
+		n, err := j.Store.DeleteIdleSessions(ctx, j.SessionTTL)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			j.Audit.System("sessions_expired", "", "count", n)
+		}
+	}
+	if _, err := j.Store.PruneRateEvents(ctx); err != nil {
 		return err
 	}
 	expired, err := j.Store.Expired(ctx, j.Retention)
