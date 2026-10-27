@@ -44,6 +44,18 @@ type Config struct {
 	MinFreeBytes         int64 // free space required on the data volume; below it uploads get 507
 	MaxSSEStreams        int   // simultaneous progress streams; excess get 503
 
+	// JobStallTimeout makes the worker kill and fail a conversion whose FFmpeg reports no
+	// progress and stays essentially idle for this long. Zero disables the watchdog.
+	JobStallTimeout time.Duration
+	// WorkerOnce and WorkerIdleExit select the worker's ephemeral modes (flags --once and
+	// --idle-exit override them): Once processes at most one job; IdleExit makes the worker exit
+	// after that long without a claimable job (0: never; once mode defaults to
+	// DefaultOnceIdleExit).
+	WorkerOnce     bool
+	WorkerIdleExit time.Duration
+	// WorkerShutdownTimeout bounds how long a stopping worker spends releasing an interrupted
+	// job (and the other writes after a run).
+	WorkerShutdownTimeout time.Duration
 	// WorkersOnDemand declares that workers are started on demand (scale to zero), so the API and
 	// janitor must not require a live worker: presets are offered from recent worker
 	// registrations (OnDemandCapabilityWindow) and queued jobs expire purely by age.
@@ -61,10 +73,18 @@ const (
 	StorageS3    = "s3"
 )
 
+// DefaultOnceIdleExit is how long a --once worker waits for a claimable job when no idle exit is
+// configured: a worker started for a job that is not yet visible (an autoscaler reacting to a row
+// being committed) still finds it.
+const DefaultOnceIdleExit = 30 * time.Second
+
 // OnDemandCapabilityWindow is how far back worker registrations count when workers run on demand:
 // a scaled-to-zero deployment has no live worker, so the presets offered are those a worker that
 // registered within this window could run.
 const OnDemandCapabilityWindow = 7 * 24 * time.Hour
+
+// MinStallTimeout is the smallest accepted non-zero CONVERTFLOW_JOB_STALL_TIMEOUT.
+const MinStallTimeout = 10 * time.Second
 
 // MaxPresignTTL caps how long a presigned upload or download URL stays valid.
 const MaxPresignTTL = time.Hour
@@ -199,7 +219,27 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		}
 		return b
 	}
+	c.WorkerOnce = boolean("CONVERTFLOW_WORKER_ONCE", false)
 	c.WorkersOnDemand = boolean("CONVERTFLOW_WORKERS_ON_DEMAND", false)
+	if v := getenv("CONVERTFLOW_WORKER_IDLE_EXIT"); v != "" {
+		c.WorkerIdleExit = dur("CONVERTFLOW_WORKER_IDLE_EXIT", 0)
+	}
+	c.WorkerShutdownTimeout = dur("CONVERTFLOW_WORKER_SHUTDOWN_TIMEOUT", 10*time.Second)
+	if c.WorkerShutdownTimeout > 5*time.Minute {
+		fail("CONVERTFLOW_WORKER_SHUTDOWN_TIMEOUT must be at most 5m, got %s", c.WorkerShutdownTimeout)
+	}
+	c.JobStallTimeout = 10 * time.Minute
+	if v := getenv("CONVERTFLOW_JOB_STALL_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		switch {
+		case err != nil || d < 0:
+			fail("CONVERTFLOW_JOB_STALL_TIMEOUT must be a duration (0 disables), got %q", v)
+		case d > 0 && d < MinStallTimeout:
+			fail("CONVERTFLOW_JOB_STALL_TIMEOUT must be 0 or at least %s, got %s", MinStallTimeout, d)
+		default:
+			c.JobStallTimeout = d
+		}
+	}
 
 	secretFile := func(key string) Secret {
 		f := getenv(key)
