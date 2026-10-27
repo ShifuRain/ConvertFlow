@@ -11,6 +11,8 @@ Workflow (podman or docker; set `CONTAINER_RUNTIME`):
     FFMPEG_FLAVOR=lgpl podman compose build     # or FFMPEG_FLAVOR=full (GPL + x264/x265, prints a patent/licence notice)
     tests/container/hardening.sh    # static + runtime hardening checks (starts the stack if needed)
     scripts/smoke.sh                # end-to-end: upload, convert, download, ffprobe
+    HARDENING_PROFILE=s3 tests/container/hardening.sh   # the same checks for the S3 profile (compose.s3.yaml)
+    tests/container/s3.sh           # S3 profile end-to-end: direct upload replayed with curl, CORS, credential scoping
 
 Bumping FFmpeg: download the tarball and its `.asc` from ffmpeg.org, verify with GPG against the
 release key (fingerprint FCF9 86EA 15E6 E293 A564 4F10 B432 2F04 D676 58D8, as published at
@@ -36,6 +38,9 @@ The worker and database sit on an internal network with no egress.
 - `scripts/smoke.sh` and `tests/container/hardening.sh` use their own compose projects (`convertflow-smoke`,
   `convertflow-hardening`) and host ports (18080 / 18081); they refuse `down -v` for any other project and never touch a
   real `convertflow` deployment. `tests/container/hardening.sh --self-test` proves a weakened config is rejected.
+- **S3 profile** (`compose.s3.yaml`, development and tests only): adds a MinIO store (AGPL-3.0, a pinned Chainguard rebuild,
+  not distributed by this project and not in the air-gap bundle); setup and limits in [on-demand.md](on-demand.md). Its test
+  projects are `convertflow-hardening-s3` and `convertflow-s3test` (ports 18081/18091 and 18082/18092).
 - Worker images are tagged per flavor: `convertflow-worker:dev-lgpl` / `:dev-full`. `FFMPEG_FLAVOR` is shared with the API
   (it filters presets by flavor) through one compose anchor together with job timeout / retention / stale settings.
 - The final worker image build fails if ffmpeg/ffprobe have unresolved libraries, expected encoders are missing, or an lgpl
