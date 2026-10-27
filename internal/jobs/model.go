@@ -46,7 +46,14 @@ type Job struct {
 	CancelRequested bool
 	// DeclaredSize is the client-announced size of a presigned upload (0 if none).
 	DeclaredSize int64
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	FinishedAt   *time.Time
+	// Owner is the owner key (session or proxy user digest); nil with sessions off.
+	Owner []byte
+	// ClientKey is the digest of the creating client's IP; set only while a per-IP quota applies.
+	ClientKey []byte
+	// InputSize is the input's size in bytes when known at creation (counted by the queued-bytes
+	// quota); 0 if unknown.
+	InputSize  int64
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	FinishedAt *time.Time
 }
