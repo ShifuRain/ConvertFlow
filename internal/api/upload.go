@@ -194,16 +194,72 @@ func (b idleDeadlineBody) Read(p []byte) (int, error) {
 	return b.ReadCloser.Read(p)
 }
 
-// createJob streams a multipart upload to disk. Fields "preset" or "options" (JSON), exactly one
-// of them and once, must precede the "file" field so invalid requests are rejected before any
-// bytes are stored. Unknown field names are rejected. Anything after the file part is ignored.
-func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
-	// Resource bounds are checked before reading any body bytes.
+// takeUploadSlot reserves one of the MaxConcurrentUploads slots (503 when none is free). The
+// caller releases it with <-s.uploadSlots.
+func (s *Server) takeUploadSlot(w http.ResponseWriter, r *http.Request) bool {
 	select {
 	case s.uploadSlots <- struct{}{}:
-		defer func() { <-s.uploadSlots }()
+		return true
 	default:
 		s.reject(w, r, http.StatusServiceUnavailable, "Server busy", "Too many uploads are in progress; retry later.", "too many concurrent uploads")
+		return false
+	}
+}
+
+// checkCapacity applies the queue cap (503) and the free-space reserve (507) before a new job is
+// accepted. announced is the expected input size (<= 0 if unknown). Stores without a free-space
+// figure (object stores report errors.ErrUnsupported) skip the free-space check.
+func (s *Server) checkCapacity(w http.ResponseWriter, r *http.Request, announced int64) bool {
+	if s.cfg.MaxQueuedJobs > 0 {
+		n, err := s.store.CountActive(r.Context())
+		if err != nil {
+			s.serverFault(w, r, "", "count_active", err)
+			return false
+		}
+		if n >= s.cfg.MaxQueuedJobs {
+			s.reject(w, r, http.StatusServiceUnavailable, "Server busy", "The job queue is full; retry later.", "queue full")
+			return false
+		}
+	}
+	if s.cfg.MinFreeBytes > 0 {
+		free, err := s.blob.FreeBytes(r.Context())
+		if errors.Is(err, errors.ErrUnsupported) {
+			return true
+		}
+		if err != nil {
+			s.serverFault(w, r, "", "statfs", err)
+			return false
+		}
+		need := s.cfg.MinFreeBytes
+		if announced > 0 {
+			need += announced
+		}
+		if free < need {
+			s.reject(w, r, http.StatusInsufficientStorage, "Insufficient storage", "The server does not have enough free storage.", "insufficient storage")
+			return false
+		}
+	}
+	return true
+}
+
+// errAborted aborts a streaming store upload whose request failed, so nothing is committed.
+var errAborted = errors.New("upload aborted")
+
+// createJob streams a multipart upload to the blob store. Fields "preset" or "options" (JSON), exactly one
+// of them and once, must precede the "file" field so invalid requests are rejected before any
+// bytes are stored. Unknown field names are rejected. Anything after the file part is ignored.
+//
+// When the store supports presigning, a request with Content-Type application/json is a direct
+// (presigned) upload instead; see createPresigned. Without it, such a request is refused as before
+// (400, expected multipart/form-data).
+func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
+	// Resource bounds are checked before reading any body bytes.
+	if !s.takeUploadSlot(w, r) {
+		return
+	}
+	defer func() { <-s.uploadSlots }()
+	if s.presign != nil && isJSON(r) {
+		s.createPresigned(w, r)
 		return
 	}
 	limit := s.cfg.MaxUploadBytes + multipartSlack
@@ -211,31 +267,8 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		s.reject(w, r, http.StatusRequestEntityTooLarge, "Upload too large", "The file exceeds the configured limit.", "upload too large")
 		return
 	}
-	if s.cfg.MaxQueuedJobs > 0 {
-		n, err := s.store.CountActive(r.Context())
-		if err != nil {
-			s.serverFault(w, r, "", "count_active", err)
-			return
-		}
-		if n >= s.cfg.MaxQueuedJobs {
-			s.reject(w, r, http.StatusServiceUnavailable, "Server busy", "The job queue is full; retry later.", "queue full")
-			return
-		}
-	}
-	if s.cfg.MinFreeBytes > 0 {
-		free, err := s.blob.FreeBytes(r.Context())
-		if err != nil {
-			s.serverFault(w, r, "", "statfs", err)
-			return
-		}
-		need := s.cfg.MinFreeBytes
-		if r.ContentLength > 0 {
-			need += r.ContentLength
-		}
-		if free < need {
-			s.reject(w, r, http.StatusInsufficientStorage, "Insufficient storage", "The server does not have enough free storage.", "insufficient storage")
-			return
-		}
+	if !s.checkCapacity(w, r, r.ContentLength) {
+		return
 	}
 
 	r.Body = http.MaxBytesReader(w, idleDeadlineBody{r.Body, http.NewResponseController(w)}, limit)
@@ -312,7 +345,12 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			}
 			inLoc = loc
 			n, err := io.Copy(tagWriter{f}, io.LimitReader(part, s.cfg.MaxUploadBytes+1))
-			cerr := f.Close()
+			var cerr error
+			if a, ok := f.(interface{ CloseWithError(error) error }); ok && (err != nil || n > s.cfg.MaxUploadBytes || n == 0) {
+				_ = a.CloseWithError(errAborted) // streaming store: abort instead of committing a rejected upload
+			} else {
+				cerr = f.Close()
+			}
 			switch {
 			case err != nil:
 				s.uploadError(w, r, id, err)

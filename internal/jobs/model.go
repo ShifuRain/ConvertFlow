@@ -6,12 +6,15 @@ import "time"
 type Status string
 
 const (
-	StatusQueued   Status = "queued"
-	StatusProbing  Status = "probing"
-	StatusRunning  Status = "running"
-	StatusDone     Status = "done"
-	StatusFailed   Status = "failed"
-	StatusCanceled Status = "canceled"
+	// StatusUploading: a presigned upload was handed out; the job is queued by
+	// POST /jobs/{id}/complete once the object is verified.
+	StatusUploading Status = "uploading"
+	StatusQueued    Status = "queued"
+	StatusProbing   Status = "probing"
+	StatusRunning   Status = "running"
+	StatusDone      Status = "done"
+	StatusFailed    Status = "failed"
+	StatusCanceled  Status = "canceled"
 )
 
 func (s Status) Terminal() bool {
@@ -41,7 +44,9 @@ type Job struct {
 	Attempts        int
 	WorkerID        string
 	CancelRequested bool
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	FinishedAt      *time.Time
+	// DeclaredSize is the client-announced size of a presigned upload (0 if none).
+	DeclaredSize int64
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	FinishedAt   *time.Time
 }

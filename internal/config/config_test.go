@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -195,5 +196,144 @@ func TestAbsolutize(t *testing.T) {
 	var empty config.Config
 	if err := empty.Absolutize(); err != nil || empty.TLSCertFile != "" {
 		t.Errorf("unset paths must stay unset: %+v %v", empty, err)
+	}
+}
+
+func s3Env(extra map[string]string) map[string]string {
+	m := map[string]string{
+		"CONVERTFLOW_DATABASE_URL":       "postgres://x",
+		"CONVERTFLOW_STORAGE":            "s3",
+		"CONVERTFLOW_S3_ENDPOINT":        "minio:9000",
+		"CONVERTFLOW_S3_BUCKET":          "convertflow",
+		"CONVERTFLOW_S3_ACCESS_KEY_FILE": "/run/secrets/ak",
+		"CONVERTFLOW_S3_SECRET_KEY_FILE": "/run/secrets/sk",
+	}
+	for k, v := range extra {
+		if v == "" {
+			delete(m, k)
+		} else {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+func keyFiles(p string) ([]byte, error) {
+	switch p {
+	case "/run/secrets/ak":
+		return []byte("AKIDEXAMPLE\n"), nil
+	case "/run/secrets/sk":
+		return []byte("very-secret-key\n"), nil
+	case "/run/secrets/empty":
+		return []byte("  \n"), nil
+	}
+	return nil, errors.New("no such file")
+}
+
+func TestStorageDefaultsToLocal(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}), noFile)
+	if err != nil || c.Storage != config.StorageLocal || c.S3 != (config.S3Config{}) {
+		t.Fatalf("got %q %+v %v", c.Storage, c.S3, err)
+	}
+	// S3 variables are ignored (not validated) in local mode, except the refused plain secrets.
+	c, err = config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "x", "CONVERTFLOW_S3_BUCKET": "Not Valid"}), noFile)
+	if err != nil || c.S3.Bucket != "" {
+		t.Fatalf("local mode must ignore S3 settings: %+v %v", c.S3, err)
+	}
+}
+
+func TestS3Defaults(t *testing.T) {
+	c, err := config.Load(env(s3Env(nil)), keyFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.S3
+	if c.Storage != "s3" || s.Endpoint != "minio:9000" || s.PublicEndpoint != "https://minio:9000" || s.Bucket != "convertflow" ||
+		s.Region != "us-east-1" || !s.UseSSL || !s.PathStyle || s.PresignTTL != 15*time.Minute {
+		t.Fatalf("bad defaults: %+v", s)
+	}
+	if s.AccessKey.Value() != "AKIDEXAMPLE" || s.SecretKey.Value() != "very-secret-key" {
+		t.Fatal("credentials not read from the files (trimmed)")
+	}
+}
+
+func TestS3Overrides(t *testing.T) {
+	c, err := config.Load(env(s3Env(map[string]string{
+		"CONVERTFLOW_S3_PUBLIC_ENDPOINT": "https://files.example.org/",
+		"CONVERTFLOW_S3_REGION":          "eu-central-1",
+		"CONVERTFLOW_S3_USE_SSL":         "false",
+		"CONVERTFLOW_S3_PATH_STYLE":      "false",
+		"CONVERTFLOW_S3_PRESIGN_TTL":     "1h",
+	})), keyFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.S3
+	if s.PublicEndpoint != "https://files.example.org" || s.Region != "eu-central-1" || s.UseSSL || s.PathStyle || s.PresignTTL != time.Hour {
+		t.Fatalf("bad overrides: %+v", s)
+	}
+	// Without TLS the default public endpoint is http.
+	c, err = config.Load(env(s3Env(map[string]string{"CONVERTFLOW_S3_USE_SSL": "0"})), keyFiles)
+	if err != nil || c.S3.PublicEndpoint != "http://minio:9000" {
+		t.Fatalf("public default without TLS: %q %v", c.S3.PublicEndpoint, err)
+	}
+}
+
+func TestS3InvalidValues(t *testing.T) {
+	cases := map[string]map[string]string{
+		"unknown storage":     {"CONVERTFLOW_STORAGE": "gcs"},
+		"upper storage":       {"CONVERTFLOW_STORAGE": "S3"},
+		"missing endpoint":    {"CONVERTFLOW_S3_ENDPOINT": ""},
+		"endpoint scheme":     {"CONVERTFLOW_S3_ENDPOINT": "http://minio:9000"},
+		"endpoint path":       {"CONVERTFLOW_S3_ENDPOINT": "minio:9000/x"},
+		"endpoint userinfo":   {"CONVERTFLOW_S3_ENDPOINT": "u@minio:9000"},
+		"endpoint bad port":   {"CONVERTFLOW_S3_ENDPOINT": "minio:99999"},
+		"endpoint no host":    {"CONVERTFLOW_S3_ENDPOINT": ":9000"},
+		"public no scheme":    {"CONVERTFLOW_S3_PUBLIC_ENDPOINT": "files.example.org"},
+		"public ftp":          {"CONVERTFLOW_S3_PUBLIC_ENDPOINT": "ftp://files.example.org"},
+		"public path":         {"CONVERTFLOW_S3_PUBLIC_ENDPOINT": "https://files.example.org/s3"},
+		"public query":        {"CONVERTFLOW_S3_PUBLIC_ENDPOINT": "https://files.example.org?x=1"},
+		"public userinfo":     {"CONVERTFLOW_S3_PUBLIC_ENDPOINT": "https://u:p@files.example.org"},
+		"missing bucket":      {"CONVERTFLOW_S3_BUCKET": ""},
+		"bad bucket":          {"CONVERTFLOW_S3_BUCKET": "Upper_Case"},
+		"short bucket":        {"CONVERTFLOW_S3_BUCKET": "ab"},
+		"bucket dots":         {"CONVERTFLOW_S3_BUCKET": "a..b"},
+		"bad region":          {"CONVERTFLOW_S3_REGION": "eu/1"},
+		"bad ssl":             {"CONVERTFLOW_S3_USE_SSL": "maybe"},
+		"bad path style":      {"CONVERTFLOW_S3_PATH_STYLE": "yes please"},
+		"ttl too long":        {"CONVERTFLOW_S3_PRESIGN_TTL": "61m"},
+		"ttl zero":            {"CONVERTFLOW_S3_PRESIGN_TTL": "0s"},
+		"ttl sub-second":      {"CONVERTFLOW_S3_PRESIGN_TTL": "500ms"},
+		"ttl garbage":         {"CONVERTFLOW_S3_PRESIGN_TTL": "soon"},
+		"missing access file": {"CONVERTFLOW_S3_ACCESS_KEY_FILE": ""},
+		"missing secret file": {"CONVERTFLOW_S3_SECRET_KEY_FILE": ""},
+		"unreadable secret":   {"CONVERTFLOW_S3_SECRET_KEY_FILE": "/nope"},
+		"empty secret":        {"CONVERTFLOW_S3_SECRET_KEY_FILE": "/run/secrets/empty"},
+		"plain secret env":    {"CONVERTFLOW_S3_SECRET_KEY": "inline"},
+		"plain access env":    {"CONVERTFLOW_S3_ACCESS_KEY": "inline"},
+	}
+	for name, extra := range cases {
+		if _, err := config.Load(env(s3Env(extra)), keyFiles); err == nil {
+			t.Errorf("%s: expected error", name)
+		} else if strings.Contains(err.Error(), "very-secret-key") || strings.Contains(err.Error(), "inline") {
+			t.Errorf("%s: error leaks a secret: %v", name, err)
+		}
+	}
+	// A plain secret is refused even in local mode, so it is never silently ignored.
+	if _, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "x", "CONVERTFLOW_S3_SECRET_KEY": "inline"}), noFile); err == nil {
+		t.Error("plain CONVERTFLOW_S3_SECRET_KEY must be refused in local mode too")
+	}
+}
+
+func TestSecretsAreRedactedWhenPrinted(t *testing.T) {
+	c, err := config.Load(env(s3Env(nil)), keyFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"%v", "%+v", "%#v", "%s"} {
+		out := fmt.Sprintf(f, c)
+		if strings.Contains(out, "very-secret-key") || strings.Contains(out, "AKIDEXAMPLE") {
+			t.Errorf("%s leaks a credential: %s", f, out)
+		}
 	}
 }

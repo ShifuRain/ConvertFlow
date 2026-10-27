@@ -3,7 +3,7 @@
 #   (a) every relative link and #anchor in README.md, SECURITY.md, CONTRIBUTING.md and docs/*.md resolves
 #   (b) every CONVERTFLOW_* variable read by internal/config/config.go has a row in the configuration table ("### Variables")
 #       of docs/operations.md (a mention elsewhere does not count), and every
-#       CONVERTFLOW_* name used anywhere in those documents exists (config.go, or a ${CONVERTFLOW_...} variable of compose.yaml)
+#       CONVERTFLOW_* name used anywhere in those documents exists (config.go, or a ${CONVERTFLOW_...} variable of compose*.yaml)
 #   (c) every route (method + path) of the OpenAPI document internal/api/openapi.json appears in a heading or a code span of docs/api.md
 # Usage: scripts/check-docs.sh [--self-test]
 set -euo pipefail
@@ -30,7 +30,9 @@ if [ "${1:-}" = "--self-test" ]; then
   done
   # things that are correctly documented must NOT be reported
   for nowant in "table of docs/operations.md: CONVERTFLOW_LISTEN" "code span: GET /healthz" "code span: POST /api/v1/jobs"; do
-    ! grep -qF "$nowant" <<<"$out" || { echo "SELF-TEST FAIL: false positive: $nowant"; bad=1; }
+    # whole-line suffix match: "POST /api/v1/jobs" must not match the report for "POST /api/v1/jobs/{id}/complete"
+    ! awk -v s="$nowant" 'length($0) >= length(s) && substr($0, length($0) - length(s) + 1) == s { f = 1 } END { exit !f }' <<<"$out" \
+      || { echo "SELF-TEST FAIL: false positive: $nowant"; bad=1; }
   done
   [ "$bad" = 0 ] && echo "self-test ok: all seeded defects were reported"
   exit "$bad"
@@ -94,7 +96,9 @@ for d in docs:
 # (b) environment variables
 cfg = read("internal/config/config.go")
 code_vars = set(re.findall(r'"(CONVERTFLOW_[A-Z][A-Z0-9_]*)"', cfg))
-compose_vars = set(re.findall(r"\$\{(CONVERTFLOW_[A-Z][A-Z0-9_]*)", read("compose.yaml")))
+compose_vars = set()
+for c in sorted(f for f in os.listdir(root) if re.fullmatch(r"compose(\.[a-z0-9-]+)?\.yaml", f)):
+    compose_vars |= set(re.findall(r"\$\{(CONVERTFLOW_[A-Z][A-Z0-9_]*)", read(c)))
 ops = read("docs/operations.md") if os.path.exists(os.path.join(root, "docs/operations.md")) else ""
 # only rows of the table under "### Variables" count: `| `CONVERTFLOW_X` | ... |`
 sec = re.search(r"^###[ \t]+Variables[ \t]*$(.*?)(?=^#{1,3}[ \t]|\Z)", ops, flags=re.S | re.M)

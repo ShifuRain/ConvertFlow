@@ -3,7 +3,10 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,7 +43,48 @@ type Config struct {
 	MaxQueuedJobs        int   // queued+probing+running jobs; excess uploads get 503
 	MinFreeBytes         int64 // free space required on the data volume; below it uploads get 507
 	MaxSSEStreams        int   // simultaneous progress streams; excess get 503
+
+	// Storage selects where job inputs and outputs live: StorageLocal (DataDir) or StorageS3.
+	Storage string
+	// S3 is the object store configuration; only read (and validated) when Storage is StorageS3.
+	S3 S3Config
 }
+
+// Storage backends.
+const (
+	StorageLocal = "local"
+	StorageS3    = "s3"
+)
+
+// MaxPresignTTL caps how long a presigned upload or download URL stays valid.
+const MaxPresignTTL = time.Hour
+
+// S3Config configures the S3-compatible object store.
+type S3Config struct {
+	Endpoint       string        // host:port the api and worker connect to
+	PublicEndpoint string        // scheme://host[:port] browsers reach; presigned URLs are signed for it
+	Bucket         string        // must exist; it is never created
+	Region         string        // signing region
+	UseSSL         bool          // TLS to Endpoint
+	PathStyle      bool          // path-style (true) or virtual-host-style bucket addressing
+	PresignTTL     time.Duration // lifetime of presigned URLs (1s..1h)
+	AccessKey      Secret
+	SecretKey      Secret
+}
+
+// Secret holds a credential. Its String and GoString forms are redacted, so a config printed with
+// %v, %+v or %#v (for example in a log line or a test failure) never shows the value.
+type Secret string
+
+func (Secret) String() string   { return "[redacted]" }
+func (Secret) GoString() string { return `"[redacted]"` }
+
+// Value returns the secret itself.
+func (s Secret) Value() string { return string(s) }
+
+// bucketName follows the S3 bucket naming rules (3-63 chars, lowercase letters, digits, dots and
+// hyphens, starting and ending with a letter or digit).
+var bucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 
 func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Config, error) {
 	var firstErr error
@@ -132,7 +176,121 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	if c.DatabaseURL == "" {
 		fail("CONVERTFLOW_DATABASE_URL or CONVERTFLOW_DATABASE_URL_FILE is required")
 	}
+
+	boolean := func(key string, def bool) bool {
+		v := getenv(key)
+		if v == "" {
+			return def
+		}
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			fail("%s must be true or false, got %q", key, v)
+			return def
+		}
+		return b
+	}
+	secretFile := func(key string) Secret {
+		f := getenv(key)
+		if f == "" {
+			fail("%s is required when CONVERTFLOW_STORAGE=s3", key)
+			return ""
+		}
+		b, err := readFile(f)
+		if err != nil {
+			fail("reading %s: %v", key, err) // the path is the operator's; the content is never printed
+			return ""
+		}
+		v := strings.TrimSpace(string(b))
+		if v == "" {
+			fail("%s names an empty file", key)
+		}
+		return Secret(v)
+	}
+	c.Storage = str("CONVERTFLOW_STORAGE", StorageLocal)
+	// Credentials are only accepted from files: an environment value would be visible in the
+	// process environment and in container inspect output.
+	for _, k := range []string{"CONVERTFLOW_S3_ACCESS_KEY", "CONVERTFLOW_S3_SECRET_KEY"} {
+		if getenv(k) != "" {
+			fail("%s is not supported; put the value in a file and set %s_FILE", k, k)
+		}
+	}
+	switch c.Storage {
+	case StorageLocal:
+	case StorageS3:
+		s3 := S3Config{
+			Endpoint:   getenv("CONVERTFLOW_S3_ENDPOINT"),
+			Bucket:     getenv("CONVERTFLOW_S3_BUCKET"),
+			Region:     str("CONVERTFLOW_S3_REGION", "us-east-1"),
+			UseSSL:     boolean("CONVERTFLOW_S3_USE_SSL", true),
+			PathStyle:  boolean("CONVERTFLOW_S3_PATH_STYLE", true),
+			PresignTTL: dur("CONVERTFLOW_S3_PRESIGN_TTL", 15*time.Minute),
+		}
+		if err := validEndpoint(s3.Endpoint); err != nil {
+			fail("CONVERTFLOW_S3_ENDPOINT: %v", err)
+		}
+		scheme := "https://"
+		if !s3.UseSSL {
+			scheme = "http://"
+		}
+		s3.PublicEndpoint = str("CONVERTFLOW_S3_PUBLIC_ENDPOINT", scheme+s3.Endpoint)
+		if err := validPublicEndpoint(s3.PublicEndpoint); err != nil {
+			fail("CONVERTFLOW_S3_PUBLIC_ENDPOINT: %v", err)
+		}
+		s3.PublicEndpoint = strings.TrimSuffix(s3.PublicEndpoint, "/")
+		if !bucketName.MatchString(s3.Bucket) || strings.Contains(s3.Bucket, "..") {
+			fail("CONVERTFLOW_S3_BUCKET must be a valid S3 bucket name, got %q", s3.Bucket)
+		}
+		if strings.ContainsAny(s3.Region, " /\\") {
+			fail("CONVERTFLOW_S3_REGION is not a valid region name: %q", s3.Region)
+		}
+		if s3.PresignTTL > MaxPresignTTL || s3.PresignTTL < time.Second {
+			fail("CONVERTFLOW_S3_PRESIGN_TTL must be between 1s and %s, got %s", MaxPresignTTL, s3.PresignTTL)
+		}
+		s3.AccessKey = secretFile("CONVERTFLOW_S3_ACCESS_KEY_FILE")
+		s3.SecretKey = secretFile("CONVERTFLOW_S3_SECRET_KEY_FILE")
+		c.S3 = s3
+	default:
+		fail("CONVERTFLOW_STORAGE must be %q or %q, got %q", StorageLocal, StorageS3, c.Storage)
+	}
 	return c, firstErr
+}
+
+// validEndpoint accepts host:port or host (no scheme, path or credentials).
+func validEndpoint(ep string) error {
+	if ep == "" {
+		return fmt.Errorf("required when CONVERTFLOW_STORAGE=s3")
+	}
+	if strings.Contains(ep, "://") || strings.ContainsAny(ep, "/@?# ") {
+		return fmt.Errorf("must be host or host:port without scheme or path, got %q", ep)
+	}
+	host := ep
+	if h, p, err := net.SplitHostPort(ep); err == nil {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid port in %q", ep)
+		}
+		host = h
+	} else if strings.Count(ep, ":") > 0 {
+		return fmt.Errorf("must be host or host:port, got %q", ep)
+	}
+	if host == "" {
+		return fmt.Errorf("missing host in %q", ep)
+	}
+	return nil
+}
+
+// validPublicEndpoint accepts an http(s) base URL without path, query, fragment or credentials.
+func validPublicEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q", raw)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("must start with http:// or https://, got %q", raw)
+	}
+	if u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return fmt.Errorf("must be scheme://host[:port] without path, query or credentials, got %q", raw)
+	}
+	return validEndpoint(u.Host)
 }
 
 // Absolutize makes every filesystem path of the configuration absolute, so later working-directory

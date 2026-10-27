@@ -1,0 +1,99 @@
+# S3 storage profile, FOR DEVELOPMENT AND TESTS ONLY. Layered on top of compose.yaml:
+#   scripts/gen-secrets.sh                                     # also creates the s3_* secrets
+#   docker compose -f compose.yaml -f compose.s3.yaml up -d s3 # the store first
+#   scripts/s3-bootstrap.sh --minio-users                      # bucket, lifecycle, least-privilege api/worker users
+#   docker compose -f compose.yaml -f compose.s3.yaml up -d    # api and worker
+# (with podman: `podman compose ...` and CONTAINER_RUNTIME=podman for the script). See docs/on-demand.md.
+#
+# The s3 service is MinIO (AGPL-3.0; a Chainguard source rebuild, because the official images are no longer
+# published) used as a local stand-in for an S3 service. This project does not distribute it: it is not part of any
+# image, release or the air-gap bundle. Production deployments point the CONVERTFLOW_S3_* variables at their own S3
+# service, with TLS (docs/on-demand.md, docs/security.md).
+#
+# Browsers post uploads straight to the store and follow presigned download redirects to it, so the store's port is
+# published on 127.0.0.1 only (CONVERTFLOW_S3_PORT) and CONVERTFLOW_S3_PUBLIC_ENDPOINT names that address. MinIO has no
+# bucket CORS: MINIO_API_CORS_ALLOW_ORIGIN allows only the UI origin(s). Open the UI at exactly one of those origins
+# (default http://127.0.0.1:8080); http://localhost:8080 is a different origin and needs CONVERTFLOW_S3_CORS_ORIGINS.
+#
+# api and worker no longer mount the shared media volume. The worker keeps a tmpfs scratch that must hold one input and
+# one output at a time, so it is sized for CONVERTFLOW_MAX_UPLOAD_BYTES + CONVERTFLOW_MAX_OUTPUT_BYTES (1 GiB + 2 GiB by
+# default in this profile); tmpfs pages count against the container memory limit, which is raised to match. Raise all
+# four together, or mount a disk-backed volume at /tmp, for larger files.
+
+services:
+  s3:
+    image: cgr.dev/chainguard/minio@sha256:1011b924d7399cb10cb41c4d555bb858975ae0c0790bbdc54e1ad724e5613eb3
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    ulimits:
+      core: {soft: 0, hard: 0}
+      nofile: {soft: 4096, hard: 8192}
+    command: ["server", "/data", "--address", ":9000", "--certs-dir", "/tmp/certs"]
+    environment:
+      # names of files under /run/secrets
+      MINIO_ROOT_USER_FILE: s3_root_user
+      MINIO_ROOT_PASSWORD_FILE: s3_root_password
+      MINIO_BROWSER: "off"
+      MINIO_API_CORS_ALLOW_ORIGIN: ${CONVERTFLOW_S3_CORS_ORIGINS:-http://127.0.0.1:${CONVERTFLOW_PORT:-8080}}
+    secrets: [s3_root_user, s3_root_password]
+    volumes: ["s3data:/data"]
+    tmpfs: ["/tmp:size=64m"]
+    # backend (internal) for api and worker; s3edge only because a port cannot be published from an internal network
+    networks: [backend, s3edge]
+    ports: ["127.0.0.1:${CONVERTFLOW_S3_PORT:-9000}:9000"]   # browsers reach the store here
+    pids_limit: 512
+    mem_limit: 1g
+    cpus: 1.0
+    healthcheck:
+      # no curl in the image: a plain HTTP request with bash builtins
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r _ code _ <&3 && [ \"$$code\" = 200 ]"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    depends_on: {s3: {condition: service_healthy}}
+    environment: &s3-env
+      CONVERTFLOW_STORAGE: s3
+      CONVERTFLOW_S3_ENDPOINT: s3:9000
+      CONVERTFLOW_S3_USE_SSL: "false"   # store traffic stays on the internal backend network of this host
+      CONVERTFLOW_S3_PUBLIC_ENDPOINT: ${CONVERTFLOW_S3_PUBLIC_ENDPOINT:-http://127.0.0.1:${CONVERTFLOW_S3_PORT:-9000}}
+      CONVERTFLOW_S3_BUCKET: ${CONVERTFLOW_S3_BUCKET:-convertflow}
+      CONVERTFLOW_S3_PRESIGN_TTL: ${CONVERTFLOW_S3_PRESIGN_TTL:-15m}
+      CONVERTFLOW_MAX_UPLOAD_BYTES: ${CONVERTFLOW_MAX_UPLOAD_BYTES:-1073741824}
+      CONVERTFLOW_MAX_OUTPUT_BYTES: ${CONVERTFLOW_MAX_OUTPUT_BYTES:-2147483648}
+      CONVERTFLOW_S3_ACCESS_KEY_FILE: /run/secrets/s3_api_access_key
+      CONVERTFLOW_S3_SECRET_KEY_FILE: /run/secrets/s3_api_secret_key
+    secrets: !override [database_url, s3_api_access_key, s3_api_secret_key]
+    volumes: !reset []
+
+  worker:
+    depends_on: {s3: {condition: service_healthy}}
+    environment:
+      <<: *s3-env
+      CONVERTFLOW_S3_ACCESS_KEY_FILE: /run/secrets/s3_worker_access_key
+      CONVERTFLOW_S3_SECRET_KEY_FILE: /run/secrets/s3_worker_secret_key
+    secrets: !override [database_url, s3_worker_access_key, s3_worker_secret_key]
+    volumes: !reset []
+    tmpfs: !override ["/tmp:size=3g,mode=1777"]
+    mem_limit: 6g
+
+networks:
+  s3edge: {}
+
+volumes:
+  s3data: {}
+
+secrets:
+  s3_root_user: {file: ./secrets/s3_root_user}               # store administrator (s3 container, scripts/s3-bootstrap.sh)
+  s3_root_password: {file: ./secrets/s3_root_password}
+  s3_api_access_key: {file: ./secrets/s3_api_access_key}     # least-privilege store user of the api
+  s3_api_secret_key: {file: ./secrets/s3_api_secret_key}
+  s3_worker_access_key: {file: ./secrets/s3_worker_access_key}  # least-privilege store user of the worker
+  s3_worker_secret_key: {file: ./secrets/s3_worker_secret_key}

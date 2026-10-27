@@ -15,6 +15,9 @@
 # real deployment and its volumes are safe. `down -v` is refused for any other project name.
 # COMPOSE_FILES may list extra "-f file" arguments (used to demonstrate that a weakened config fails).
 #   tests/container/hardening.sh --self-test   runs the weakened config and asserts the test FAILS.
+# HARDENING_PROFILE=s3 checks the S3 storage profile (compose.yaml + compose.s3.yaml, project convertflow-hardening-s3):
+# the same rules plus the s3 store service, which is bootstrapped with scripts/s3-bootstrap.sh --minio-users before the
+# api and worker start.
 set -euo pipefail
 SELF=$(readlink -f "${BASH_SOURCE[0]}")   # absolute, resolved before any cd
 cd "$(dirname "$SELF")/../.."
@@ -48,14 +51,22 @@ if [ "${1:-}" = "--self-test" ]; then
   [ "$bad" = 0 ] && echo "self-test ok: weakened config is rejected for the expected reasons"
   exit "$bad"
 fi
+PROFILE=${HARDENING_PROFILE:-local}
+case "$PROFILE" in local|s3) ;; *) echo "HARDENING_PROFILE must be local or s3" >&2; exit 2 ;; esac
 PROJECT=convertflow-hardening
 export CONVERTFLOW_PORT=${CONVERTFLOW_HARDENING_PORT:-18081}
+if [ "$PROFILE" = s3 ]; then
+  PROJECT=convertflow-hardening-s3
+  export CONVERTFLOW_S3_PORT=${CONVERTFLOW_HARDENING_S3_PORT:-18091}
+fi
 safe_down() {
   case "$PROJECT" in convertflow-hardening*) ;; *) echo "refusing down -v for project $PROJECT" >&2; return 1 ;; esac
   $RT compose -p "$PROJECT" "${CF[@]}" down -v >/dev/null 2>&1 || true
 }
 # shellcheck disable=SC2206
 CF=(-f compose.yaml ${COMPOSE_FILES:-})
+[ "$PROFILE" = s3 ] && CF+=(-f compose.s3.yaml)
+SERVICES=(db api worker); [ "$PROFILE" = s3 ] && SERVICES+=(s3)
 fail=0
 check() { if ! eval "$2"; then echo "FAIL: $1"; fail=1; else echo "ok:   $1"; fi; }
 
@@ -88,12 +99,30 @@ check "worker is only on the backend network" \
   "jq -e '.services.worker.networks | keys == [\"backend\"]' <<<\"\$CFG\" >/dev/null"
 check "db is only on the backend network" \
   "jq -e '.services.db.networks | keys == [\"backend\"]' <<<\"\$CFG\" >/dev/null"
-check "only the api publishes ports, on loopback by default" \
-  "jq -e '([.services | to_entries[] | select(.key != \"api\") | .value.ports // [] | length] | add // 0) == 0 and (.services.api.ports | length == 1 and all(.host_ip == \"127.0.0.1\"))' <<<\"\$CFG\" >/dev/null"
+if [ "$PROFILE" = s3 ]; then
+  check "only the api and the s3 store publish ports, each one port on loopback" \
+    "jq -e '([.services | to_entries[] | select(.key != \"api\" and .key != \"s3\") | .value.ports // [] | length] | add // 0) == 0 and ([.services.api, .services.s3] | all(.ports | length == 1 and all(.host_ip == \"127.0.0.1\")))' <<<\"\$CFG\" >/dev/null"
+else
+  check "only the api publishes ports, on loopback by default" \
+    "jq -e '([.services | to_entries[] | select(.key != \"api\") | .value.ports // [] | length] | add // 0) == 0 and (.services.api.ports | length == 1 and all(.host_ip == \"127.0.0.1\"))' <<<\"\$CFG\" >/dev/null"
+fi
 check "secrets are passed as files, not environment" \
-  "! jq -e '.services | to_entries | any(.value.environment // {} | to_entries | any(.key | test(\"PASSWORD$|DATABASE_URL$\")))' <<<\"\$CFG\" >/dev/null"
-check "api and worker mount only the connection URL secret, not the database passwords" \
-  "jq -e '[.services.api, .services.worker] | all([.secrets[].source] == [\"database_url\"])' <<<\"\$CFG\" >/dev/null"
+  "! jq -e '.services | to_entries | any(.value.environment // {} | to_entries | any(.key | test(\"PASSWORD$|DATABASE_URL$|SECRET_KEY$|ACCESS_KEY$|ROOT_USER$\")))' <<<\"\$CFG\" >/dev/null"
+if [ "$PROFILE" = s3 ]; then
+  check "api and worker mount only the connection URL and their own store credential; the store only its admin credential" \
+    "jq -e '([.services.api.secrets[].source] == [\"database_url\",\"s3_api_access_key\",\"s3_api_secret_key\"]) and ([.services.worker.secrets[].source] == [\"database_url\",\"s3_worker_access_key\",\"s3_worker_secret_key\"]) and ([.services.s3.secrets[].source] == [\"s3_root_user\",\"s3_root_password\"])' <<<\"\$CFG\" >/dev/null"
+  check "api and worker use s3 storage with separate credentials and no shared media volume" \
+    "jq -e '[.services.api, .services.worker] | all(.environment.CONVERTFLOW_STORAGE == \"s3\" and ((.volumes // []) | length == 0)) and (.[0].environment.CONVERTFLOW_S3_ACCESS_KEY_FILE != .[1].environment.CONVERTFLOW_S3_ACCESS_KEY_FILE)' <<<\"\$CFG\" >/dev/null"
+  check "api and worker share the upload and output size limits" \
+    "jq -e '[.services.api.environment, .services.worker.environment] | map({u:.CONVERTFLOW_MAX_UPLOAD_BYTES,o:.CONVERTFLOW_MAX_OUTPUT_BYTES}) | .[0] == .[1] and .[0].u != null and .[0].o != null' <<<\"\$CFG\" >/dev/null"
+  check "worker tmpfs scratch holds one input and one output (size >= MAX_UPLOAD_BYTES + MAX_OUTPUT_BYTES) within its memory limit" \
+    "jq -e '.services.worker as \$w | (\$w.tmpfs[] | select(startswith(\"/tmp:\")) | capture(\"size=(?<n>[0-9]+)(?<u>[kmgKMG]?)\")) as \$t | ((\$t.n | tonumber) * ({\"\":1,\"k\":1024,\"m\":1048576,\"g\":1073741824}[\$t.u | ascii_downcase])) as \$sz | (\$sz >= ((\$w.environment.CONVERTFLOW_MAX_UPLOAD_BYTES | tonumber) + (\$w.environment.CONVERTFLOW_MAX_OUTPUT_BYTES | tonumber))) and ((\$w.mem_limit | tostring | tonumber) > \$sz)' <<<\"\$CFG\" >/dev/null"
+  check "s3 store is only on the internal backend network and its own port-publishing network" \
+    "jq -e '(.services.s3.networks | keys | sort) == [\"backend\",\"s3edge\"] and (.services.s3.user | startswith(\"65532\"))' <<<\"\$CFG\" >/dev/null"
+else
+  check "api and worker mount only the connection URL secret, not the database passwords" \
+    "jq -e '[.services.api, .services.worker] | all([.secrets[].source] == [\"database_url\"])' <<<\"\$CFG\" >/dev/null"
+fi
 check "db init scripts are mounted read-only into /docker-entrypoint-initdb.d" \
   "jq -e '.services.db.volumes | any(.target == \"/docker-entrypoint-initdb.d\" and .read_only == true)' <<<\"\$CFG\" >/dev/null"
 check "database_url secret connects as the application role, not the bootstrap superuser" \
@@ -119,12 +148,18 @@ if [ "${HARDENING_SELFTEST:-}" = 1 ]; then  # test-only overrides, inert unless 
   RT_KIND=podman; RT_MAJOR=${HARDENING_SELFTEST_MAJOR:-$RT_MAJOR}
 fi
 echo "info: runtime $RT_KIND major ${RT_MAJOR:-?}"
+if [ "$PROFILE" = s3 ]; then
+  # the store first: the api refuses to start without its bucket
+  FFMPEG_FLAVOR=$FLAVOR $RT compose -p "$PROJECT" "${CF[@]}" up -d --no-build --wait --wait-timeout 120 s3 >/dev/null 2>&1 || true
+  check "s3 bootstrap (bucket, lifecycle, least-privilege users) succeeds" \
+    "CONTAINER_RUNTIME=$RT S3_ADMIN_URL=http://127.0.0.1:$CONVERTFLOW_S3_PORT scripts/s3-bootstrap.sh --minio-users >/dev/null"
+fi
 FFMPEG_FLAVOR=$FLAVOR $RT compose -p "$PROJECT" "${CF[@]}" up -d --no-build --wait --wait-timeout 120 >/dev/null 2>&1 || true
 
 cid() { $RT ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=$1" | head -n1; }
 status() { grep -E "^$2:" "/proc/$1/status" | awk '{print $2}'; }
 
-for svc in db api worker; do
+for svc in "${SERVICES[@]}"; do
   id=$(cid "$svc")
   check "$svc container is running" "[ -n \"$id\" ] && [ \"\$($RT inspect $id --format '{{.State.Running}}')\" = true ]"
   [ -n "$id" ] || continue
@@ -155,12 +190,19 @@ for svc in db api worker; do
     "! $RT inspect $id --format '{{json .Config.Env}}' | grep -qF \"\$(cat secrets/db_password)\""
   check "$svc environment contains no application database password" \
     "! $RT inspect $id --format '{{json .Config.Env}}' | grep -qF \"\$(cat secrets/db_app_password)\""
+  if [ "$PROFILE" = s3 ]; then
+    for sf in s3_root_password s3_api_secret_key s3_worker_secret_key; do
+      check "$svc environment contains no object store secret ($sf)" \
+        "! $RT inspect $id --format '{{json .Config.Env}}' | grep -qF \"\$(cat secrets/$sf)\""
+    done
+  fi
   check "$svc has no host mounts other than /run/secrets files" \
     "! $RT inspect $id --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Destination}}{{println}}{{end}}{{end}}' | grep -v '^/run/secrets/' | grep -vx '/docker-entrypoint-initdb.d' | grep -q ."
 done
 
 # Shell-based behavioural checks (db and worker images contain a shell; the distroless API does not).
-for svc in db worker; do
+shells=(db worker); [ "$PROFILE" = s3 ] && shells+=(s3)
+for svc in "${shells[@]}"; do
   id=$(cid "$svc"); [ -n "$id" ] || continue
   check "$svc: writing to the root filesystem fails" "! $RT exec $id sh -c 'touch /hardening-probe 2>/dev/null'"
 done
@@ -209,6 +251,15 @@ if [ -n "$aid" ]; then
   check "api: published port bound to 127.0.0.1 only" \
     "[ \"\$($RT inspect $aid --format '{{json .NetworkSettings.Ports}}' | jq -r '[.[]? // empty | .[]? | (.HostIp // .HostIP // \"?\")] | join(\" \")')\" = 127.0.0.1 ]"
   check "api: image has no shell" "! $RT exec $aid /bin/sh -c true >/dev/null 2>&1"
+fi
+sid=$(cid s3)
+if [ "$PROFILE" = s3 ] && [ -n "$sid" ]; then
+  check "s3: published port bound to 127.0.0.1 only" \
+    "[ \"\$($RT inspect $sid --format '{{json .NetworkSettings.Ports}}' | jq -r '[.[]? // empty | .[]? | (.HostIp // .HostIP // \"?\")] | join(\" \")')\" = 127.0.0.1 ]"
+  check "s3: anonymous requests cannot list the bucket or read objects (403)" \
+    "[ \"\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$CONVERTFLOW_S3_PORT/convertflow/)\" = 403 ] && [ \"\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$CONVERTFLOW_S3_PORT/convertflow/in/x)\" = 403 ]"
+  check "api and worker have no media volume mounted at /data" \
+    "! $RT inspect \$(cid api) \$(cid worker) --format '{{range .Mounts}}{{.Destination}}{{println}}{{end}}' | grep -qx /data"
 fi
 bn=$($RT network ls --format '{{.Name}}' | grep -E "^${PROJECT}_backend$" | head -n1 || true)
 check "runtime backend network is internal" "[ \"\$($RT network inspect $bn --format '{{.Internal}}')\" = true ]"

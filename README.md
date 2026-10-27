@@ -91,6 +91,7 @@ Run the tests with `scripts/test-db.sh` (starts a throwaway PostgreSQL container
 
 - [docs/operations.md](docs/operations.md) - configuration reference, TLS and reverse proxy, scaling, upgrades, backup, monitoring, logging and audit events, troubleshooting
 - [docs/api.md](docs/api.md) - automation guide for the REST API
+- [docs/on-demand.md](docs/on-demand.md) - S3-compatible storage with direct browser uploads (`CONVERTFLOW_STORAGE=s3`), bucket setup, the dev/test profile `compose.s3.yaml`
 - [docs/security.md](docs/security.md) - threat model, what is and is not protected; vulnerability reporting in [SECURITY.md](SECURITY.md)
 - [docs/grundschutz-mapping.md](docs/grundschutz-mapping.md) - IT-Grundschutz Bausteine mapping (Kompendium Edition 2023)
 - [docs/risk-acceptance-template.md](docs/risk-acceptance-template.md) - risk acceptance template for the missing authentication (German and English)

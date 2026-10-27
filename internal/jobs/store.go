@@ -20,14 +20,14 @@ type Store struct{ pool *pgxpool.Pool }
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 const jobCols = `id::text, status, filename, input_path, output_path, options, progress, encoder_used,
- probe, error, attempts, worker_id, cancel_requested, created_at, updated_at, finished_at`
+ probe, error, attempts, worker_id, cancel_requested, created_at, updated_at, finished_at, coalesce(declared_size, 0)`
 
 func scanJob(row pgx.Row) (*Job, error) {
 	var j Job
 	var opts []byte
 	err := row.Scan(&j.ID, &j.Status, &j.Filename, &j.InputPath, &j.OutputPath, &opts, &j.Progress,
 		&j.EncoderUsed, &j.Probe, &j.Error, &j.Attempts, &j.WorkerID, &j.CancelRequested,
-		&j.CreatedAt, &j.UpdatedAt, &j.FinishedAt)
+		&j.CreatedAt, &j.UpdatedAt, &j.FinishedAt, &j.DeclaredSize)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -40,15 +40,57 @@ func scanJob(row pgx.Row) (*Job, error) {
 	return &j, nil
 }
 
+// Create inserts a job as queued, or as uploading when j.Status is StatusUploading (a presigned
+// upload; j.DeclaredSize is recorded when positive).
 func (s *Store) Create(ctx context.Context, j *Job) error {
 	opts, err := json.Marshal(j.Options)
 	if err != nil {
 		return err
 	}
+	status := StatusQueued
+	if j.Status == StatusUploading {
+		status = StatusUploading
+	}
+	var declared *int64
+	if j.DeclaredSize > 0 {
+		declared = &j.DeclaredSize
+	}
 	_, err = s.pool.Exec(ctx,
-		`INSERT INTO jobs (id, status, filename, input_path, options) VALUES ($1::uuid, 'queued', $2, $3, $4)`,
-		j.ID, j.Filename, j.InputPath, opts)
+		`INSERT INTO jobs (id, status, filename, input_path, options, declared_size) VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
+		j.ID, string(status), j.Filename, j.InputPath, opts, declared)
 	return err
+}
+
+// MarkUploaded queues an uploading job. ErrNotFound means the job is gone or no longer uploading
+// (already completed, deleted, or expired by the janitor).
+func (s *Store) MarkUploaded(ctx context.Context, id string) error {
+	return s.guarded(ctx, `UPDATE jobs SET status = 'queued', updated_at = now() WHERE id = $1::uuid AND status = 'uploading'`, id)
+}
+
+// ErrUploadExpired is the error stored on jobs whose presigned upload was never completed.
+const ErrUploadExpired = "upload was not completed in time"
+
+// ExpireUploading fails jobs that have been uploading for longer than maxAge (their upload form has
+// long expired) in one guarded statement and returns their ids and input locators, so the caller
+// can remove whatever was uploaded.
+func (s *Store) ExpireUploading(ctx context.Context, maxAge time.Duration) ([]Job, error) {
+	rows, err := s.pool.Query(ctx, `
+UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now()
+WHERE status = 'uploading' AND updated_at < now() - make_interval(secs => $1)
+RETURNING id::text, input_path`, maxAge.Seconds(), ErrUploadExpired)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Job
+	for rows.Next() {
+		var j Job
+		if err := rows.Scan(&j.ID, &j.InputPath); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) Get(ctx context.Context, id string) (*Job, error) {
@@ -152,6 +194,14 @@ func (s *Store) MarkCanceled(ctx context.Context, id, workerID string) error {
 	return s.guarded(ctx, `UPDATE jobs SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running')`, id, workerID)
 }
 
+// ReleaseForRetry gives up a job the worker owns without a terminal write, for failures that
+// are not the job's fault (for example a storage outage): its lease is expired at once, so the
+// janitor's next RequeueStale pass requeues it, or fails it once MaxAttempts is reached, exactly
+// as if the worker had died. ErrNotFound means the lease was already lost.
+func (s *Store) ReleaseForRetry(ctx context.Context, id, workerID string) error {
+	return s.guarded(ctx, `UPDATE jobs SET heartbeat_at = '-infinity', updated_at = now() WHERE id = $1::uuid AND worker_id = $2 AND status IN ('probing','running')`, id, workerID)
+}
+
 // RequestCancel cancels a queued job immediately and flags an active one for its worker.
 func (s *Store) RequestCancel(ctx context.Context, id string) error {
 	return s.exec(ctx, `
@@ -161,10 +211,11 @@ UPDATE jobs SET cancel_requested = true, updated_at = now(),
 WHERE id = $1::uuid AND status IN ('queued','probing','running')`, id)
 }
 
-// Delete removes an idle (queued or terminal) job and returns it so callers can remove its files.
+// Delete removes an idle (uploading, queued or terminal) job and returns it so callers can remove
+// its files.
 func (s *Store) Delete(ctx context.Context, id string) (*Job, error) {
 	j, err := scanJob(s.pool.QueryRow(ctx,
-		`DELETE FROM jobs WHERE id = $1::uuid AND status IN ('queued','done','failed','canceled') RETURNING `+jobCols, id))
+		`DELETE FROM jobs WHERE id = $1::uuid AND status IN ('uploading','queued','done','failed','canceled') RETURNING `+jobCols, id))
 	if errors.Is(err, ErrNotFound) {
 		if _, gerr := s.Get(ctx, id); gerr == nil {
 			return nil, ErrBusy
@@ -261,10 +312,11 @@ func (s *Store) Counts(ctx context.Context) (map[string]int, error) {
 	return out, rows.Err()
 }
 
-// CountActive returns the number of jobs that are queued, probing or running.
+// CountActive returns the number of jobs that are uploading (presigned), queued, probing or
+// running. Uploading jobs count, so handing out upload forms is bounded by the same queue cap.
 func (s *Store) CountActive(ctx context.Context) (int, error) {
 	var n int
-	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status IN ('queued','probing','running')`).Scan(&n)
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status IN ('uploading','queued','probing','running')`).Scan(&n)
 	return n, err
 }
 

@@ -46,16 +46,18 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	bs, err := blob.NewLocalFS(cfg.DataDir) // ensures in/ and out/ exist (0700)
-	if err != nil {
-		return err
-	}
 	scratch, err := os.MkdirTemp("", "cf-scratch-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(scratch)
 	if scratch, err = filepath.Abs(scratch); err != nil {
+		return err
+	}
+	// local: ensures in/ and out/ exist (0700). s3: inputs are downloaded to and outputs written in
+	// the scratch dir; an input larger than the upload limit is refused.
+	bs, err := blob.Open(ctx, cfg, scratch, cfg.MaxUploadBytes)
+	if err != nil {
 		return err
 	}
 	host, _ := os.Hostname()
@@ -68,6 +70,6 @@ func run() error {
 		LeaseTimeout: cfg.StaleAfter,
 		JobTimeout:   cfg.JobTimeout, MaxOutputBytes: cfg.MaxOutputBytes,
 	}
-	slog.Info("worker starting", "id", w.ID, "flavor", cfg.Flavor)
+	slog.Info("worker starting", "id", w.ID, "flavor", cfg.Flavor, "storage", cfg.Storage)
 	return w.Run(ctx)
 }

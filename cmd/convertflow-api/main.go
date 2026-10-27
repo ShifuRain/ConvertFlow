@@ -51,15 +51,19 @@ func run() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	bs, err := blob.NewLocalFS(cfg.DataDir) // creates in/ and out/ (0700)
+	bs, err := blob.Open(ctx, cfg, "", 0) // local: creates in/ and out/ (0700); s3: checks the bucket
 	if err != nil {
 		return err
+	}
+	var uploadTTL time.Duration // presigned uploads exist only with S3 storage
+	if _, ok := bs.(blob.Presigner); ok {
+		uploadTTL = cfg.S3.PresignTTL
 	}
 	store := jobs.NewStore(pool)
 	al := audit.New(os.Stdout)
 	go (&janitor.Janitor{Store: store, Audit: al, Blob: bs, Retention: cfg.Retention,
 		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout, MaxQueueAge: cfg.MaxQueueAge, Flavor: cfg.Flavor,
-		Interval: time.Minute}).Run(ctx)
+		UploadTTL: uploadTTL, Interval: time.Minute}).Run(ctx)
 
 	shutdownStarted := make(chan struct{})
 	srv := &http.Server{
@@ -75,7 +79,7 @@ func run() error {
 	srv.RegisterOnShutdown(func() { close(shutdownStarted) })
 	errc := make(chan error, 1)
 	go func() {
-		slog.Info("api listening", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "")
+		slog.Info("api listening", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "", "storage", cfg.Storage)
 		if cfg.TLSCertFile != "" {
 			errc <- srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
 		} else {

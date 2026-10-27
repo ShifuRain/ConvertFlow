@@ -246,6 +246,115 @@ jobs:
           CONTAINER_RUNTIME: podman
         run: tests/container/hardening.sh --self-test
 
+  # S3 storage (CONVERTFLOW_STORAGE=s3) against a real MinIO (pinned in scripts/tool-versions.env; AGPL-3.0, used here as a
+  # test fixture only, never shipped). Pull requests and manual runs only: the code paths do not change on the push to
+  # main that merges an already tested pull request.
+  s3-integration:
+    name: S3 integration tests (MinIO)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: docker.io/library/postgres:16-bookworm@sha256:0ea6700a3b4f0ae6ce746519073558aed4d88a79d8d07622a9a644946c7319c4
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install ffmpeg and podman
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg podman uidmap
+      - name: Start MinIO (rootless podman, random throwaway credentials as files)
+        run: |
+          set -euo pipefail
+          . scripts/tool-versions.env
+          d="$RUNNER_TEMP/s3"
+          mkdir -p "$d"
+          openssl rand -hex 10 > "$d/access"
+          openssl rand -hex 20 > "$d/secret"
+          chmod 644 "$d/access" "$d/secret"   # read by uid 65532 in the container; the runner is single-tenant
+          podman run -d --name minio -p 127.0.0.1:19000:9000 -v "$d:/run/secrets:ro" \
+            -e MINIO_ROOT_USER_FILE=access -e MINIO_ROOT_PASSWORD_FILE=secret "$MINIO_IMAGE" server /data
+          for _ in $(seq 1 30); do curl -fs http://127.0.0.1:19000/minio/health/live && break; sleep 1; done
+          curl -fs http://127.0.0.1:19000/minio/health/live
+          {
+            echo "CONVERTFLOW_TEST_S3_ENDPOINT=127.0.0.1:19000"
+            echo "CONVERTFLOW_TEST_S3_ACCESS_KEY_FILE=$d/access"
+            echo "CONVERTFLOW_TEST_S3_SECRET_KEY_FILE=$d/secret"
+          } >> "$GITHUB_ENV"
+      - name: Go tests that use S3 (they skip without the variables above, so a skip here is a failure)
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -v ./internal/blob/... ./internal/janitor/... ./internal/worker/... ./internal/api/... 2>&1 | tee "$RUNNER_TEMP/s3-test.log"
+          if grep -F 'CONVERTFLOW_TEST_S3_ENDPOINT not set' "$RUNNER_TEMP/s3-test.log"; then echo "S3 tests were skipped"; exit 1; fi
+      - name: MinIO logs
+        if: failure()
+        run: podman logs --tail 100 minio
+
+  s3-stack:
+    name: S3 compose profile (rootless podman)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: build-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: images-lgpl
+          path: ${{ runner.temp }}/images
+      # Same toolchain as the hardening job (verified locally with rootless podman 6.x; the runner ships podman 4.x).
+      - name: Install jq, podman and a pinned docker-compose provider
+        env:
+          COMPOSE_VERSION: v5.5.1
+          COMPOSE_SHA256: db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman jq uidmap
+          curl -fsSL -o /tmp/docker-compose "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  /tmp/docker-compose" | sha256sum -c -
+          sudo install -m 0755 /tmp/docker-compose /usr/local/bin/docker-compose
+          podman --version
+      - name: Load the images built by the images job and pull the pinned MinIO images
+        env:
+          IMG_DIR: ${{ runner.temp }}/images
+        run: |
+          set -euo pipefail
+          . scripts/tool-versions.env
+          podman load -i "$IMG_DIR/api.tar"
+          podman load -i "$IMG_DIR/worker-lgpl.tar"
+          podman pull "$MINIO_IMAGE"
+          podman pull "$MC_IMAGE"
+      - name: Start the podman API socket for the compose provider
+        run: |
+          export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+          mkdir -p "$XDG_RUNTIME_DIR/podman"
+          nohup podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" >/tmp/podman-service.log 2>&1 &
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock" >> "$GITHUB_ENV"
+          sleep 2
+      - name: Hardening test of the s3 profile
+        env:
+          CONTAINER_RUNTIME: podman
+          HARDENING_PROFILE: s3
+        run: tests/container/hardening.sh
+      - name: End-to-end direct upload through the s3 profile (curl replay of the UI flow)
+        env:
+          CONTAINER_RUNTIME: podman
+        run: tests/container/s3.sh
+
   image-full:
     name: images (FULL flavor, manual only)
     if: github.event_name == 'workflow_dispatch' && inputs.build_full

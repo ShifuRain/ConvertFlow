@@ -29,9 +29,10 @@ Configuration is read from environment variables by `internal/config/config.go`.
 
 - **Shared anchor** (`x-shared-env`, identical for `api` and `worker`, so they cannot diverge): `CONVERTFLOW_JOB_TIMEOUT`, `CONVERTFLOW_RETENTION`, `CONVERTFLOW_STALE_AFTER`, `CONVERTFLOW_MAX_QUEUE_AGE`, `CONVERTFLOW_MAX_ATTEMPTS`, and `CONVERTFLOW_FLAVOR` (fed from `FFMPEG_FLAVOR`). The janitor runs inside the API container and applies the same windows the worker enforces. `tests/container/hardening.sh` fails if the two diverge. **Set these only through the host environment or `.env`, never separately on one service.**
 - **API only:** `CONVERTFLOW_MAX_UPLOAD_BYTES` (host-settable), `CONVERTFLOW_LISTEN` (fixed to `0.0.0.0:8080` in the container; the published host port is `${CONVERTFLOW_PORT:-8080}` on `127.0.0.1`), `CONVERTFLOW_DATABASE_URL_FILE` (fixed to the secret).
+- **S3 profile** (`compose.s3.yaml`, development and tests only, see [on-demand.md](on-demand.md)): sets `CONVERTFLOW_STORAGE=s3` and the S3 variables for api and worker with separate key files, and passes `CONVERTFLOW_S3_PUBLIC_ENDPOINT`, `CONVERTFLOW_S3_BUCKET`, `CONVERTFLOW_S3_PRESIGN_TTL`, `CONVERTFLOW_MAX_UPLOAD_BYTES` and `CONVERTFLOW_MAX_OUTPUT_BYTES` through from the host to both.
 - **Everything else** is not wired through `compose.yaml`; set it with an override file (see below). `CONVERTFLOW_DATA_DIR` is set to `/data` by both images.
 
-Compose-level variables (not read by the Go code): `CONVERTFLOW_PORT` (host port, default 8080), `CONVERTFLOW_VERSION` (image tag, default `dev`), `FFMPEG_FLAVOR` (`lgpl`|`full`, default `lgpl`), plus `FFMPEG_VERSION`/`FFMPEG_SHA256` from `docker/ffmpeg.env` for builds.
+Compose-level variables (not read by the Go code): `CONVERTFLOW_PORT` (host port, default 8080), `CONVERTFLOW_S3_PORT` (host port of the dev/test store of `compose.s3.yaml`, default 9000), `CONVERTFLOW_S3_CORS_ORIGINS` (UI origins that store accepts, default `http://127.0.0.1:${CONVERTFLOW_PORT}`), `CONVERTFLOW_VERSION` (image tag, default `dev`), `FFMPEG_FLAVOR` (`lgpl`|`full`, default `lgpl`), plus `FFMPEG_VERSION`/`FFMPEG_SHA256` from `docker/ffmpeg.env` for builds.
 
 Example override file (`compose.override.yaml` next to `compose.yaml` is picked up automatically; the file below was verified for the TLS case, see below):
 
@@ -59,7 +60,7 @@ services:
 | `CONVERTFLOW_TLS_CERT_FILE` | none | api | PEM certificate (chain). Must be set together with the key file, else start error. Enables HTTPS (TLS 1.2 minimum) and the HSTS header. |
 | `CONVERTFLOW_TLS_KEY_FILE` | none | api | PEM private key. Must be readable by uid 65532. |
 | `CONVERTFLOW_VAAPI_DEVICE` | `/dev/dri/renderD128` | worker | VAAPI render device used only if a VAAPI encoder is present and passes its trial encode. Irrelevant for the default image. |
-| `CONVERTFLOW_MAX_UPLOAD_BYTES` | `8589934592` (8 GiB) | api | Largest accepted upload; larger gets `413`. Positive integer. |
+| `CONVERTFLOW_MAX_UPLOAD_BYTES` | `8589934592` (8 GiB) | api; worker with `s3` storage | Largest accepted upload; larger gets `413`. Positive integer. With `s3` storage it also caps the presigned upload form and the worker refuses a larger input, so set the same value on both (`compose.s3.yaml` does). |
 | `CONVERTFLOW_MAX_PIXELS` | `35389440` (8192x4320) | worker | Largest video frame area (width x height) accepted after probing; violation fails the job. |
 | `CONVERTFLOW_MAX_DURATION_SEC` | `21600` (6 h) | worker | Longest accepted input duration in seconds; violation fails the job. |
 | `CONVERTFLOW_MAX_STREAMS` | `16` | worker | Maximum number of streams in the input; violation fails the job. |
@@ -75,6 +76,18 @@ services:
 | `CONVERTFLOW_MAX_QUEUED_JOBS` | `100` | api | Maximum active jobs (queued + probing + running); excess uploads get `503`. |
 | `CONVERTFLOW_MIN_FREE_BYTES` | 2 x `MAX_UPLOAD_BYTES` (16 GiB by default) | api | Free space required on the data volume before an upload is accepted (plus the announced upload size when the client sends `Content-Length`); below it uploads get `507`. Default leaves room for one maximum-size upload and a similarly sized output. |
 | `CONVERTFLOW_MAX_SSE_STREAMS` | `64` | api | Simultaneous progress streams; excess get `503`. |
+| `CONVERTFLOW_STORAGE` | `local` | api, worker | Where inputs and outputs live: `local` (`CONVERTFLOW_DATA_DIR`) or `s3` (an S3-compatible bucket, configured by the S3 variables below, which are ignored in `local` mode). Anything else is a start error. |
+| `CONVERTFLOW_S3_ENDPOINT` | none | api, worker | `s3` only, required: `host` or `host:port` of the object store as reached by api and worker (no scheme, no path). |
+| `CONVERTFLOW_S3_PUBLIC_ENDPOINT` | `https://` (or `http://` without TLS) + the endpoint | api | `s3` only: `scheme://host[:port]` of the object store as reached by **browsers**; presigned upload and download URLs are signed for this host. No path. |
+| `CONVERTFLOW_S3_BUCKET` | none | api, worker | `s3` only, required: existing bucket (it is never created). S3 naming rules apply. |
+| `CONVERTFLOW_S3_REGION` | `us-east-1` | api, worker | `s3` only: signing region. |
+| `CONVERTFLOW_S3_USE_SSL` | `true` | api, worker | `s3` only: TLS to the endpoint (`true`/`false`). |
+| `CONVERTFLOW_S3_PATH_STYLE` | `true` | api, worker | `s3` only: path-style bucket addressing (`false` selects virtual-host style). |
+| `CONVERTFLOW_S3_PRESIGN_TTL` | `15m` | api (and janitor) | `s3` only: lifetime of presigned upload and download URLs, `1s` to `1h`. Uploads not completed within this time plus a grace period are failed by the janitor. |
+| `CONVERTFLOW_S3_ACCESS_KEY_FILE` | none | api, worker | `s3` only, required: file containing the access key id. |
+| `CONVERTFLOW_S3_SECRET_KEY_FILE` | none | api, worker | `s3` only, required: file containing the secret key. |
+| `CONVERTFLOW_S3_ACCESS_KEY` | not accepted | api, worker | Setting it is a start error: credentials are read from files only (`_FILE` variables). |
+| `CONVERTFLOW_S3_SECRET_KEY` | not accepted | api, worker | Setting it is a start error: credentials are read from files only (`_FILE` variables). |
 
 ### MAX_QUEUE_AGE: how long a job nobody can run is kept
 
@@ -270,6 +283,7 @@ Notes: after a restore on a different or wiped `media` volume, restored jobs ref
 - Files are removed with a plain `unlink`. There is **no secure wipe**; remnants may remain on the underlying storage until overwritten.
 - Deletion happens on `DELETE`, after finishing a job (input), at retention expiry (output and database row), and by an orphan sweep (files without a job, or superseded attempt outputs, once older than 6 h). The janitor runs every minute.
 - For stronger sanitization (BSI CON.6), put the `media` volume (and `pgdata`) on an encrypted filesystem such as LUKS and destroy the key to sanitize. Name the volume's host path explicitly in the compose file (bind mount) so you know what to encrypt. Also protect or disable swap and make sure the worker's RAM scratch (`/tmp`, tmpfs) cannot be swapped to unencrypted storage.
+- With `s3` storage the same deletions remove bucket objects instead, and the bucket's lifecycle rules ([on-demand.md](on-demand.md#setting-up-a-bucket)) are a backstop. Sanitization of the bucket's storage is the store operator's responsibility (provider-side encryption, key destruction).
 - Container logs and the database contain filenames; log rotation is `10m x 3` files per container by default.
 
 ## Monitoring

@@ -1,6 +1,6 @@
 # REST API guide
 
-The machine-readable source of truth is the OpenAPI 3.1 document served at `GET /api/openapi.json` (the UI renders it at `/docs.html`). This page is a short guide for automation. The upload, status, SSE, download, delete, presets and metrics examples were run with curl against the podman stack (rootless podman 6.1.2); the Range request is covered by the Go test `TestOutputOverRealServerLargeAndRange` and was not run with curl. `BASE` is the service URL.
+The machine-readable source of truth is the OpenAPI 3.1 document served at `GET /api/openapi.json` (the UI renders it at `/docs.html`). This page is a short guide for automation. The upload, status, SSE, download, delete, presets and metrics examples were run with curl against the podman stack (rootless podman 6.1.2); the Range request is covered by the Go test `TestOutputOverRealServerLargeAndRange` and was not run with curl. The direct-upload examples (S3 storage) were run with curl against the `compose.s3.yaml` profile (rootless podman 6.1.2, MinIO). `BASE` is the service URL.
 
 ```bash
 BASE=http://127.0.0.1:8080          # or https://... when TLS is enabled (curl --cacert ca.pem)
@@ -12,13 +12,14 @@ There is **no authentication**. State-changing requests (`POST`, `DELETE`) that 
 
 | Method and path | Purpose | Success | Notes |
 |---|---|---|---|
-| `POST /api/v1/jobs` | Upload a file and create a job | `202` + job JSON, `Location` header | multipart/form-data, see below |
+| `POST /api/v1/jobs` | Upload a file and create a job | `202` + job JSON, `Location` header | multipart/form-data, see below. S3 storage also accepts JSON and answers `201` with a presigned upload form, see [Direct upload](#direct-upload-s3-storage) |
+| `POST /api/v1/jobs/{id}/complete` | S3 storage only: queue a job after its direct upload (JSON `POST /api/v1/jobs`) | `200` + job JSON | `409` nothing uploaded, size mismatch or expired; `404` with local storage |
 | `GET /api/v1/jobs` | Most recent jobs, newest first, at most 200 | `200` | JSON array |
 | `GET /api/v1/jobs/{id}` | Status, progress, metadata | `200` | `404` for unknown or malformed ids |
 | `DELETE /api/v1/jobs/{id}` | Delete an idle job and its files, or request cancellation of an active one | `204` or `202` | see "Cancel and delete" |
 | `GET /api/v1/jobs/{id}/events` | Server-Sent Events progress stream | `200` | `503` when the stream limit is reached |
-| `GET /api/v1/jobs/{id}/output` | Download the result | `200` / `206` | Range requests supported; `409` not ready, `410` removed |
-| `GET /api/v1/presets` | Presets runnable on the currently live workers | `200` | only presets some live worker can encode (after the flavor policy) |
+| `GET /api/v1/jobs/{id}/output` | Download the result | `200` / `206` (S3 storage: `302` to a presigned URL) | Range requests supported; `409` not ready, `410` removed |
+| `GET /api/v1/presets` | Presets runnable on the currently live workers | `200` | only presets some live worker can encode (after the flavor policy); the `ConvertFlow-Upload-Mode` header says how the UI uploads |
 | `GET /api/openapi.json` | The OpenAPI document | `200` | |
 | `GET /healthz` | Liveness with a short database ping | `200` body `ok` | `503` when the database is unreachable |
 | `GET /metrics` | Prometheus metrics | `200` | see [operations.md](operations.md#monitoring) |
@@ -74,7 +75,90 @@ These are the only user-controlled parameters. They are validated against fixed 
 
 `id`, `status`, `filename` (sanitized display name), `preset`, `progress` (0-100), `encoder_used` (set once the job runs), `probe` (ffprobe summary, once probed), `error` (short sanitized message on failure), `attempts`, `created_at`, `updated_at`, `finished_at`, `output_url` (only when `done`).
 
-Status values: `queued`, `probing`, `running`, `done`, `failed`, `canceled`. `done`, `failed` and `canceled` are terminal.
+Status values: `uploading` (S3 direct upload created, not completed yet), `queued`, `probing`, `running`, `done`, `failed`, `canceled`. `done`, `failed` and `canceled` are terminal.
+
+## Direct upload (S3 storage)
+
+With `CONVERTFLOW_STORAGE=s3` ([on-demand.md](on-demand.md)) a client can send the file straight to the bucket; the API never sees the bytes. The multipart upload above keeps working as well. `GET /api/v1/presets` answers `ConvertFlow-Upload-Mode: presigned` when browsers should use this path (`multipart` otherwise, including all local-storage deployments, where a JSON `POST` answers `400`):
+
+```bash
+curl -sI $BASE/api/v1/presets | grep -i convertflow-upload-mode
+# Convertflow-Upload-Mode: presigned
+```
+
+### `POST /api/v1/jobs` with JSON
+
+Body: exactly one of `preset` or `options` (the same object as the multipart `options` field), plus `filename` (display only) and `size` (bytes, required). At most 8 KiB, unknown fields are rejected.
+
+```bash
+size=$(stat -c %s song.wav)
+curl -s -H 'Content-Type: application/json' \
+  -d "{\"preset\":\"audio-flac\",\"filename\":\"song.wav\",\"size\":$size}" $BASE/api/v1/jobs > presign.json
+jq . presign.json
+```
+
+```json
+{
+  "id": "58a2016e-a334-461c-9270-1e90e1890439",
+  "upload": {
+    "url": "http://127.0.0.1:18094/convertflow/",
+    "fields": {
+      "bucket": "convertflow",
+      "key": "in/58a2016e-a334-461c-9270-1e90e1890439",
+      "policy": "eyJleHBpcmF0aW9uIjoi...",
+      "x-amz-algorithm": "AWS4-HMAC-SHA256",
+      "x-amz-credential": "cfapiKwMRbVeysFj8Kps/20261026/us-east-1/s3/aws4_request",
+      "x-amz-date": "20261026T204053Z",
+      "x-amz-signature": "3015c6a7..."
+    }
+  },
+  "expires_at": "2026-10-26T20:55:53Z"
+}
+```
+
+The job now exists with status `uploading`. The answer is `201` with a `Location` header; the same checks as a multipart upload apply first (`503` queue full or too many uploads, `422` invalid options, `413` size over `CONVERTFLOW_MAX_UPLOAD_BYTES`, `400` missing or non-positive size). **The URL and fields are a credential** until `expires_at`: do not log or share them.
+
+### Upload to the bucket
+
+A `multipart/form-data` `POST` to `upload.url` with **every field of `upload.fields` first and the file last** (the store ignores fields after the file). Adding any other field makes the store refuse the form.
+
+```bash
+args=(); while IFS=$'\t' read -r k v; do args+=(--form-string "$k=$v"); done \
+  < <(jq -r '.upload.fields | to_entries[] | [.key, .value] | @tsv' presign.json)
+curl -s -w '%{http_code}\n' "${args[@]}" -F file=@song.wav "$(jq -r .upload.url presign.json)"
+# 204
+```
+
+The store answers with its own XML errors, for example `400 EntityTooLarge` (over the limit), `400 EntityTooSmall` (empty) or `403 AccessDenied` (expired or altered form).
+
+### `POST /api/v1/jobs/{id}/complete`
+
+Queues the job after the upload. The API checks the stored object: present, 1 byte to the limit, and exactly the declared `size`.
+
+```bash
+id=$(jq -r .id presign.json)
+curl -s -X POST $BASE/api/v1/jobs/$id/complete | jq -c '{id,status,filename}'
+# {"id":"58a2016e-a334-461c-9270-1e90e1890439","status":"queued","filename":"song.wav"}
+```
+
+It is idempotent: calling it again answers `200` with the current job. `409` means nothing was uploaded yet, the size differs from the declared one (the object is then removed; upload again while the form is valid), or the upload expired; `413`/`400` a stored object over the limit or empty; `404` an unknown job or local storage.
+
+```bash
+curl -s -X POST $BASE/api/v1/jobs/$id/complete      # after uploading 176478 bytes for a declared size of 1000
+# {"type":"about:blank","title":"Size mismatch","status":409,"detail":"The uploaded file does not have the announced size."}
+```
+
+### Download with S3 storage
+
+`GET /api/v1/jobs/{id}/output` answers `302` to a presigned GET on the store, valid for at most 5 minutes, with `Cache-Control: no-store`. The file name and type are part of the signature. Follow the redirect (`curl -L`):
+
+```bash
+curl -s -o /dev/null -D - $BASE/api/v1/jobs/$id/output | grep -iE '^(HTTP|location|cache-control)'
+# HTTP/1.1 302 Found
+# Cache-Control: no-store
+# Location: http://127.0.0.1:18094/convertflow/out/58a2016e-....1.flac?X-Amz-Algorithm=AWS4-HMAC-SHA256&...&response-content-disposition=attachment%3B%20filename%3D%22song.flac%22...
+curl -fsL -OJ $BASE/api/v1/jobs/$id/output          # saves song.flac
+```
 
 ## Status, progress and download
 
