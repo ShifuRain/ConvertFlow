@@ -337,3 +337,70 @@ func TestSecretsAreRedactedWhenPrinted(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerModeAndStallDefaults(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.WorkerOnce || c.WorkerIdleExit != 0 || c.WorkersOnDemand {
+		t.Fatalf("always-on must be the default: %+v", c)
+	}
+	if c.JobStallTimeout != 10*time.Minute || c.WorkerShutdownTimeout != 10*time.Second {
+		t.Fatalf("bad defaults: stall %s shutdown %s", c.JobStallTimeout, c.WorkerShutdownTimeout)
+	}
+}
+
+func TestWorkerModeAndStallOverrides(t *testing.T) {
+	c, err := config.Load(env(map[string]string{
+		"CONVERTFLOW_DATABASE_URL":            "postgres://x",
+		"CONVERTFLOW_WORKER_ONCE":             "true",
+		"CONVERTFLOW_WORKER_IDLE_EXIT":        "45s",
+		"CONVERTFLOW_WORKER_SHUTDOWN_TIMEOUT": "20s",
+		"CONVERTFLOW_JOB_STALL_TIMEOUT":       "0",
+		"CONVERTFLOW_WORKERS_ON_DEMAND":       "true",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.WorkerOnce || c.WorkerIdleExit != 45*time.Second || c.WorkerShutdownTimeout != 20*time.Second ||
+		c.JobStallTimeout != 0 || !c.WorkersOnDemand {
+		t.Fatalf("overrides not applied: %+v", c)
+	}
+	c, err = config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", "CONVERTFLOW_JOB_STALL_TIMEOUT": "15m"}), noFile)
+	if err != nil || c.JobStallTimeout != 15*time.Minute {
+		t.Fatalf("got %s, %v", c.JobStallTimeout, err)
+	}
+}
+
+func TestWorkerModeAndStallInvalid(t *testing.T) {
+	for name, kv := range map[string][2]string{
+		"once not bool":      {"CONVERTFLOW_WORKER_ONCE", "yes please"},
+		"idle zero":          {"CONVERTFLOW_WORKER_IDLE_EXIT", "0"},
+		"idle negative":      {"CONVERTFLOW_WORKER_IDLE_EXIT", "-5s"},
+		"idle no unit":       {"CONVERTFLOW_WORKER_IDLE_EXIT", "30"},
+		"stall negative":     {"CONVERTFLOW_JOB_STALL_TIMEOUT", "-1m"},
+		"stall garbage":      {"CONVERTFLOW_JOB_STALL_TIMEOUT", "soon"},
+		"stall too short":    {"CONVERTFLOW_JOB_STALL_TIMEOUT", "2s"},
+		"shutdown zero":      {"CONVERTFLOW_WORKER_SHUTDOWN_TIMEOUT", "0s"},
+		"shutdown too long":  {"CONVERTFLOW_WORKER_SHUTDOWN_TIMEOUT", "10m"},
+		"on demand not bool": {"CONVERTFLOW_WORKERS_ON_DEMAND", "sometimes"},
+	} {
+		_, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", kv[0]: kv[1]}), noFile)
+		if err == nil || !strings.Contains(err.Error(), kv[0]) {
+			t.Errorf("%s: want an error naming %s, got %v", name, kv[0], err)
+		}
+	}
+}
+
+func TestWorkersOnDemand(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "false": false, "true": true} {
+		c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", "CONVERTFLOW_WORKERS_ON_DEMAND": v}), noFile)
+		if err != nil || c.WorkersOnDemand != want {
+			t.Errorf("%q: got %v %v", v, c.WorkersOnDemand, err)
+		}
+	}
+	if _, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", "CONVERTFLOW_WORKERS_ON_DEMAND": "sometimes"}), noFile); err == nil {
+		t.Error("invalid value accepted")
+	}
+}

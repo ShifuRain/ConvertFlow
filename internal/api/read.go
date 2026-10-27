@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ShifuRain/convertflow/internal/blob"
+	"github.com/ShifuRain/convertflow/internal/config"
 	"github.com/ShifuRain/convertflow/internal/jobs"
 	"github.com/ShifuRain/convertflow/internal/presets"
 )
@@ -412,8 +413,16 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 
 // runnablePresets returns the presets a single live worker can run. The flavor policy is enforced
 // here too, so a stale or misconfigured worker can never widen what the API offers.
+//
+// With workers started on demand (CONVERTFLOW_WORKERS_ON_DEMAND) there is usually no live worker:
+// the presets are then those a single worker that registered within OnDemandCapabilityWindow can
+// run (workers register their encoders before claiming, also in --once mode).
 func (s *Server) runnablePresets(ctx context.Context) ([]presets.Preset, error) {
-	ws, err := s.store.LiveWorkerEncoders(ctx, liveWindow)
+	window := liveWindow
+	if s.cfg.WorkersOnDemand {
+		window = config.OnDemandCapabilityWindow
+	}
+	ws, err := s.store.LiveWorkerEncoders(ctx, window)
 	if err != nil {
 		return nil, err
 	}

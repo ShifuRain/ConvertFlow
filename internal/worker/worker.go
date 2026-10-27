@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,24 @@ var (
 	errLeaseLost     = errors.New("lease lost") // never shown: the worker aborts quietly
 )
 
+// errStalled is the message stored on a job the stall watchdog killed.
+type errStalled time.Duration
+
+func (e errStalled) Error() string {
+	return "conversion stalled (no progress for " + humanDuration(time.Duration(e)) + ")"
+}
+
+// humanDuration writes whole minutes as "N minute(s)" and anything else in Go notation.
+func humanDuration(d time.Duration) string {
+	if d >= time.Minute && d%time.Minute == 0 {
+		if n := int64(d / time.Minute); n != 1 {
+			return strconv.FormatInt(n, 10) + " minutes"
+		}
+		return "1 minute"
+	}
+	return d.String()
+}
+
 type Worker struct {
 	ID          string
 	Store       *jobs.Store
@@ -60,6 +79,14 @@ type Worker struct {
 	JobTimeout time.Duration
 	// MaxOutputBytes kills a run whose output file grows beyond it (default 16 GiB).
 	MaxOutputBytes int64
+	// StallTimeout kills and fails a run when FFmpeg reports no progress and is essentially idle
+	// for this long (see ffmpeg.RunOpts.StallTimeout). Zero disables the watchdog; JobTimeout
+	// stays the outer backstop.
+	StallTimeout time.Duration
+	// ShutdownTimeout bounds the store and blob writes after a job ended, in particular the
+	// release of an interrupted job when the worker is shut down (default 10s), so a container
+	// grace period is respected.
+	ShutdownTimeout time.Duration
 
 	// DetectEvery is the longest time between full capability detections (which run a trial
 	// encode per encoder); default 1h. FailureRedetectGap is the minimum time between two
@@ -117,15 +144,16 @@ func (w *Worker) tick(ctx context.Context) {
 	age := time.Since(w.lastDetected)
 	encs := w.encoderList
 	w.mu.RUnlock()
+	// Refresh the liveness row first, also before a full detection: its trial encodes take a while,
+	// and the janitor and API must not see the worker as gone meanwhile (issue #9).
+	if err := w.Store.UpsertWorker(ctx, w.ID, encs); err != nil && ctx.Err() == nil {
+		slog.Warn("capability refresh failed", "err", err)
+	}
 	if age >= every || (w.redetect.Load() && age >= gap) {
 		w.redetect.Store(false)
-		if err := w.RegisterCapabilities(ctx); err != nil {
+		if err := w.RegisterCapabilities(ctx); err != nil && ctx.Err() == nil {
 			slog.Warn("capability detection failed", "err", err)
 		}
-		return
-	}
-	if err := w.Store.UpsertWorker(ctx, w.ID, encs); err != nil {
-		slog.Warn("capability refresh failed", "err", err)
 	}
 }
 
@@ -141,51 +169,138 @@ func (w *Worker) snapshot() map[string]bool {
 	return w.encoders
 }
 
+// Mode selects when Run returns. The zero value is the always-on default: process jobs until ctx
+// ends.
+type Mode struct {
+	// Once claims at most one job, runs it to its end and returns. Without a claimable job Run
+	// polls (every Poll) until IdleExit has passed, then returns.
+	Once bool
+	// IdleExit makes Run return once no job was claimed for this long (measured from the start, or
+	// from the end of the last job). Zero means never; Once requires a positive value.
+	IdleExit time.Duration
+}
+
+// Ephemeral reports whether the worker exits on its own (Once or IdleExit).
+func (m Mode) Ephemeral() bool { return m.Once || m.IdleExit > 0 }
+
+// Summary describes how Run ended.
+type Summary struct {
+	// Jobs is the number of jobs claimed.
+	Jobs int
+	// Finished reports whether the last claimed job got its terminal write (done, failed or
+	// canceled). A job without one was released for retry, abandoned after a lost lease, or its
+	// terminal write failed; the janitor requeues it (or fails it once attempts are exhausted).
+	Finished bool
+	// Interrupted reports that ctx ended (a shutdown signal) while a job was running; the job was
+	// released for retry.
+	Interrupted bool
+	// IdleExit reports that Run returned because IdleExit passed without a claimable job.
+	IdleExit bool
+}
+
 // Run registers capabilities (full detection at startup), keeps the registration alive and
 // re-detects hourly or after a failed job (see tick), and processes jobs until ctx ends.
 func (w *Worker) Run(ctx context.Context) error {
-	if err := w.RegisterCapabilities(ctx); err != nil {
-		return fmt.Errorf("detecting encoders: %w", err)
+	_, err := w.RunMode(ctx, Mode{})
+	return err
+}
+
+// RunMode is Run with an exit policy (see Mode). It returns an error only when the worker cannot
+// work at all: capability detection failed, or (in an ephemeral mode) every claim attempt of the
+// idle period failed, for example because the database is unreachable.
+func (w *Worker) RunMode(ctx context.Context, m Mode) (Summary, error) {
+	var sum Summary
+	if m.Once && m.IdleExit <= 0 {
+		return sum, errors.New("once mode needs a positive idle exit")
 	}
+	if err := w.RegisterCapabilities(ctx); err != nil {
+		return sum, fmt.Errorf("detecting encoders: %w", err)
+	}
+	tickCtx, stopTick := context.WithCancel(ctx)
+	tickDone := make(chan struct{})
+	defer func() { stopTick(); <-tickDone }()
 	go func() {
+		defer close(tickDone)
 		t := time.NewTicker(capabilityTick)
 		defer t.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-tickCtx.Done():
 				return
 			case <-t.C:
-				w.tick(ctx)
+				w.tick(tickCtx)
 			}
 		}
 	}()
+	idleSince := time.Now()
+	var claimErr error // the last claim error; reset by any successful claim query
 	for ctx.Err() == nil {
-		ok, err := w.ProcessOne(ctx)
+		claimed, oc, err := w.processOne(ctx)
 		if err != nil {
+			claimErr = err
 			slog.Error("process", "err", err)
+		} else {
+			claimErr = nil
 		}
-		if !ok {
-			select {
-			case <-ctx.Done():
-			case <-time.After(w.Poll):
+		if claimed {
+			sum.Jobs++
+			sum.Finished = oc == outcomeFinished
+			if oc == outcomeInterrupted {
+				sum.Interrupted = true
+				return sum, nil
 			}
+			if m.Once {
+				return sum, nil
+			}
+			idleSince = time.Now()
+			continue
+		}
+		wait := w.Poll
+		if m.IdleExit > 0 {
+			left := m.IdleExit - time.Since(idleSince)
+			if left <= 0 {
+				sum.IdleExit = true
+				if claimErr != nil {
+					return sum, fmt.Errorf("claiming jobs: %w", claimErr)
+				}
+				return sum, nil
+			}
+			wait = min(wait, left)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
 		}
 	}
-	return nil
+	return sum, nil
 }
 
 // ProcessOne claims and processes at most one job. It reports whether a job was claimed.
 func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
+	ok, _, err := w.processOne(ctx)
+	return ok, err
+}
+
+func (w *Worker) processOne(ctx context.Context) (bool, outcome, error) {
 	j, err := w.Store.Claim(ctx, w.ID, w.claimable())
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if j == nil {
-		return false, nil
+		return false, 0, nil
 	}
-	w.process(ctx, j)
-	return true, nil
+	return true, w.process(ctx, j), nil
 }
+
+// outcome is how one claimed job ended for this worker.
+type outcome int
+
+const (
+	outcomeFinished    outcome = iota + 1 // terminal write made: done, failed or canceled
+	outcomeReleased                       // released for retry (storage failure not the job's fault)
+	outcomeInterrupted                    // shutdown while the job was active: released for retry
+	outcomeAbandoned                      // lease lost, or the terminal write failed
+)
 
 // jobState carries the out-of-band signals that classify how a run ended.
 type jobState struct {
@@ -193,7 +308,7 @@ type jobState struct {
 	lost     atomic.Bool // the store no longer lets this worker touch the job
 }
 
-func (w *Worker) process(ctx context.Context, j *jobs.Job) {
+func (w *Worker) process(ctx context.Context, j *jobs.Job) outcome {
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var st jobState
@@ -219,9 +334,10 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 		out, err = w.run(jobCtx, cancel, &st, j, inPath)
 	}
 	// Publish the finished output while the heartbeat still runs (an upload to an object store
-	// can take longer than STALE_AFTER); for the local store this is a no-op. A cancel request or
-	// a lost lease cancels jobCtx and so the upload.
+	// can take longer than STALE_AFTER); for the local store this is a no-op. A cancel request, a
+	// lost lease or a shutdown cancels jobCtx and so the upload.
 	var outLoc string
+	committed := false
 	if err == nil && jobCtx.Err() == nil {
 		cctx, ccancel := context.WithTimeout(jobCtx, w.jobTimeout())
 		outLoc, err = out.commit(cctx)
@@ -232,12 +348,17 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 				transient = transientStorageErr(err)
 			}
 			err = errInternal
+		} else {
+			committed = true
 		}
 	}
 	cancel()
 	<-watchDone
+	// From here on the heartbeat is stopped and every write is fenced by worker id and status, so
+	// a job that was requeued in the meantime is never touched.
 
-	bg, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	// The post-run writes are bounded so a shutdown finishes within a container grace period.
+	bg, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), w.shutdownTimeout())
 	defer bgCancel()
 	// dropOutput removes this attempt's output: the local file and, once committed, the stored
 	// object (per-attempt names: no other attempt's output is ever touched).
@@ -247,14 +368,22 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 			_ = w.Blob.Remove(bg, outLoc)
 		}
 	}
-	if ctx.Err() != nil { // worker shutting down: leave the job (and its input) for requeue
-		dropOutput()
-		return
-	}
 	if st.lost.Load() { // requeued, canceled or deleted behind our back: abort quietly
 		dropOutput()
 		w.Audit.System("job_lease_lost", j.ID, "worker", w.ID)
-		return
+		return outcomeAbandoned
+	}
+	// A shutdown that cut the job short (anything but a finished, published output) releases it
+	// for retry at once instead of leaving it to the janitor's stale-heartbeat requeue. A user
+	// cancel request that arrived first still wins: that is a terminal write the user asked for.
+	if ctx.Err() != nil && !st.canceled.Load() && !(err == nil && committed) {
+		dropOutput()
+		rerr := w.Store.ReleaseForRetry(bg, j.ID, w.ID)
+		w.logStoreErr("release", j.ID, rerr)
+		if rerr == nil {
+			w.Audit.System("job_released", j.ID, "worker", w.ID, "reason", "shutdown")
+		}
+		return outcomeInterrupted
 	}
 
 	if transient && !st.canceled.Load() {
@@ -266,7 +395,7 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 		if rerr == nil {
 			w.Audit.System("job_released", j.ID, "worker", w.ID, "reason", "storage_unavailable")
 		}
-		return
+		return outcomeReleased
 	}
 
 	// The input is deleted only after the fenced terminal write succeeds; if that write
@@ -284,7 +413,7 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 	case err != nil:
 		removeIf(out.path)
 		if !errors.Is(err, errTimeout) && !errors.Is(err, errOversize) && !errors.Is(err, errInternal) && !errors.Is(err, errInputTooLarge) && j.EncoderUsed != "" {
-			w.redetect.Store(true) // FFmpeg itself failed: an encoder may have stopped working
+			w.redetect.Store(true) // FFmpeg itself failed or hung: an encoder may have stopped working
 		}
 		msg := ffmpeg.Sanitize(err.Error(), w.stripPaths(j.InputPath, inPath, out.path)...)
 		werr = w.Store.Fail(bg, j.ID, w.ID, msg)
@@ -301,9 +430,11 @@ func (w *Worker) process(ctx context.Context, j *jobs.Job) {
 			dropOutput()
 		}
 	}
-	if werr == nil {
-		_ = w.Blob.Remove(bg, j.InputPath)
+	if werr != nil {
+		return outcomeAbandoned
 	}
+	_ = w.Blob.Remove(bg, j.InputPath)
+	return outcomeFinished
 }
 
 // output is an attempt's local output file and the func that publishes it to the blob store.
@@ -337,6 +468,15 @@ func (w *Worker) stripPaths(paths ...string) []string {
 // a locator the store does not own and an oversized input are permanent.
 func transientStorageErr(err error) bool {
 	return !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, blob.ErrInvalidLocator) && !errors.Is(err, blob.ErrTooLarge)
+}
+
+const defaultShutdownTimeout = 10 * time.Second
+
+func (w *Worker) shutdownTimeout() time.Duration {
+	if w.ShutdownTimeout <= 0 {
+		return defaultShutdownTimeout
+	}
+	return w.ShutdownTimeout
 }
 
 func (w *Worker) jobTimeout() time.Duration {
@@ -523,7 +663,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 		dur = pr.DurationSeconds()
 	}
 	var last time.Time
-	tail, err := ffmpeg.Run(runCtx, w.FFmpegBin, args, w.ScratchDir, dur, func(p float64) {
+	tail, err := ffmpeg.RunWith(runCtx, w.FFmpegBin, args, w.ScratchDir, ffmpeg.RunOpts{DurationSec: dur, StallTimeout: w.StallTimeout, OnProgress: func(p float64) {
 		if time.Since(last) >= time.Second {
 			last = time.Now()
 			e := w.Store.UpdateProgress(ctx, j.ID, w.ID, p)
@@ -534,7 +674,7 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 				w.logStoreErr("update_progress", j.ID, e)
 			}
 		}
-	})
+	}})
 	close(monStop)
 	<-monDone
 	if err == nil {
@@ -549,6 +689,12 @@ func (w *Worker) run(ctx context.Context, cancel context.CancelFunc, st *jobStat
 		return out, ctx.Err()
 	case oversize.Load():
 		return out, errOversize
+	case errors.Is(err, ffmpeg.ErrStalled):
+		// The stderr tail goes to the operator log only (sanitized like a stored message); the
+		// user sees the fixed stall message.
+		slog.Warn("ffmpeg stalled; job failed", "job_id", j.ID, "worker", w.ID, "stall_timeout", w.StallTimeout,
+			"stderr_tail", ffmpeg.Sanitize(tail, w.stripPaths(j.InputPath, inPath, outPath)...))
+		return out, errStalled(w.StallTimeout)
 	case err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return out, errTimeout
 	case err != nil:

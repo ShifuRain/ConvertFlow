@@ -830,3 +830,38 @@ func TestShutdownDoesNotCutInFlightUpload(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 }
+
+// With workers started on demand (scale to zero) no worker is live most of the time: presets come
+// from registrations within OnDemandCapabilityWindow, so uploads are still accepted. Without the
+// setting, the same stale registration offers nothing.
+func TestPresetsFromRecentRegistrationsWhenWorkersOnDemand(t *testing.T) {
+	for _, onDemand := range []bool{false, true} {
+		pool := dbtest.New(t)
+		dir := t.TempDir()
+		_ = os.MkdirAll(filepath.Join(dir, "in"), 0o700)
+		store := jobs.NewStore(pool)
+		ctx := context.Background()
+		_ = store.UpsertWorker(ctx, "gone", []string{"pcm_s16le", "flac"})
+		_ = store.UpsertWorker(ctx, "ancient", []string{"libopus"})
+		_, _ = pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '2 hours'`)
+		_, _ = pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '30 days' WHERE id = 'ancient'`)
+		cfg := config.Config{AllowedHosts: []string{"*"}, DataDir: dir, MaxUploadBytes: 1 << 20, Retention: time.Hour, WorkersOnDemand: onDemand}
+		f := fixture{api.NewHandler(api.Deps{Store: store, Cfg: cfg, Audit: audit.New(io.Discard)}), store, dir}
+
+		var ps []map[string]any
+		_ = json.Unmarshal(get(f, "/api/v1/presets").Body.Bytes(), &ps)
+		ids := map[string]bool{}
+		for _, p := range ps {
+			ids[p["id"].(string)] = true
+		}
+		body, ct := multipartBody(t, []field{{"preset", "audio-flac"}}, "a.wav", []byte("x"))
+		code := post(f, body, ct).Code
+		if onDemand {
+			if !ids["audio-wav"] || !ids["audio-flac"] || ids["audio-opus"] || code != 202 {
+				t.Errorf("on demand: presets %v, upload %d; want wav+flac (not opus from a 30-day-old registration), 202", ids, code)
+			}
+		} else if len(ids) != 0 || code != 422 {
+			t.Errorf("always-on: presets %v, upload %d; want none, 422", ids, code)
+		}
+	}
+}

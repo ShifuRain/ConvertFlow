@@ -555,3 +555,101 @@ func TestSweepKeepsInputOfUploadingJob(t *testing.T) {
 		t.Fatal("input of an uploading job removed by the orphan sweep")
 	}
 }
+
+// On demand (scale to zero) a live worker is the exception: queued jobs expire purely by age, even
+// when a live worker could run the preset, and their input is removed.
+func TestSweepOnDemandExpiresByAgeOnly(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	e.j.Flavor = "full"
+	e.j.OnDemand = true
+	ctx := context.Background()
+	if err := e.store.UpsertWorker(ctx, "w1", []string{"pcm_s16le"}); err != nil { // could run audio-wav
+		t.Fatal(err)
+	}
+	old, young := e.job(t, "queued"), e.job(t, "queued")
+	oldIn := e.file(t, "in", old, time.Minute)
+	e.backdate(t, old, 2*time.Hour)
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := e.store.Get(ctx, old); g.Status != jobs.StatusFailed || g.Error != jobs.ErrQueueTimeout {
+		t.Errorf("old queued job must expire by age on demand: %+v", g)
+	}
+	if _, err := os.Stat(oldIn); !os.IsNotExist(err) {
+		t.Error("expired job's input must be removed")
+	}
+	if g, _ := e.store.Get(ctx, young); g.Status != jobs.StatusQueued {
+		t.Errorf("young job must stay queued: %+v", g)
+	}
+}
+
+// With no worker at all (the on-demand steady state), a young job is never touched and an old one
+// fails with the queue timeout, not "no worker available".
+func TestSweepOnDemandWithZeroWorkers(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	e.j.OnDemand = true
+	ctx := context.Background()
+	young := e.job(t, "queued")
+	e.backdate(t, young, 59*time.Minute)
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := e.store.Get(ctx, young); g.Status != jobs.StatusQueued {
+		t.Errorf("job inside MaxQueueAge failed while scaled to zero: %+v", g)
+	}
+}
+
+// Issue #9: a worker whose last registration refresh is 90s old (for example during a slow
+// re-detection) still counts as live for queue expiry by default.
+func TestSweepLiveWindowToleratesRefreshGap(t *testing.T) {
+	e := newEnv(t)
+	e.j.MaxQueueAge = time.Hour
+	e.j.Flavor = "full"
+	ctx := context.Background()
+	_ = e.store.UpsertWorker(ctx, "w1", []string{"pcm_s16le"})
+	_, _ = e.pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '90 seconds'`)
+	backlog := e.job(t, "queued")
+	e.backdate(t, backlog, 48*time.Hour)
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := e.store.Get(ctx, backlog); g.Status != jobs.StatusQueued {
+		t.Errorf("backlog failed during a short registration gap: %+v", g)
+	}
+	// 2*StaleAfter widens the window further.
+	e.j.StaleAfter = 5 * time.Minute
+	_, _ = e.pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '8 minutes'`)
+	_ = e.j.Sweep(ctx)
+	if g, _ := e.store.Get(ctx, backlog); g.Status != jobs.StatusQueued {
+		t.Errorf("window must be at least 2*StaleAfter: %+v", g)
+	}
+	_, _ = e.pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '11 minutes'`)
+	_ = e.j.Sweep(ctx)
+	if g, _ := e.store.Get(ctx, backlog); g.Status != jobs.StatusFailed {
+		t.Errorf("a worker gone for longer than the window no longer protects the backlog: %+v", g)
+	}
+}
+
+func TestSweepPrunesOldWorkerRegistrations(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	_ = e.store.UpsertWorker(ctx, "recent", []string{"flac"})
+	_ = e.store.UpsertWorker(ctx, "old", []string{"flac"})
+	_, _ = e.pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '8 days' WHERE id = 'old'`)
+	if err := e.j.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	rows, _ := e.pool.Query(ctx, `SELECT id FROM workers`)
+	for rows.Next() {
+		var id string
+		_ = rows.Scan(&id)
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if len(ids) != 1 || ids[0] != "recent" {
+		t.Fatalf("want only the recent registration, got %v", ids)
+	}
+}

@@ -63,6 +63,7 @@ func run() error {
 	al := audit.New(os.Stdout)
 	go (&janitor.Janitor{Store: store, Audit: al, Blob: bs, Retention: cfg.Retention,
 		StaleAfter: cfg.StaleAfter, MaxAttempts: cfg.MaxAttempts, JobTimeout: cfg.JobTimeout, MaxQueueAge: cfg.MaxQueueAge, Flavor: cfg.Flavor,
+		OnDemand: cfg.WorkersOnDemand, WorkerRetention: config.OnDemandCapabilityWindow,
 		UploadTTL: uploadTTL, Interval: time.Minute}).Run(ctx)
 
 	shutdownStarted := make(chan struct{})
@@ -79,7 +80,7 @@ func run() error {
 	srv.RegisterOnShutdown(func() { close(shutdownStarted) })
 	errc := make(chan error, 1)
 	go func() {
-		slog.Info("api listening", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "", "storage", cfg.Storage)
+		slog.Info("api listening", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "", "storage", cfg.Storage, "workers_on_demand", cfg.WorkersOnDemand)
 		if cfg.TLSCertFile != "" {
 			errc <- srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
 		} else {
