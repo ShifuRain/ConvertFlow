@@ -1,6 +1,6 @@
 # On-demand deployment and S3 storage
 
-Status: storage on an S3-compatible bucket with direct browser uploads is implemented (`CONVERTFLOW_STORAGE=s3`). Workers that start per job and scale to zero, sessions and quotas, and Kubernetes manifests are later phases and are **not** implemented yet. Everything marked "verified" below was run with rootless podman 6.1.2, the docker-compose provider and MinIO `RELEASE.2026-10-23T20-06-51Z` (Chainguard rebuild). No AWS S3, Cloudflare R2 or Ceph endpoint was tested.
+Status: storage on an S3-compatible bucket with direct browser uploads is implemented (`CONVERTFLOW_STORAGE=s3`), and so are ephemeral workers (`--once`, `--idle-exit`) with the queue semantics for scaling to zero (`CONVERTFLOW_WORKERS_ON_DEMAND`). Sessions and quotas, and Kubernetes manifests (KEDA) are later phases and are **not** implemented yet. Everything marked "verified" below was run with rootless podman 6.1.2, the docker-compose provider and MinIO `RELEASE.2026-10-23T20-06-51Z` (Chainguard rebuild). No AWS S3, Cloudflare R2 or Ceph endpoint was tested.
 
 ## Contents
 
@@ -8,6 +8,7 @@ Status: storage on an S3-compatible bucket with direct browser uploads is implem
 - [How a direct upload works](#how-a-direct-upload-works)
 - [Setting up a bucket](#setting-up-a-bucket)
 - [The development and test profile (compose.s3.yaml)](#the-development-and-test-profile-composes3yaml)
+- [Ephemeral workers (once and idle exit)](#ephemeral-workers-once-and-idle-exit)
 - [Failure behavior](#failure-behavior)
 - [Cost notes](#cost-notes)
 - [Limits and open points](#limits-and-open-points)
@@ -16,12 +17,12 @@ Status: storage on an S3-compatible bucket with direct browser uploads is implem
 
 | | A. Single host (default) | B. On-demand (S3) |
 |---|---|---|
-| Processes | api + workers + PostgreSQL from `compose.yaml` | api (always on, small) + workers (later: started per job) + PostgreSQL |
+| Processes | api + workers + PostgreSQL from `compose.yaml` | api (always on, small) + workers started per job (`--once`) + PostgreSQL |
 | Storage | `CONVERTFLOW_STORAGE=local`: the shared `media` volume (`/data/in`, `/data/out`) | `CONVERTFLOW_STORAGE=s3`: one bucket, `in/<job id>` and `out/<job id>.<attempt>.<ext>` |
 | Upload path | browser -> api -> volume | browser -> bucket (presigned POST); the API never sees the bytes |
 | Download path | api streams the file | api answers `302` to a presigned GET; the bytes come from the bucket |
 | Worker disk | the shared volume | a private scratch directory (tmpfs in compose) holding one input and one output at a time |
-| Status | released (v0.1.0) | implemented; scale-to-zero not yet |
+| Status | released (v0.1.0) | implemented; the autoscaler setup (KEDA) is not shipped yet |
 
 Shape A is unchanged and stays the default. The multipart upload through the API also keeps working in shape B (the bytes are streamed to the bucket), so curl users and scripts need no change.
 
@@ -105,6 +106,98 @@ What the profile changes (verified by `HARDENING_PROFILE=s3 tests/container/hard
 
 `tests/container/s3.sh` replays the UI's direct upload with curl against this profile (CSP, CORS preflight, form POST, `/complete`, conversion, redirected download, `EntityTooLarge`, credential scoping, log hygiene). The same flow was also run once in a real Chrome against this profile, with the UI's own code: preflight `204`, form POST `204`, `/complete` `200`, conversion done, the download followed the redirect to the store, and cancelling during the upload deleted the job.
 
+## Ephemeral workers (once and idle exit)
+
+The worker binary has two modes for platforms that start a container per job (Kubernetes Job or KEDA ScaledJob, Cloud Run Jobs) or that scale a deployment to zero. Without either flag it behaves as before: it processes jobs until it is stopped.
+
+| Flag | Environment | Behavior |
+|---|---|---|
+| `--once` | `CONVERTFLOW_WORKER_ONCE=true` | Claim **at most one** job, run it to a terminal state, exit. If no job is claimable it polls every `CONVERTFLOW_WORKER_POLL` until the idle exit has passed (default `30s` in once mode), then exits. The wait covers an autoscaler that starts the worker before the job is visible. |
+| `--idle-exit=D` | `CONVERTFLOW_WORKER_IDLE_EXIT=D` | Keep processing jobs; exit once nothing was claimable for `D` (counted from the start or the end of the last job). Combined with `--once`, it is the once-mode wait. |
+
+Flags take precedence over the environment. An invalid value (`--idle-exit=0s`, `CONVERTFLOW_WORKER_IDLE_EXIT=30` without unit) is a start error (exit 1). Every run, also a once run, first detects its encoders and registers them (a few seconds of trial encodes) and then claims only presets it can encode.
+
+### Exit codes
+
+| Code | Meaning | Suggested platform handling |
+|---|---|---|
+| `0` | The claimed job reached a terminal state: `done`, `failed` (bad input, limits, stall, ...) or `canceled`; those are job results, not worker failures. Also: idle exit without a job, or a signal while no job was running. | success |
+| `1` | Infrastructure or configuration: invalid configuration, database unreachable at start (or every claim during the idle period failed), encoder detection failed, object store or bucket unusable at start. | failure; retry with backoff |
+| `75` (`EX_TEMPFAIL`) | The job did not reach a terminal state and was given back for retry: the worker was stopped by SIGTERM/SIGINT while it ran (scale-in, spot preemption, node drain), or in once mode the object store failed while reading the input or writing the output, or the job's lease was lost. The job is requeued by the janitor (counts as an attempt). | ignore / retry; not a failure of the job |
+
+An always-on worker (no flag) still exits 0 when it is stopped by a signal, and 1 on fatal errors.
+
+For a Kubernetes Job, a `podFailurePolicy` keeps preemptions from counting against `backoffLimit` (*unverified: no cluster was used*):
+
+```yaml
+podFailurePolicy:
+  rules:
+    - action: Ignore            # preempted or scaled in: the job was released for retry
+      onExitCodes: {containerName: worker, operator: In, values: [75]}
+    - action: Ignore            # the node shut the pod down (spot)
+      onPodConditions: [{type: DisruptionTarget}]
+```
+
+### Shutdown, preemption and attempts
+
+On SIGTERM or SIGINT (any mode) the worker kills FFmpeg, removes the partial output, and releases the job at once: the job's lease is expired (audit event `job_released`, `reason` `shutdown`), so the janitor requeues it on its next pass (within a minute) instead of waiting `CONVERTFLOW_STALE_AFTER`. No terminal state is written, the input is kept, and the worker's later writes are impossible because every worker write is fenced by worker id and status. The release and the other writes after the run are bounded by `CONVERTFLOW_WORKER_SHUTDOWN_TIMEOUT` (default `10s`); a shutdown that hangs anyway is cut 5 s later. Set the platform's grace period (`terminationGracePeriodSeconds`, `stop_grace_period`) above that sum. In the tests, SIGTERM to exit took about 0.03 s for the bare binary and 0.34 s for `podman stop` (example below).
+
+**Attempts.** The interrupted attempt counts exactly like a worker crash: `attempts` was incremented when the job was claimed, and the janitor's requeue fails the job with "worker lost; attempts exhausted" once `CONVERTFLOW_MAX_ATTEMPTS` (default 3) is reached. A preempted job therefore never uses up its attempts faster than a crash would, but repeated preemption can fail a job. On preemptible (spot) nodes raise `CONVERTFLOW_MAX_ATTEMPTS`. The attempt is deliberately not given back: an attempt number is also the name of the attempt's output (`<id>.<attempt>.<ext>`), and reusing it could let a slow, stopped worker's cleanup reach a later attempt's output; and a job that keeps being interrupted still ends instead of looping forever.
+
+**Stalls.** A conversion whose FFmpeg makes no progress and is idle for `CONVERTFLOW_JOB_STALL_TIMEOUT` (default 10 minutes) is killed and failed with "conversion stalled (no progress for 10 minutes)", so a hung encoder does not keep a billed pod alive until `CONVERTFLOW_JOB_TIMEOUT` (4 h). See [operations.md](operations.md#troubleshooting).
+
+### Scratch directory
+
+Each worker process creates a private scratch directory under `$TMPDIR` (`/tmp`, a tmpfs in compose; use an `emptyDir` in Kubernetes). It holds the downloaded input and the output before upload with `s3` storage, and is FFmpeg's working directory with both storages. The directory is removed on every exit path: after a job, on idle exit, on errors, on a signal and on the hard stop. Tests check that nothing is left (`TestOnceModeWithS3LeavesNoScratchFiles`, `TestBinarySIGTERMReleasesJobForAnotherWorker`).
+
+### Queue semantics without live workers (`CONVERTFLOW_WORKERS_ON_DEMAND`)
+
+With workers scaled to zero there is no live worker most of the time. Two places relied on one:
+
+1. **Which presets the API offers.** Normally only presets a live worker (seen within 30 s) can run are listed and accepted. With `CONVERTFLOW_WORKERS_ON_DEMAND=true` the API uses the worker registrations of the last 7 days instead: every worker registers its encoders before claiming, also in once mode. A fresh installation has none yet, so run one worker once (`--once --idle-exit=1s`, it exits 0 after registering) before the first upload. The janitor deletes registrations older than 7 days.
+2. **Queue expiry.** Normally `CONVERTFLOW_MAX_QUEUE_AGE` fails only jobs no live worker can run; while scaled to zero that would be every old job. With `CONVERTFLOW_WORKERS_ON_DEMAND=true` the janitor expires queued jobs purely by age ("no worker picked up this job in time"). Size `MAX_QUEUE_AGE` to the longest backlog your maximum worker count may build up.
+
+Set it on the api (the janitor runs there); `compose.yaml` passes it through. The always-on default is unchanged; issue #9 (a short gap in a live worker's registration refresh could fail old jobs) is fixed for that mode: the janitor's live window is now at least 2 minutes or twice `STALE_AFTER`, and workers refresh their registration before a re-detection.
+
+### Example: one worker per job with podman
+
+Verified with rootless podman 6.1.2 against the compose stack (project name `convertflow`, `local` storage, `lgpl` worker image built from this branch). The api and database run as usual, with no always-on worker; each `podman run` is what an autoscaler would start for one queued job. The worker options mirror the `worker` service of `compose.yaml`.
+
+```bash
+set -a; . docker/ffmpeg.env; set +a
+CONVERTFLOW_WORKERS_ON_DEMAND=true podman compose up -d db api      # no worker service
+
+# 1. Register the worker image's encoders once (a fresh installation offers no presets before this).
+podman run --rm --network convertflow_backend \
+    --read-only --tmpfs /tmp:size=2g,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 512 --memory 4g --cpus 4 \
+    -v convertflow_media:/data -v ./secrets/database_url:/run/secrets/database_url:ro \
+    -e CONVERTFLOW_DATABASE_URL_FILE=/run/secrets/database_url -e CONVERTFLOW_FLAVOR=lgpl \
+    localhost/convertflow-worker:dev-lgpl --once --idle-exit=1s; echo "exit $?"
+
+# 2. Queue a job, then start one worker for it (same command, without --idle-exit=1s).
+curl -sS -F preset=audio-flac -F file=@tone.wav http://127.0.0.1:8080/api/v1/jobs
+podman run --rm --name cf-once --network convertflow_backend \
+    --read-only --tmpfs /tmp:size=2g,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 512 --memory 4g --cpus 4 \
+    -v convertflow_media:/data -v ./secrets/database_url:/run/secrets/database_url:ro \
+    -e CONVERTFLOW_DATABASE_URL_FILE=/run/secrets/database_url -e CONVERTFLOW_FLAVOR=lgpl \
+    localhost/convertflow-worker:dev-lgpl --once; echo "exit $?"
+```
+
+What happened (port 18085 instead of 8080 on the test host):
+
+| Step | Result |
+|---|---|
+| `GET /api/v1/presets` before step 1 | `[]` (no registration yet) |
+| step 1 | `exit 0` after 1.8 s (`jobs=0 idle_exit=true`); presets now listed |
+| step 2, a 3 s WAV to `audio-flac` | `exit 0`, job `done`, attempt 1 |
+| step 2 with a 60 s 720p clip to `video-vp9`, `podman stop -t 30 cf-once` at 11 % progress | `podman stop` returned after 0.34 s; `exit 75`; audit `job_released` `reason` `shutdown`; job still `running` with `heartbeat_at = -infinity`, no partial output in `out/` |
+| the janitor's next pass (41 s later) | `jobs_recovered` `requeued 1`; job `queued` |
+| step 2 again | `exit 0`, job `done` on attempt 2 |
+
+Tear down with `podman compose down -v` (removes the volumes).
+
 ## Failure behavior
 
 | Situation | What happens |
@@ -115,6 +208,8 @@ What the profile changes (verified by `HARDENING_PROFILE=s3 tests/container/hard
 | Form expired | the store answers `403 AccessDenied`; the UI reports that the upload link may have expired. Start the upload again. |
 | Browser blocked by CORS or CSP | the request fails with status 0; the UI reports that it could not reach the storage server. Check the CORS origin and `CONVERTFLOW_S3_PUBLIC_ENDPOINT`. |
 | `/complete` size differs from the declared size | `409`; the object is removed, the job stays `uploading` until the UI deletes it or the janitor expires it |
+| Worker stopped (SIGTERM, preemption) while a job runs | FFmpeg is killed, the job is released and requeued within a minute; exit code `75` for an ephemeral worker. Counts as an attempt. |
+| FFmpeg hangs | the stall watchdog fails the job after `CONVERTFLOW_JOB_STALL_TIMEOUT` with "conversion stalled (no progress for N minutes)" |
 | Store unavailable while a worker reads the input or writes the output | the attempt is released (not failed) and the janitor requeues the job within a minute. **Each release uses an attempt**: after `CONVERTFLOW_MAX_ATTEMPTS` the job fails with the existing message "worker lost; attempts exhausted", which is misleading for a storage outage. There is no backoff beyond the janitor's interval. |
 | Output object removed by the lifecycle rule or by hand | `GET .../output` answers `410` |
 | Database unavailable | unchanged from shape A |
@@ -132,4 +227,6 @@ Not benchmarked. No cost, throughput or cold-start figures were measured for thi
 - A presigned upload form can be used again until it expires, also after `/complete`: the owner of a job could replace that job's input. The damage is bounded (same key, same size limit, the worker rechecks the size, ffprobe validates as usual). See [security.md](security.md).
 - The upload policy allows any size up to `CONVERTFLOW_MAX_UPLOAD_BYTES`, not just the declared size; the mismatch is caught at `/complete`.
 - No storage backpressure in s3 mode besides the queue cap (there is no free-space figure for a bucket).
-- Worker `--once`, scale-to-zero, sessions and quotas, and Kubernetes manifests are later phases.
+- Sessions and quotas, and Kubernetes manifests with a KEDA trigger are later phases. Scale-to-zero was exercised with `podman run` only, not on a cluster; no cold-start figures were measured.
+- An autoscaler that counts every queued job (the simple KEDA query) keeps starting workers for a job no worker image can run; each exits 0 after its idle period, until `MAX_QUEUE_AGE` fails the job. Filter the trigger query by preset if you run several worker images.
+- A preempted job restarts from the beginning, and every interruption uses an attempt.

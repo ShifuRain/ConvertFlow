@@ -65,6 +65,8 @@ services:
       CONVERTFLOW_MAX_UPLOAD_BYTES: ${CONVERTFLOW_MAX_UPLOAD_BYTES:-8589934592}
       # DNS-rebinding defense (API only): extra Host names; localhost and IP literals are always allowed
       CONVERTFLOW_ALLOWED_HOSTS: ${CONVERTFLOW_ALLOWED_HOSTS:-}
+      # true when workers are started on demand (docs/on-demand.md): no live worker is required
+      CONVERTFLOW_WORKERS_ON_DEMAND: ${CONVERTFLOW_WORKERS_ON_DEMAND:-false}
     secrets: [database_url]
     volumes: ["media:/data"]
     tmpfs: ["/tmp:size=64m"]
