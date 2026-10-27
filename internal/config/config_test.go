@@ -404,3 +404,71 @@ func TestWorkersOnDemand(t *testing.T) {
 		t.Error("invalid value accepted")
 	}
 }
+
+func TestSessionsDefaults(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Sessions != config.SessionsOff || c.SessionTTL != 30*24*time.Hour || c.SessionHeader != "X-Forwarded-User" || c.TrustedProxies != nil {
+		t.Fatalf("bad session defaults: %+v", c)
+	}
+	if c.Quota != (config.Quota{SessionsPerHourPerIP: config.DefaultSessionsPerHourPerIP}) {
+		t.Fatalf("bad quota defaults: %+v", c.Quota)
+	}
+}
+
+func TestSessionsOverrides(t *testing.T) {
+	c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x",
+		"CONVERTFLOW_SESSIONS": "header", "CONVERTFLOW_SESSION_HEADER": "Remote-User", "CONVERTFLOW_SESSION_TTL": "48h",
+		"CONVERTFLOW_TRUSTED_PROXIES":             "10.0.0.0/8, 192.0.2.7 ,fd00::/8,::ffff:10.1.0.0/112",
+		"CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_OWNER": "3", "CONVERTFLOW_QUOTA_QUEUED_BYTES_PER_OWNER": "1000",
+		"CONVERTFLOW_QUOTA_JOBS_PER_HOUR_PER_OWNER": "20", "CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_IP": "9",
+		"CONVERTFLOW_QUOTA_SESSIONS_PER_HOUR_PER_IP": "0"}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Sessions != "header" || c.SessionHeader != "Remote-User" || c.SessionTTL != 48*time.Hour {
+		t.Fatalf("%+v", c)
+	}
+	want := []string{"10.0.0.0/8", "192.0.2.7/32", "fd00::/8", "10.1.0.0/16"}
+	if len(c.TrustedProxies) != len(want) {
+		t.Fatalf("proxies %v", c.TrustedProxies)
+	}
+	for i, p := range c.TrustedProxies {
+		if p.String() != want[i] {
+			t.Errorf("proxy %d: %s want %s", i, p, want[i])
+		}
+	}
+	if c.Quota != (config.Quota{ActiveJobsPerOwner: 3, QueuedBytesPerOwner: 1000, JobsPerHourPerOwner: 20, ActiveJobsPerIP: 9}) {
+		t.Fatalf("quota %+v", c.Quota)
+	}
+}
+
+func TestSessionsInvalid(t *testing.T) {
+	cases := map[string]map[string]string{
+		"bad mode":            {"CONVERTFLOW_SESSIONS": "jwt"},
+		"header without cidr": {"CONVERTFLOW_SESSIONS": "header"},
+		"bad cidr":            {"CONVERTFLOW_SESSIONS": "header", "CONVERTFLOW_TRUSTED_PROXIES": "10.0.0.0/33"},
+		"bad ip":              {"CONVERTFLOW_TRUSTED_PROXIES": "proxy.example"},
+		"zone":                {"CONVERTFLOW_TRUSTED_PROXIES": "fe80::1%eth0"},
+		"bad header":          {"CONVERTFLOW_SESSION_HEADER": "X User"},
+		"bad ttl":             {"CONVERTFLOW_SESSION_TTL": "0"},
+		"negative quota":      {"CONVERTFLOW_SESSIONS": "cookie", "CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_OWNER": "-1"},
+		"text quota":          {"CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_IP": "many"},
+		"owner quota off":     {"CONVERTFLOW_QUOTA_JOBS_PER_HOUR_PER_OWNER": "5"},
+	}
+	for name, extra := range cases {
+		m := map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		if _, err := config.Load(env(m), noFile); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// a per-IP quota needs no owner
+	if _, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", "CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_IP": "2"}), noFile); err != nil {
+		t.Fatal(err)
+	}
+}
