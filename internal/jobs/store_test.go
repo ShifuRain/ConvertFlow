@@ -667,3 +667,52 @@ func TestReleaseForRetry(t *testing.T) {
 		t.Fatalf("exhausted: RequeueStale = %d %d %v", rq, failed, err)
 	}
 }
+
+// On demand there is no live worker most of the time, so the queue age is the only criterion: a
+// backlog of a runnable preset expires too, with its own message.
+func TestExpireQueuedByAgeIgnoresRunnable(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	old, young := newJob(), newJob()
+	for _, j := range []*jobs.Job{old, young} {
+		if err := s.Create(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _ = pool.Exec(ctx, `UPDATE jobs SET updated_at = now() - interval '3 hours' WHERE id = $1::uuid`, old.ID)
+	got, err := s.ExpireQueuedByAge(ctx, time.Hour)
+	if err != nil || len(got) != 1 || got[0].ID != old.ID {
+		t.Fatalf("ExpireQueuedByAge = %+v %v", got, err)
+	}
+	if j, _ := s.Get(ctx, old.ID); j.Status != jobs.StatusFailed || j.Error != jobs.ErrQueueTimeout {
+		t.Errorf("old job: %+v", j)
+	}
+	if j, _ := s.Get(ctx, young.ID); j.Status != jobs.StatusQueued {
+		t.Errorf("young job expired: %+v", j)
+	}
+}
+
+func TestPruneWorkersAndDistinctEncoderSets(t *testing.T) {
+	pool := dbtest.New(t)
+	s := jobs.NewStore(pool)
+	ctx := context.Background()
+	// Three on-demand runs of the same image, one of another, one long gone.
+	for _, id := range []string{"a1", "a2", "a3"} {
+		_ = s.UpsertWorker(ctx, id, []string{"flac", "libopus"})
+	}
+	_ = s.UpsertWorker(ctx, "b", []string{"libsvtav1"})
+	_ = s.UpsertWorker(ctx, "old", []string{"libx264"})
+	_, _ = pool.Exec(ctx, `UPDATE workers SET seen_at = now() - interval '8 days' WHERE id = 'old'`)
+	ws, err := s.LiveWorkerEncoders(ctx, 7*24*time.Hour)
+	if err != nil || len(ws) != 2 {
+		t.Fatalf("want 2 distinct encoder sets, got %v %v", ws, err)
+	}
+	n, err := s.PruneWorkers(ctx, 7*24*time.Hour)
+	if err != nil || n != 1 {
+		t.Fatalf("PruneWorkers = %d %v", n, err)
+	}
+	if c, _ := s.LiveWorkers(ctx, 30*24*time.Hour); c != 4 {
+		t.Fatalf("want 4 registrations left, got %d", c)
+	}
+}

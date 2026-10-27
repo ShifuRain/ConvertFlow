@@ -117,15 +117,16 @@ func (w *Worker) tick(ctx context.Context) {
 	age := time.Since(w.lastDetected)
 	encs := w.encoderList
 	w.mu.RUnlock()
+	// Refresh the liveness row first, also before a full detection: its trial encodes take a while,
+	// and the janitor and API must not see the worker as gone meanwhile (issue #9).
+	if err := w.Store.UpsertWorker(ctx, w.ID, encs); err != nil {
+		slog.Warn("capability refresh failed", "err", err)
+	}
 	if age >= every || (w.redetect.Load() && age >= gap) {
 		w.redetect.Store(false)
 		if err := w.RegisterCapabilities(ctx); err != nil {
 			slog.Warn("capability detection failed", "err", err)
 		}
-		return
-	}
-	if err := w.Store.UpsertWorker(ctx, w.ID, encs); err != nil {
-		slog.Warn("capability refresh failed", "err", err)
 	}
 }
 

@@ -31,6 +31,12 @@ const (
 	// the form's expiry when an upload starts, so a large upload begun just before expiry may still
 	// be arriving afterwards.
 	UploadGrace = time.Hour
+	// DefaultLiveWindow is the minimum window in which a worker counts as live for queue expiry.
+	DefaultLiveWindow = 2 * time.Minute
+	// DefaultWorkerRetention keeps worker registrations for a week after their last refresh; it
+	// matches config.OnDemandCapabilityWindow, the window the API offers presets from when workers
+	// run on demand.
+	DefaultWorkerRetention = 7 * 24 * time.Hour
 )
 
 type Janitor struct {
@@ -51,9 +57,18 @@ type Janitor struct {
 	// offers their preset) and removes their input. Zero disables the check.
 	MaxQueueAge time.Duration
 	// Flavor and LiveWindow decide which presets a live worker can run (see presets.Runnable);
-	// queued jobs of such presets never expire by age. LiveWindow defaults to 30s.
+	// queued jobs of such presets never expire by age. LiveWindow defaults to
+	// max(DefaultLiveWindow, 2*StaleAfter), so a short gap in a worker's registration refreshes
+	// does not count as "no live worker" (issue #9).
 	Flavor     string
 	LiveWindow time.Duration
+	// OnDemand declares that workers are started on demand (scale to zero): there is no live
+	// worker most of the time, so queued jobs expire purely by age (MaxQueueAge) instead of only
+	// when no live worker can run their preset.
+	OnDemand bool
+	// WorkerRetention is how long a worker registration is kept after its last refresh before it
+	// is deleted. Default DefaultWorkerRetention.
+	WorkerRetention time.Duration
 	// UploadTTL is the lifetime of presigned upload forms (S3 storage). Jobs still 'uploading'
 	// UploadTTL+UploadGrace after they were created are failed and whatever was uploaded is
 	// removed. Zero disables the check (local storage has no uploading jobs).
@@ -86,6 +101,13 @@ func (j *Janitor) grace() time.Duration {
 	return DefaultOrphanGrace
 }
 
+func (j *Janitor) liveWindow() time.Duration {
+	if j.LiveWindow > 0 {
+		return j.LiveWindow
+	}
+	return max(DefaultLiveWindow, 2*j.StaleAfter)
+}
+
 func (j *Janitor) activeLimit() time.Duration {
 	t := j.JobTimeout
 	if t <= 0 {
@@ -107,15 +129,16 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 		j.Audit.System("jobs_recovered", "", "requeued", requeued, "failed", failed)
 	}
 	if j.MaxQueueAge > 0 {
-		window := j.LiveWindow
-		if window <= 0 {
-			window = 30 * time.Second
+		var stranded []jobs.Job
+		if j.OnDemand {
+			stranded, err = j.Store.ExpireQueuedByAge(ctx, j.MaxQueueAge)
+		} else {
+			var ws [][]string
+			if ws, err = j.Store.LiveWorkerEncoders(ctx, j.liveWindow()); err != nil {
+				return err
+			}
+			stranded, err = j.Store.ExpireQueued(ctx, j.MaxQueueAge, presets.IDs(presets.Runnable(ws, j.Flavor)))
 		}
-		ws, err := j.Store.LiveWorkerEncoders(ctx, window)
-		if err != nil {
-			return err
-		}
-		stranded, err := j.Store.ExpireQueued(ctx, j.MaxQueueAge, presets.IDs(presets.Runnable(ws, j.Flavor)))
 		if err != nil {
 			return err
 		}
@@ -133,6 +156,13 @@ func (j *Janitor) Sweep(ctx context.Context) error {
 			j.removeData(ctx, e.ID, e.InputPath)
 			j.Audit.System("job_upload_expired", e.ID)
 		}
+	}
+	retention := j.WorkerRetention
+	if retention <= 0 {
+		retention = DefaultWorkerRetention
+	}
+	if _, err := j.Store.PruneWorkers(ctx, retention); err != nil {
+		return err
 	}
 	expired, err := j.Store.Expired(ctx, j.Retention)
 	if err != nil {

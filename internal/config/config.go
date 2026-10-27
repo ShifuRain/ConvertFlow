@@ -44,6 +44,11 @@ type Config struct {
 	MinFreeBytes         int64 // free space required on the data volume; below it uploads get 507
 	MaxSSEStreams        int   // simultaneous progress streams; excess get 503
 
+	// WorkersOnDemand declares that workers are started on demand (scale to zero), so the API and
+	// janitor must not require a live worker: presets are offered from recent worker
+	// registrations (OnDemandCapabilityWindow) and queued jobs expire purely by age.
+	WorkersOnDemand bool
+
 	// Storage selects where job inputs and outputs live: StorageLocal (DataDir) or StorageS3.
 	Storage string
 	// S3 is the object store configuration; only read (and validated) when Storage is StorageS3.
@@ -55,6 +60,11 @@ const (
 	StorageLocal = "local"
 	StorageS3    = "s3"
 )
+
+// OnDemandCapabilityWindow is how far back worker registrations count when workers run on demand:
+// a scaled-to-zero deployment has no live worker, so the presets offered are those a worker that
+// registered within this window could run.
+const OnDemandCapabilityWindow = 7 * 24 * time.Hour
 
 // MaxPresignTTL caps how long a presigned upload or download URL stays valid.
 const MaxPresignTTL = time.Hour
@@ -189,6 +199,8 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		}
 		return b
 	}
+	c.WorkersOnDemand = boolean("CONVERTFLOW_WORKERS_ON_DEMAND", false)
+
 	secretFile := func(key string) Secret {
 		f := getenv(key)
 		if f == "" {

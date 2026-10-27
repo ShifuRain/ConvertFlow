@@ -243,8 +243,13 @@ SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status 
 	return requeued, failed, err
 }
 
-// ErrNoWorker is the error stored on queued jobs that waited longer than the maximum queue age.
+// ErrNoWorker is the error stored on queued jobs that waited longer than the maximum queue age
+// while no live worker could run their preset.
 const ErrNoWorker = "no worker available for this preset"
+
+// ErrQueueTimeout is the error stored on queued jobs that waited longer than the maximum queue age
+// when workers run on demand (ExpireQueuedByAge).
+const ErrQueueTimeout = "no worker picked up this job in time"
 
 // ExpireQueued fails jobs that have been queued for longer than maxAge in one guarded statement (a job claimed in the
 // meantime is no longer 'queued' and is not touched) and returns their ids and input paths.
@@ -258,11 +263,23 @@ func (s *Store) ExpireQueued(ctx context.Context, maxAge time.Duration, runnable
 	if runnable == nil {
 		runnable = []string{}
 	}
+	return s.expireQueued(ctx, maxAge, runnable, ErrNoWorker)
+}
+
+// ExpireQueuedByAge is ExpireQueued without the live-worker exemption, for workers started on
+// demand: with the deployment scaled to zero there is no live worker most of the time, so whether
+// one is live says nothing about whether the job will run. maxAge is then a plain upper bound on
+// the queue wait.
+func (s *Store) ExpireQueuedByAge(ctx context.Context, maxAge time.Duration) ([]Job, error) {
+	return s.expireQueued(ctx, maxAge, []string{}, ErrQueueTimeout)
+}
+
+func (s *Store) expireQueued(ctx context.Context, maxAge time.Duration, runnable []string, msg string) ([]Job, error) {
 	rows, err := s.pool.Query(ctx, `
 UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), updated_at = now()
 WHERE status = 'queued' AND updated_at < now() - make_interval(secs => $1)
   AND options->>'preset' <> ALL($3::text[])
-RETURNING id::text, input_path`, maxAge.Seconds(), ErrNoWorker, runnable)
+RETURNING id::text, input_path`, maxAge.Seconds(), msg, runnable)
 	if err != nil {
 		return nil, err
 	}
@@ -330,10 +347,12 @@ func (s *Store) UpsertWorker(ctx context.Context, id string, encoders []string) 
 ON CONFLICT (id) DO UPDATE SET encoders = EXCLUDED.encoders, seen_at = now()`, id, encoders)
 }
 
-// LiveWorkerEncoders returns the encoder list of every live worker, one entry per worker. Capability
-// decisions must be made per worker (one worker has to run the whole job), never on the union.
+// LiveWorkerEncoders returns the encoder lists of the workers seen within the window, one entry per
+// distinct list (workers of one image advertise the same list, so on-demand deployments with one
+// registration per started worker stay small). Capability decisions must be made per worker (one
+// worker has to run the whole job), never on the union.
 func (s *Store) LiveWorkerEncoders(ctx context.Context, within time.Duration) ([][]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT encoders FROM workers WHERE seen_at > now() - make_interval(secs => $1)`, within.Seconds())
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT encoders FROM workers WHERE seen_at > now() - make_interval(secs => $1)`, within.Seconds())
 	if err != nil {
 		return nil, err
 	}
@@ -353,4 +372,15 @@ func (s *Store) LiveWorkers(ctx context.Context, within time.Duration) (int, err
 	var n int
 	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM workers WHERE seen_at > now() - make_interval(secs => $1)`, within.Seconds()).Scan(&n)
 	return n, err
+}
+
+// PruneWorkers deletes worker registrations not refreshed for longer than olderThan (every worker
+// process registers under its own id, so on-demand workers leave one row per run) and returns how
+// many were removed.
+func (s *Store) PruneWorkers(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM workers WHERE seen_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

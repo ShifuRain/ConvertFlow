@@ -337,3 +337,15 @@ func TestSecretsAreRedactedWhenPrinted(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkersOnDemand(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "false": false, "true": true} {
+		c, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", "CONVERTFLOW_WORKERS_ON_DEMAND": v}), noFile)
+		if err != nil || c.WorkersOnDemand != want {
+			t.Errorf("%q: got %v %v", v, c.WorkersOnDemand, err)
+		}
+	}
+	if _, err := config.Load(env(map[string]string{"CONVERTFLOW_DATABASE_URL": "postgres://x", "CONVERTFLOW_WORKERS_ON_DEMAND": "sometimes"}), noFile); err == nil {
+		t.Error("invalid value accepted")
+	}
+}
