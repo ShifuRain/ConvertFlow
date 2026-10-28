@@ -2,7 +2,7 @@
 
 Self-hosted, air-gap-friendly web app and REST API that transcodes video and audio with FFmpeg. Dark UI with drag-and-drop, live progress, no CDN and no telemetry.
 
-**There is no authentication.** Anyone who can reach the port can submit, list, download and delete jobs. The default compose file publishes the API on `127.0.0.1` only. Read [docs/security.md](docs/security.md) and [docs/risk-acceptance-template.md](docs/risk-acceptance-template.md) before exposing it to a network.
+**There is no authentication.** Anyone who can reach the port can submit, list, download and delete jobs (optionally only their own: `CONVERTFLOW_SESSIONS=cookie` or `header`, see [docs/operations.md](docs/operations.md#sessions-and-quotas); that is isolation, not authentication). The default compose file publishes the API on `127.0.0.1` only. Read [docs/security.md](docs/security.md) and [docs/risk-acceptance-template.md](docs/risk-acceptance-template.md) before exposing it to a network.
 
 ConvertFlow is software, not an ISMS. It cannot be "IT-Grundschutz compliant" or certified; see [docs/grundschutz-mapping.md](docs/grundschutz-mapping.md) for how it supports an operator's own Grundschutz work. **Note:** that mapping covers the classic IT-Grundschutz-Kompendium, Edition 2023, only. The BSI is introducing Grundschutz++ (which it states will replace the Kompendium, with a transition period); this mapping does not cover it. Verify the current status at bsi.bund.de.
 

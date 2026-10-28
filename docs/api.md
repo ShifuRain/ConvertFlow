@@ -1,12 +1,12 @@
 # REST API guide
 
-The machine-readable source of truth is the OpenAPI 3.1 document served at `GET /api/openapi.json` (the UI renders it at `/docs.html`). This page is a short guide for automation. The upload, status, SSE, download, delete, presets and metrics examples were run with curl against the podman stack (rootless podman 6.1.2); the Range request is covered by the Go test `TestOutputOverRealServerLargeAndRange` and was not run with curl. The direct-upload examples (S3 storage) were run with curl against the `compose.s3.yaml` profile (rootless podman 6.1.2, MinIO). `BASE` is the service URL.
+The machine-readable source of truth is the OpenAPI 3.1 document served at `GET /api/openapi.json` (the UI renders it at `/docs.html`). This page is a short guide for automation. The upload, status, SSE, download, delete, presets and metrics examples were run with curl against the podman stack (rootless podman 6.1.2); the Range request is covered by the Go test `TestOutputOverRealServerLargeAndRange` and was not run with curl. The session examples were run with curl and two cookie jars against the podman stack in cookie mode. The direct-upload examples (S3 storage) were run with curl against the `compose.s3.yaml` profile (rootless podman 6.1.2, MinIO). `BASE` is the service URL.
 
 ```bash
 BASE=http://127.0.0.1:8080          # or https://... when TLS is enabled (curl --cacert ca.pem)
 ```
 
-There is **no authentication**. State-changing requests (`POST`, `DELETE`) that a browser marks as cross-origin are refused with `403`; automation that sends no `Origin`/`Sec-Fetch-Site` header (curl, scripts, HTTP libraries) is unaffected, but do not set an `Origin` header that differs from the `Host` you call. Do not put secrets into filenames or options; restrict network access as described in [security.md](security.md).
+There is **no authentication**. With `CONVERTFLOW_SESSIONS=cookie` or `header` each client sees only its own jobs (see [Sessions and quotas](#sessions-and-quotas)); that is isolation, not authentication. State-changing requests (`POST`, `DELETE`) that a browser marks as cross-origin are refused with `403`; automation that sends no `Origin`/`Sec-Fetch-Site` header (curl, scripts, HTTP libraries) is unaffected, but do not set an `Origin` header that differs from the `Host` you call. Do not put secrets into filenames or options; restrict network access as described in [security.md](security.md).
 
 ## Endpoints
 
@@ -14,12 +14,13 @@ There is **no authentication**. State-changing requests (`POST`, `DELETE`) that 
 |---|---|---|---|
 | `POST /api/v1/jobs` | Upload a file and create a job | `202` + job JSON, `Location` header | multipart/form-data, see below. S3 storage also accepts JSON and answers `201` with a presigned upload form, see [Direct upload](#direct-upload-s3-storage) |
 | `POST /api/v1/jobs/{id}/complete` | S3 storage only: queue a job after its direct upload (JSON `POST /api/v1/jobs`) | `200` + job JSON | `409` nothing uploaded, size mismatch or expired; `404` with local storage |
-| `GET /api/v1/jobs` | Most recent jobs, newest first, at most 200 | `200` | JSON array |
+| `GET /api/v1/jobs` | Most recent jobs, newest first, at most 200 | `200` | JSON array; with sessions on only the caller's jobs |
 | `GET /api/v1/jobs/{id}` | Status, progress, metadata | `200` | `404` for unknown or malformed ids |
 | `DELETE /api/v1/jobs/{id}` | Delete an idle job and its files, or request cancellation of an active one | `204` or `202` | see "Cancel and delete" |
 | `GET /api/v1/jobs/{id}/events` | Server-Sent Events progress stream | `200` | `503` when the stream limit is reached |
 | `GET /api/v1/jobs/{id}/output` | Download the result | `200` / `206` (S3 storage: `302` to a presigned URL) | Range requests supported; `409` not ready, `410` removed |
 | `GET /api/v1/presets` | Presets runnable on the currently live workers | `200` | only presets some live worker can encode (after the flavor policy); the `ConvertFlow-Upload-Mode` header says how the UI uploads |
+| `GET /api/v1/quota` | The caller's quota limits and usage | `200` | see [Sessions and quotas](#sessions-and-quotas); `401` in header mode without a user |
 | `GET /api/openapi.json` | The OpenAPI document | `200` | |
 | `GET /healthz` | Liveness with a short database ping | `200` body `ok` | `503` when the database is unreachable |
 | `GET /metrics` | Prometheus metrics | `200` | see [operations.md](operations.md#monitoring) |
@@ -193,6 +194,47 @@ curl -s -X DELETE $BASE/api/v1/jobs/$ID -w '%{http_code}\n'
 - Job being probed or encoded (`probing`/`running`): **the first `DELETE` only cancels** - it requests cancellation and answers `202` with `{"id":"...","status":"canceling"}`; nothing is deleted yet. The worker stops FFmpeg, removes its partial output and its input file, and marks the job `canceled` (the files are gone once the job reaches that terminal state). Send a **second `DELETE`** after that to remove the job record (and any file that is still there, `204`). If the worker is gone, the janitor turns the job into `canceled` after `CONVERTFLOW_STALE_AFTER`. If it finished in the meantime, `409` and you delete it again.
 - Unknown id: `404`.
 
+## Sessions and quotas
+
+With `CONVERTFLOW_SESSIONS=cookie` the server issues an anonymous session cookie and every job belongs to the session that created it. Keep the cookie with a cookie jar; without one, each request is a new client with no jobs. The examples below were run with curl against the podman stack started with `CONVERTFLOW_SESSIONS=cookie`, `CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_OWNER=2` and `CONVERTFLOW_QUOTA_JOBS_PER_HOUR_PER_OWNER=20` (rootless podman 6.1.2); ids and tokens are shortened or differ per run.
+
+```bash
+curl -s -c a.jar -D - -o /dev/null $BASE/api/v1/presets | grep -i set-cookie   # the page's first call starts the session
+# Set-Cookie: cf_session=thLmgxJl...; Path=/api/; Max-Age=2592000; HttpOnly; SameSite=Strict
+
+A=$(curl -s -b a.jar -c a.jar -F preset=audio-flac -F file=@song.wav $BASE/api/v1/jobs | jq -er .id)
+curl -s -b b.jar -c b.jar -F preset=audio-flac -F file=@song.wav $BASE/api/v1/jobs | jq -c '{id,status}'   # a second client
+# {"id":"195dfcba-602c-452c-be7c-5533700206b4","status":"queued"}
+
+curl -s -b a.jar $BASE/api/v1/jobs | jq -c 'map({id,status,filename})'
+# [{"id":"e51f182d-4655-4e13-af8d-9a2b071b081e","status":"done","filename":"song.wav"}]
+curl -s $BASE/api/v1/jobs                                  # no cookie: no jobs
+# []
+curl -s -b b.jar $BASE/api/v1/jobs/$A -w ' %{http_code}\n'  # the same for /output, /events, DELETE, /complete
+# {"type":"about:blank","title":"Not found","status":404,"detail":"no such job"} 404
+
+curl -s -b a.jar $BASE/api/v1/quota | jq -c .
+# {"sessions":"cookie","owner":true,"limits":{"active_jobs":2,"queued_bytes":0,"jobs_per_hour":20,"active_jobs_per_ip":0},"usage":{"active_jobs":0,"queued_bytes":0,"jobs_per_hour":1,"active_jobs_per_ip":0},"jobs_per_hour_resets_in_seconds":3594}
+```
+
+`GET /api/v1/quota` reports the configured limits (`0` = unlimited) and the caller's usage; `jobs_per_hour` and `active_jobs_per_ip` are counted only while their limit is set. Another session's job answers exactly like a job that does not exist (`404`), on every job route. A third unfinished job with the limit at 2 (no worker running):
+
+```bash
+curl -s -b a.jar -c a.jar -F preset=audio-flac -F file=@song.wav $BASE/api/v1/jobs -D hdr.txt -o body.txt -w '%{http_code}\n'
+# 429
+grep -i retry-after hdr.txt; cat body.txt
+# Retry-After: 60
+# {"type":"about:blank","title":"Quota exceeded","status":429,"detail":"You have too many unfinished jobs; wait for one to finish or remove one."}
+```
+
+Rules for clients:
+
+- The server never accepts a cookie value it did not issue; an unknown, expired or malformed value is ignored. A request carrying **two** `cf_session` cookies is treated as having none, and creating a job then answers `400`.
+- The session lasts `CONVERTFLOW_SESSION_TTL` (30 days) after its last use. Losing the cookie loses access to the jobs.
+- With `CONVERTFLOW_SESSIONS=header` there is no cookie: the reverse proxy sends the user (`X-Forwarded-User` by default) and the job routes answer `401` without it. Calls that bypass the proxy have no user.
+- `429` always carries `Retry-After` (seconds); `413` means a single file exceeds the queued-bytes quota and retrying cannot help.
+- Direct uploads to the object store never carry the cookie (it is scoped to `/api/` on the API's origin and the UI posts the form without credentials).
+
 ## Errors (RFC 9457)
 
 Errors are `application/problem+json`:
@@ -208,13 +250,15 @@ Errors are `application/problem+json`:
 | `400` | not multipart, wrong field order, duplicate/unknown field, empty file, interrupted upload |
 | `421` | the `Host` header is not `localhost`, an IP literal or listed in `CONVERTFLOW_ALLOWED_HOSTS` (DNS rebinding defense; applies to every route). Reaching the API by DNS name or through a proxy requires that variable |
 | `403` | a browser marked the request as cross-origin (`Sec-Fetch-Site` not `same-origin`/`none`, or `Origin` differs from `Host`); also returned by `DELETE`. Clients that send neither header, such as curl and scripts, are not affected |
-| `413` | file larger than `CONVERTFLOW_MAX_UPLOAD_BYTES` (default 8 GiB) |
+| `413` | file larger than `CONVERTFLOW_MAX_UPLOAD_BYTES` (default 8 GiB), or than the owner's queued-bytes quota |
 | `422` | invalid options, or the preset is not available on any running worker (for example `video-h264` on the `lgpl` flavor) |
+| `401` | header session mode only: no user identity from a trusted proxy (also on the other job routes and `GET /api/v1/quota`) |
+| `429` | a quota is exhausted (unfinished jobs, queued bytes or jobs per hour of the owner, unfinished jobs of the client address, new sessions of the client address), with `Retry-After` in seconds |
 | `503` | too many concurrent uploads, or the job queue is full (`Retry-After: 30`) |
 | `507` | not enough free space on the data volume |
 | `500` | server fault; details are only in the server log |
 
-Other endpoints: `404` unknown/malformed job id, `409` output not ready or job already finished, `410` output removed, `416` unsatisfiable range, `503` SSE limit or unhealthy database.
+Other endpoints: `404` unknown/malformed job id (with sessions on, also another owner's job: the answer is identical), `409` output not ready or job already finished, `410` output removed, `416` unsatisfiable range, `503` SSE limit or unhealthy database.
 
 ## Limits
 

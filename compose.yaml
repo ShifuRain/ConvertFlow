@@ -67,6 +67,8 @@ services:
       CONVERTFLOW_ALLOWED_HOSTS: ${CONVERTFLOW_ALLOWED_HOSTS:-}
       # true when workers are started on demand (docs/on-demand.md): no live worker is required
       CONVERTFLOW_WORKERS_ON_DEMAND: ${CONVERTFLOW_WORKERS_ON_DEMAND:-false}
+      # per-session job ownership (docs/security.md): off (default), cookie or header
+      CONVERTFLOW_SESSIONS: ${CONVERTFLOW_SESSIONS:-off}
     secrets: [database_url]
     volumes: ["media:/data"]
     tmpfs: ["/tmp:size=64m"]
