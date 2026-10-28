@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,14 +21,14 @@ type Store struct{ pool *pgxpool.Pool }
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 const jobCols = `id::text, status, filename, input_path, output_path, options, progress, encoder_used,
- probe, error, attempts, worker_id, cancel_requested, created_at, updated_at, finished_at, coalesce(declared_size, 0)`
+ probe, error, attempts, worker_id, cancel_requested, created_at, updated_at, finished_at, coalesce(declared_size, 0), owner, coalesce(input_size, 0)`
 
 func scanJob(row pgx.Row) (*Job, error) {
 	var j Job
 	var opts []byte
 	err := row.Scan(&j.ID, &j.Status, &j.Filename, &j.InputPath, &j.OutputPath, &opts, &j.Progress,
 		&j.EncoderUsed, &j.Probe, &j.Error, &j.Attempts, &j.WorkerID, &j.CancelRequested,
-		&j.CreatedAt, &j.UpdatedAt, &j.FinishedAt, &j.DeclaredSize)
+		&j.CreatedAt, &j.UpdatedAt, &j.FinishedAt, &j.DeclaredSize, &j.Owner, &j.InputSize)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -42,7 +43,16 @@ func scanJob(row pgx.Row) (*Job, error) {
 
 // Create inserts a job as queued, or as uploading when j.Status is StatusUploading (a presigned
 // upload; j.DeclaredSize is recorded when positive).
+// Owner, ClientKey and InputSize are stored when set.
 func (s *Store) Create(ctx context.Context, j *Job) error {
+	return insertJob(ctx, s.pool, j)
+}
+
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func insertJob(ctx context.Context, db execer, j *Job) error {
 	opts, err := json.Marshal(j.Options)
 	if err != nil {
 		return err
@@ -51,13 +61,17 @@ func (s *Store) Create(ctx context.Context, j *Job) error {
 	if j.Status == StatusUploading {
 		status = StatusUploading
 	}
-	var declared *int64
+	var declared, size *int64
 	if j.DeclaredSize > 0 {
 		declared = &j.DeclaredSize
 	}
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO jobs (id, status, filename, input_path, options, declared_size) VALUES ($1::uuid, $2, $3, $4, $5, $6)`,
-		j.ID, string(status), j.Filename, j.InputPath, opts, declared)
+	if j.InputSize > 0 {
+		size = &j.InputSize
+	}
+	_, err = db.Exec(ctx,
+		`INSERT INTO jobs (id, status, filename, input_path, options, declared_size, owner, client_key, input_size)
+VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		j.ID, string(status), j.Filename, j.InputPath, opts, declared, j.Owner, j.ClientKey, size)
 	return err
 }
 

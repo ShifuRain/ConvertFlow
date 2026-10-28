@@ -6,6 +6,7 @@ Scope: running ConvertFlow from the supplied `compose.yaml`. Status of the comma
 
 - [Configuration reference](#configuration-reference)
 - [Exposing the service, TLS and reverse proxy](#exposing-the-service-tls-and-reverse-proxy)
+- [Sessions and quotas](#sessions-and-quotas)
 - [Scaling and resource sizing](#scaling-and-resource-sizing)
 - [Upgrades](#upgrades)
 - [Database role and secrets](#database-role-and-secrets)
@@ -28,7 +29,7 @@ Configuration is read from environment variables by `internal/config/config.go`.
 `compose.yaml` passes only some variables through from the host shell (or an `.env` file next to `compose.yaml`):
 
 - **Shared anchor** (`x-shared-env`, identical for `api` and `worker`, so they cannot diverge): `CONVERTFLOW_JOB_TIMEOUT`, `CONVERTFLOW_RETENTION`, `CONVERTFLOW_STALE_AFTER`, `CONVERTFLOW_MAX_QUEUE_AGE`, `CONVERTFLOW_MAX_ATTEMPTS`, and `CONVERTFLOW_FLAVOR` (fed from `FFMPEG_FLAVOR`). The janitor runs inside the API container and applies the same windows the worker enforces. `tests/container/hardening.sh` fails if the two diverge. **Set these only through the host environment or `.env`, never separately on one service.**
-- **API only:** `CONVERTFLOW_MAX_UPLOAD_BYTES` (host-settable), `CONVERTFLOW_LISTEN` (fixed to `0.0.0.0:8080` in the container; the published host port is `${CONVERTFLOW_PORT:-8080}` on `127.0.0.1`), `CONVERTFLOW_DATABASE_URL_FILE` (fixed to the secret).
+- **API only:** `CONVERTFLOW_MAX_UPLOAD_BYTES` (host-settable), `CONVERTFLOW_SESSIONS` (host-settable, default `off`; the other session and quota variables go into an override file), `CONVERTFLOW_LISTEN` (fixed to `0.0.0.0:8080` in the container; the published host port is `${CONVERTFLOW_PORT:-8080}` on `127.0.0.1`), `CONVERTFLOW_DATABASE_URL_FILE` (fixed to the secret).
 - **S3 profile** (`compose.s3.yaml`, development and tests only, see [on-demand.md](on-demand.md)): sets `CONVERTFLOW_STORAGE=s3` and the S3 variables for api and worker with separate key files, and passes `CONVERTFLOW_S3_PUBLIC_ENDPOINT`, `CONVERTFLOW_S3_BUCKET`, `CONVERTFLOW_S3_PRESIGN_TTL`, `CONVERTFLOW_MAX_UPLOAD_BYTES` and `CONVERTFLOW_MAX_OUTPUT_BYTES` through from the host to both.
 - **Everything else** is not wired through `compose.yaml`; set it with an override file (see below). `CONVERTFLOW_DATA_DIR` is set to `/data` by both images.
 
@@ -81,6 +82,15 @@ services:
 | `CONVERTFLOW_MAX_QUEUED_JOBS` | `100` | api | Maximum active jobs (queued + probing + running); excess uploads get `503`. |
 | `CONVERTFLOW_MIN_FREE_BYTES` | 2 x `MAX_UPLOAD_BYTES` (16 GiB by default) | api | Free space required on the data volume before an upload is accepted (plus the announced upload size when the client sends `Content-Length`); below it uploads get `507`. Default leaves room for one maximum-size upload and a similarly sized output. |
 | `CONVERTFLOW_MAX_SSE_STREAMS` | `64` | api | Simultaneous progress streams; excess get `503`. |
+| `CONVERTFLOW_SESSIONS` | `off` | api | Per-session job ownership ([Sessions and quotas](#sessions-and-quotas)). `off`: every client sees and may delete every job (the single-user behavior). `cookie`: anonymous server-issued session cookie; each browser (or curl cookie jar) sees only its own jobs. `header`: the owner is a user id set by a trusted reverse proxy (`CONVERTFLOW_SESSION_HEADER`); requires `CONVERTFLOW_TRUSTED_PROXIES`. Anything else is a start error. Passed through by `compose.yaml`. |
+| `CONVERTFLOW_SESSION_TTL` | `720h` (30 days) | api (and janitor) | `cookie` only: a session unused for this long is no longer accepted and is deleted by the janitor; use refreshes it (at most once an hour, also renewing the cookie's `Max-Age`). Positive duration. |
+| `CONVERTFLOW_SESSION_HEADER` | `X-Forwarded-User` | api | `header` only: name of the header that carries the user id (1 to 256 bytes, no control characters). Read **only** from peers in `CONVERTFLOW_TRUSTED_PROXIES`, and only when it occurs exactly once. The proxy must set or overwrite it on every request and strip any value the client sent. |
+| `CONVERTFLOW_TRUSTED_PROXIES` | unset | api | Comma-separated CIDR prefixes or single addresses (`10.0.0.0/8, 192.0.2.7, fd00::/8`) of reverse proxies whose `X-Forwarded-For`, `X-Forwarded-Proto` and session header are believed. Required with `CONVERTFLOW_SESSIONS=header`. Without it no forwarding header is evaluated (the client IP is the TCP peer). |
+| `CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_OWNER` | `0` (unlimited) | api | Unfinished jobs (`uploading`, `queued`, `probing`, `running`) one owner may have; more get `429`. Non-negative integer; needs `CONVERTFLOW_SESSIONS` `cookie` or `header` (start error otherwise). |
+| `CONVERTFLOW_QUOTA_QUEUED_BYTES_PER_OWNER` | `0` (unlimited) | api | Summed input bytes of one owner's unfinished jobs (multipart: bytes received; direct upload: the announced size, which `/complete` verifies). Over it: `429`; a single file larger than the quota: `413`. Needs a session mode. |
+| `CONVERTFLOW_QUOTA_JOBS_PER_HOUR_PER_OWNER` | `0` (unlimited) | api | Jobs one owner may create in any trailing hour (deleting a job does not give the slot back). `429` with `Retry-After` until the oldest counted job leaves the window. Needs a session mode. |
+| `CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_IP` | `0` (unlimited) | api | Unfinished jobs created from one client address (IPv6: one `/64`), in every session mode. Blunts cookie clearing. Behind a reverse proxy set `CONVERTFLOW_TRUSTED_PROXIES`, or all clients share the proxy's address. |
+| `CONVERTFLOW_QUOTA_SESSIONS_PER_HOUR_PER_IP` | `60` | api | `cookie` only: new sessions one client address (IPv6: one `/64`) may obtain per trailing hour; `0` = unlimited. Beyond it the presets list still works without a session and job creation answers `429`. Clients behind one NAT share the budget. |
 | `CONVERTFLOW_STORAGE` | `local` | api, worker | Where inputs and outputs live: `local` (`CONVERTFLOW_DATA_DIR`) or `s3` (an S3-compatible bucket, configured by the S3 variables below, which are ignored in `local` mode). Anything else is a start error. |
 | `CONVERTFLOW_S3_ENDPOINT` | none | api, worker | `s3` only, required: `host` or `host:port` of the object store as reached by api and worker (no scheme, no path). |
 | `CONVERTFLOW_S3_PUBLIC_ENDPOINT` | `https://` (or `http://` without TLS) + the endpoint | api | `s3` only: `scheme://host[:port]` of the object store as reached by **browsers**; presigned upload and download URLs are signed for this host. No path. |
@@ -162,7 +172,20 @@ Terminate TLS in the organization's proxy and forward to the loopback-published 
 - forward the `Host` header unchanged (nginx: `proxy_set_header Host $http_host;`) and list that name in `CONVERTFLOW_ALLOWED_HOSTS` ([DNS rebinding](#dns-rebinding-host-allow-list)); the cross-origin check also compares the browser's `Origin` with `Host` (see [Cross-origin requests from browsers](#cross-origin-requests-from-browsers)),
 - do not strip the security headers the application sets (CSP, `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, `Cross-Origin-Resource-Policy`). The application emits `Strict-Transport-Security` only when it terminates TLS itself, so add HSTS in the proxy.
 
-**`X-Forwarded-For` and similar headers are not trusted or evaluated.** The `remote_ip` in the audit log is the TCP peer address. Behind a reverse proxy that is the proxy's address, so attribute clients from the proxy's access log, correlated by time. Also with the default rootless-podman published port the peer address is not the client's: a request from `127.0.0.1` was logged as `10.89.1.2` (the container network gateway) in the verified setup. Do not rely on `remote_ip` for attribution without checking what your runtime reports.
+**`X-Forwarded-For` and similar headers are not evaluated unless `CONVERTFLOW_TRUSTED_PROXIES` lists the proxy.** With it, requests whose TCP peer is in that list are read as follows: the client address is the first entry of `X-Forwarded-For`, read from the right, that is not itself a trusted proxy (a malformed entry stops the walk, so a client cannot forge its way past a trusted hop; several header lines count as one list); `X-Forwarded-Proto: https` (exactly one value) marks the session cookie `Secure`; in `header` session mode the user header is accepted. Configure the proxy to append to `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) and to overwrite `X-Forwarded-Proto` and the user header. Audit records then carry `client_ip` next to `remote_ip`. List only the proxy's own addresses; a broad prefix lets anything inside it claim any client address or user. The `remote_ip` in the audit log is always the TCP peer address. Behind a reverse proxy that is the proxy's address, so attribute clients from the proxy's access log, correlated by time. Also with the default rootless-podman published port the peer address is not the client's: a request from `127.0.0.1` was logged as `10.89.1.2` (the container network gateway) in the verified setup. Do not rely on `remote_ip` for attribution without checking what your runtime reports.
+
+### Sessions and quotas
+
+By default (`CONVERTFLOW_SESSIONS=off`) there is no notion of a user: every client lists, downloads and deletes every job, exactly as before. Two opt-in modes give each user their own jobs without accounts:
+
+- **`cookie`**: the first `GET /api/v1/presets` (the page's first request), `GET /api/v1/quota` or job creation without a session creates one: 256 random bits in the cookie `cf_session` (`HttpOnly; SameSite=Strict; Path=/api/`, `Secure` when the API terminates TLS or a trusted proxy sends `X-Forwarded-Proto: https`, `Max-Age` = `CONVERTFLOW_SESSION_TTL`). The database stores only the SHA-256 digest; a cookie value the server did not issue is ignored (no session fixation). Clearing cookies, another browser or a private window means a new, empty session: **the old jobs are not reachable any more** and expire with `CONVERTFLOW_RETENTION`. curl and scripts keep the session with a cookie jar (`-c`/`-b`), see [api.md](api.md#sessions-and-quotas).
+- **`header`**: the reverse proxy authenticates users (for example OIDC) and sets `CONVERTFLOW_SESSION_HEADER` (default `X-Forwarded-User`); the API believes it only from `CONVERTFLOW_TRUSTED_PROXIES`. A request without it answers `401` on the job routes and `GET /api/v1/quota`. The proxy must overwrite the header (a client-supplied value that the proxy passes through, or appends to, is a user switch; a second value makes the request `401`). Not verified with a real proxy.
+
+In both modes list, get, events, output (also the presigned download redirect), delete/cancel and `/complete` only match the caller's jobs; another owner's job id answers the same `404` as a missing one. Jobs created while sessions were `off` have no owner and are not visible in a session mode (they expire normally); switching back to `off` shows every job to everyone again. `GET /api/v1/presets`, `/healthz` and `/metrics` need no session; `/metrics` reports only global counts.
+
+**Quotas** (the `QUOTA` variables above, 0 = unlimited) are abuse limits on top of the global caps (`MAX_QUEUED_JOBS`, `MAX_CONCURRENT_UPLOADS`, free space), which still apply first. They are checked before any upload byte is read (multipart, using `Content-Length`) and again when the job row is written, inside one database transaction that holds an advisory lock on the owner and client-address keys, so parallel creates (also on several API replicas) cannot exceed a limit. A multipart upload that passes the first check but loses the second to a parallel request is refused after its bytes arrived, and they are removed. Refusals answer `429` with `Retry-After` (60 s for the active-job and byte limits, the exact remaining time for the hourly limits) and are audited as `upload_rejected` with `reason` `quota <kind>`; a single file larger than the byte quota answers `413`. The hourly counts live in the table `rate_events` (one row per created job or session, kept for an hour), so they are shared by all replicas and survive restarts. Clients read their limits and usage at `GET /api/v1/quota`; the UI shows the refusal and the wait.
+
+Per-address limits (`ACTIVE_JOBS_PER_IP`, `SESSIONS_PER_HOUR_PER_IP`) key IPv4 by address and IPv6 by `/64`, and store only a SHA-256 digest of that (pseudonymous: the IPv4 space can be enumerated). Behind a proxy they need `CONVERTFLOW_TRUSTED_PROXIES`, otherwise every client shares the proxy's budget. Users behind one NAT share them too.
 
 ## Scaling and resource sizing
 
@@ -296,7 +319,7 @@ Notes: after a restore on a different or wiped `media` volume, restored jobs ref
 ## Monitoring
 
 - `GET /healthz` returns `200 ok` if the API can ping the database within 2 s, `503` otherwise. The API container healthcheck runs `/convertflow-api healthcheck` against it (TLS-aware). The worker healthcheck is liveness only.
-- `GET /metrics` (Prometheus text format, unauthenticated like everything else; do not scrape it across untrusted networks):
+- `GET /metrics` (Prometheus text format, unauthenticated like everything else, also with sessions on; do not scrape it across untrusted networks). It reports global counts only, nothing per owner or client address:
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -309,7 +332,7 @@ Suggested alerts: `convertflow_workers_live == 0` for 2 minutes; `convertflow_jo
 
 ## Logging and audit events
 
-All components write structured JSON (one object per line) to stdout/stderr; the compose logging driver is `json-file` with rotation. Forward the container logs to the central log infrastructure (OPS.1.1.5; the stack has none of its own). Audit records have `"audit":true`, an `event` name, the `job_id` (empty if there is none) and, for API events, `remote_ip` (the TCP peer, see the proxy note). File contents are never logged; filenames are not part of audit records.
+All components write structured JSON (one object per line) to stdout/stderr; the compose logging driver is `json-file` with rotation. Forward the container logs to the central log infrastructure (OPS.1.1.5; the stack has none of its own). Audit records have `"audit":true`, an `event` name, the `job_id` (empty if there is none) and, for API events, `remote_ip` (the TCP peer, see the proxy note), `client_ip` (only when a trusted proxy reported a different client address) and, with sessions on, `owner`: the first 8 hex characters of the owner key (a digest; never the cookie token or the proxy user id). File contents are never logged; filenames are not part of audit records.
 
 | Event | Source | Extra fields | Meaning |
 |---|---|---|---|
@@ -318,6 +341,10 @@ All components write structured JSON (one object per line) to stdout/stderr; the
 | `upload_failed` | api | `status`, `class` | server-side failure during upload |
 | `job_deleted` | api | | job and files deleted on request |
 | `job_cancel_requested` | api | | cancel requested for an active job |
+| `session_created` | api | | `cookie` mode: a new session was issued (the record has the new `owner` prefix) |
+| `session_refused` | api | `reason` | `cookie` mode: no session was issued on a page load because the per-address limit is reached |
+| `request_rejected` | api | `status`, `reason` | refused before any handler: `host_not_allowed` (421), `cross_origin` (403), `no_user_header` (401, `header` mode) |
+| `sessions_expired` | api (janitor) | `count` | idle sessions deleted after `CONVERTFLOW_SESSION_TTL` |
 | `job_started` | worker | `worker`, `attempt` | worker claimed the job |
 | `job_finished` | worker | `worker`, `encoder` | conversion succeeded |
 | `job_failed` | worker | `worker`, `error` | conversion failed (sanitized error text) |
@@ -379,8 +406,8 @@ Passing a device conflicts with the hardening policy: `tests/container/hardening
 
 ## Known limits
 
-- No authentication, no users, no per-user separation. Job ids are random UUIDs, but `GET /api/v1/jobs` lists every job.
-- The client IP in audit records is the TCP peer address only.
+- No authentication and no user accounts. With `CONVERTFLOW_SESSIONS=off` (default) there is no per-user separation: `GET /api/v1/jobs` lists every job. The `cookie` and `header` modes separate jobs per session or proxy user ([Sessions and quotas](#sessions-and-quotas)); a lost cookie means lost access to its jobs.
+- The client IP in audit records is the TCP peer address, plus `client_ip` from `X-Forwarded-For` only when the peer is in `CONVERTFLOW_TRUSTED_PROXIES`.
 - A restart of a worker restarts the interrupted conversion from the beginning.
 - Plain unlink only; use an encrypted volume for sanitization requirements.
 - `MAX_QUEUE_AGE` counts from the last time a job became queued, so a requeued job gets a fresh window (see above).

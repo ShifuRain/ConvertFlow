@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -61,11 +62,47 @@ type Config struct {
 	// registrations (OnDemandCapabilityWindow) and queued jobs expire purely by age.
 	WorkersOnDemand bool
 
+	// Sessions selects per-session job ownership: SessionsOff (every client sees every job, the
+	// single-user default), SessionsCookie (anonymous server-issued session cookie) or
+	// SessionsHeader (owner id from a header set by a trusted reverse proxy).
+	Sessions string
+	// SessionTTL is the idle lifetime of a cookie session (it is refreshed while in use).
+	SessionTTL time.Duration
+	// SessionHeader names the header carrying the user id in header mode.
+	SessionHeader string
+	// TrustedProxies are the peers whose X-Forwarded-For, X-Forwarded-Proto and SessionHeader
+	// values are believed. Required in header mode; optional otherwise (client IP for per-IP
+	// quotas, the cookie's Secure flag behind a TLS-terminating proxy).
+	TrustedProxies []netip.Prefix
+	// Quota holds the per-owner and per-IP abuse limits (0 = unlimited).
+	Quota Quota
+
 	// Storage selects where job inputs and outputs live: StorageLocal (DataDir) or StorageS3.
 	Storage string
 	// S3 is the object store configuration; only read (and validated) when Storage is StorageS3.
 	S3 S3Config
 }
+
+// Session modes.
+const (
+	SessionsOff    = "off"
+	SessionsCookie = "cookie"
+	SessionsHeader = "header"
+)
+
+// Quota limits job creation per owner (session or proxy user) and per client IP. Zero means
+// unlimited. They are abuse limits, not a security boundary.
+type Quota struct {
+	ActiveJobsPerOwner  int   // uploading+queued+probing+running jobs of one owner
+	QueuedBytesPerOwner int64 // summed input bytes of one owner's active jobs
+	JobsPerHourPerOwner int   // jobs one owner created in the trailing hour
+	ActiveJobsPerIP     int   // active jobs created from one client IP (IPv6: one /64)
+	// SessionsPerHourPerIP limits how many cookie sessions one client IP may obtain per hour.
+	SessionsPerHourPerIP int
+}
+
+// DefaultSessionsPerHourPerIP bounds session minting in cookie mode unless configured otherwise.
+const DefaultSessionsPerHourPerIP = 60
 
 // Storage backends.
 const (
@@ -241,6 +278,60 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		}
 	}
 
+	nonNeg := func(key string) int64 {
+		v := getenv(key)
+		if v == "" {
+			return 0
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			fail("%s must be a non-negative integer (0 = unlimited), got %q", key, v)
+			return 0
+		}
+		return n
+	}
+	c.Sessions = str("CONVERTFLOW_SESSIONS", SessionsOff)
+	c.SessionTTL = dur("CONVERTFLOW_SESSION_TTL", 30*24*time.Hour)
+	c.SessionHeader = str("CONVERTFLOW_SESSION_HEADER", "X-Forwarded-User")
+	if !headerName.MatchString(c.SessionHeader) {
+		fail("CONVERTFLOW_SESSION_HEADER is not a valid header name: %q", c.SessionHeader)
+	}
+	if v := getenv("CONVERTFLOW_TRUSTED_PROXIES"); v != "" {
+		for _, e := range strings.Split(v, ",") {
+			if e = strings.TrimSpace(e); e == "" {
+				continue
+			}
+			p, err := parsePrefix(e)
+			if err != nil {
+				fail("CONVERTFLOW_TRUSTED_PROXIES: %v", err)
+				continue
+			}
+			c.TrustedProxies = append(c.TrustedProxies, p)
+		}
+	}
+	c.Quota = Quota{
+		ActiveJobsPerOwner:  int(nonNeg("CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_OWNER")),
+		QueuedBytesPerOwner: nonNeg("CONVERTFLOW_QUOTA_QUEUED_BYTES_PER_OWNER"),
+		JobsPerHourPerOwner: int(nonNeg("CONVERTFLOW_QUOTA_JOBS_PER_HOUR_PER_OWNER")),
+		ActiveJobsPerIP:     int(nonNeg("CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_IP")),
+	}
+	c.Quota.SessionsPerHourPerIP = DefaultSessionsPerHourPerIP
+	if getenv("CONVERTFLOW_QUOTA_SESSIONS_PER_HOUR_PER_IP") != "" {
+		c.Quota.SessionsPerHourPerIP = int(nonNeg("CONVERTFLOW_QUOTA_SESSIONS_PER_HOUR_PER_IP"))
+	}
+	switch c.Sessions {
+	case SessionsOff, SessionsCookie:
+	case SessionsHeader:
+		if len(c.TrustedProxies) == 0 {
+			fail("CONVERTFLOW_TRUSTED_PROXIES is required when CONVERTFLOW_SESSIONS=header")
+		}
+	default:
+		fail("CONVERTFLOW_SESSIONS must be %q, %q or %q, got %q", SessionsOff, SessionsCookie, SessionsHeader, c.Sessions)
+	}
+	if c.Sessions == SessionsOff && (c.Quota.ActiveJobsPerOwner > 0 || c.Quota.QueuedBytesPerOwner > 0 || c.Quota.JobsPerHourPerOwner > 0) {
+		fail("the CONVERTFLOW_QUOTA_*_PER_OWNER limits need an owner: set CONVERTFLOW_SESSIONS to cookie or header")
+	}
+
 	secretFile := func(key string) Secret {
 		f := getenv(key)
 		if f == "" {
@@ -305,6 +396,34 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 		fail("CONVERTFLOW_STORAGE must be %q or %q, got %q", StorageLocal, StorageS3, c.Storage)
 	}
 	return c, firstErr
+}
+
+// headerName is an HTTP field name (RFC 9110 token).
+var headerName = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$")
+
+// parsePrefix accepts a CIDR prefix or a single IP address (a /32 or /128), and returns it masked.
+func parsePrefix(s string) (netip.Prefix, error) {
+	if strings.Contains(s, "/") {
+		p, err := netip.ParsePrefix(s)
+		if err != nil || p.Addr().Zone() != "" || (p.Addr().Is4In6() && p.Bits() < 96) {
+			return netip.Prefix{}, fmt.Errorf("invalid CIDR %q", s)
+		}
+		return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-unmapBits(p.Addr())).Masked(), nil
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil || a.Zone() != "" {
+		return netip.Prefix{}, fmt.Errorf("invalid IP address %q", s)
+	}
+	a = a.Unmap()
+	return netip.PrefixFrom(a, a.BitLen()), nil
+}
+
+// unmapBits is 96 for an IPv4-mapped IPv6 address (::ffff:a.b.c.d/n becomes a.b.c.d/(n-96)).
+func unmapBits(a netip.Addr) int {
+	if a.Is4In6() {
+		return 96
+	}
+	return 0
 }
 
 // validEndpoint accepts host:port or host (no scheme, path or credentials).

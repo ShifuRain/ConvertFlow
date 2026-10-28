@@ -54,7 +54,7 @@ type presignResponse struct {
 // go from the browser straight to the bucket; POST /api/v1/jobs/{id}/complete then queues the job.
 // The URL and form fields are credentials and are never logged or audited.
 func (s *Server) createPresigned(w http.ResponseWriter, r *http.Request) {
-	if !s.checkCapacity(w, r, 0) {
+	if !s.checkCapacity(w, r, 0) || !s.ensureOwner(w, r, true) {
 		return
 	}
 	body, err := readSmall(http.MaxBytesReader(w, r.Body, maxPresignBody), maxPresignBody)
@@ -113,8 +113,13 @@ func (s *Server) createPresigned(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
 	defer cancel()
 	j := &jobs.Job{ID: id, Status: jobs.StatusUploading, Filename: SanitizeFilename(req.Filename), InputPath: pp.Key,
-		Options: opts, DeclaredSize: *req.Size}
-	if err := s.store.Create(ctx, j); err != nil {
+		Options: opts, DeclaredSize: *req.Size, InputSize: *req.Size}
+	s.stamp(r, j)
+	var qe *jobs.QuotaError
+	if err := s.store.CreateWithQuota(ctx, j, s.limits()); errors.As(err, &qe) {
+		s.quotaReject(w, r, qe) // the presigned form is dropped unused
+		return
+	} else if err != nil {
 		s.serverFault(w, r, id, "create_job", err)
 		return
 	}
@@ -184,7 +189,7 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit.Event(r, "job_created", j.ID, "preset", j.Options.Preset)
-	got, err := s.store.Get(ctx, j.ID)
+	got, err := s.store.GetFor(ctx, j.ID, jobs.AllJobs()) // ownership was checked by lookup
 	if err != nil {
 		s.serverFault(w, r, j.ID, "get_job", err)
 		return

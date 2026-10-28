@@ -1,6 +1,6 @@
 # On-demand deployment and S3 storage
 
-Status: storage on an S3-compatible bucket with direct browser uploads is implemented (`CONVERTFLOW_STORAGE=s3`), and so are ephemeral workers (`--once`, `--idle-exit`) with the queue semantics for scaling to zero (`CONVERTFLOW_WORKERS_ON_DEMAND`). Sessions and quotas, and Kubernetes manifests (KEDA) are later phases and are **not** implemented yet. Everything marked "verified" below was run with rootless podman 6.1.2, the docker-compose provider and MinIO `RELEASE.2026-10-23T20-06-51Z` (Chainguard rebuild). No AWS S3, Cloudflare R2 or Ceph endpoint was tested.
+Status: storage on an S3-compatible bucket with direct browser uploads is implemented (`CONVERTFLOW_STORAGE=s3`), and so are ephemeral workers (`--once`, `--idle-exit`) with the queue semantics for scaling to zero (`CONVERTFLOW_WORKERS_ON_DEMAND`). Per-session job isolation and quotas (`CONVERTFLOW_SESSIONS` and the quota variables) are implemented; Kubernetes manifests (KEDA) are a later phase and are **not** implemented yet. Everything marked "verified" below was run with rootless podman 6.1.2, the docker-compose provider and MinIO `RELEASE.2026-10-23T20-06-51Z` (Chainguard rebuild). No AWS S3, Cloudflare R2 or Ceph endpoint was tested.
 
 ## Contents
 
@@ -9,6 +9,7 @@ Status: storage on an S3-compatible bucket with direct browser uploads is implem
 - [Setting up a bucket](#setting-up-a-bucket)
 - [The development and test profile (compose.s3.yaml)](#the-development-and-test-profile-composes3yaml)
 - [Ephemeral workers (once and idle exit)](#ephemeral-workers-once-and-idle-exit)
+- [Sessions and quotas for shared deployments](#sessions-and-quotas-for-shared-deployments)
 - [Failure behavior](#failure-behavior)
 - [Cost notes](#cost-notes)
 - [Limits and open points](#limits-and-open-points)
@@ -198,6 +199,16 @@ What happened (port 18085 instead of 8080 on the test host):
 
 Tear down with `podman compose down -v` (removes the volumes).
 
+## Sessions and quotas for shared deployments
+
+A deployment that many people reach (the usual reason to scale workers on demand) should not show every job to everyone. Set `CONVERTFLOW_SESSIONS=cookie` (anonymous browser sessions) or `header` (user from an authenticating reverse proxy, with `CONVERTFLOW_TRUSTED_PROXIES`), and bound what one owner can queue; details in [operations.md](operations.md#sessions-and-quotas) and [security.md](security.md).
+
+- Worker capacity, and so cost, is bounded by the maximum worker count and `CONVERTFLOW_MAX_QUEUED_JOBS`; the per-owner quotas only share that capacity more fairly. A queue that one session cannot flood also keeps the autoscaler from starting workers for one client's backlog.
+- All quota state is in PostgreSQL (counts of the jobs table plus the `rate_events` table), checked in one transaction under an advisory lock: several API replicas enforce the same limits, and a restart forgets nothing.
+- The direct upload counts the announced size against the queued-bytes quota from the moment the form is issued (`/complete` verifies it), so a client cannot stage more than its byte quota in the bucket through unfinished uploads. Presigned forms and download URLs are issued only to the job's owner.
+- Behind a load balancer or ingress, set `CONVERTFLOW_TRUSTED_PROXIES` to its addresses, or all clients share one per-address budget (including the 60 new sessions per hour of cookie mode).
+- Verified with the `compose.s3.yaml` profile in cookie mode: a real Chrome uploaded straight to MinIO (presigned mode) and downloaded through the redirect with the session cookie on the API only. Not verified: Kubernetes, several API replicas, an authenticating proxy.
+
 ## Failure behavior
 
 | Situation | What happens |
@@ -227,6 +238,6 @@ Not benchmarked. No cost, throughput or cold-start figures were measured for thi
 - A presigned upload form can be used again until it expires, also after `/complete`: the owner of a job could replace that job's input. The damage is bounded (same key, same size limit, the worker rechecks the size, ffprobe validates as usual). See [security.md](security.md).
 - The upload policy allows any size up to `CONVERTFLOW_MAX_UPLOAD_BYTES`, not just the declared size; the mismatch is caught at `/complete`.
 - No storage backpressure in s3 mode besides the queue cap (there is no free-space figure for a bucket).
-- Sessions and quotas, and Kubernetes manifests with a KEDA trigger are later phases. Scale-to-zero was exercised with `podman run` only, not on a cluster; no cold-start figures were measured.
+- Kubernetes manifests with a KEDA trigger are a later phase. Scale-to-zero was exercised with `podman run` only, not on a cluster; no cold-start figures were measured.
 - An autoscaler that counts every queued job (the simple KEDA query) keeps starting workers for a job no worker image can run; each exits 0 after its idle period, until `MAX_QUEUE_AGE` fails the job. Filter the trigger query by preset if you run several worker images.
 - A preempted job restarts from the beginning, and every interruption uses an attempt.

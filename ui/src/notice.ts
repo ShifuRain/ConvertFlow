@@ -14,3 +14,26 @@ export function av1Notice(presets: PresetLike[]): string {
   if (vp9) return `${base} The VP9 preset remains available if you need wider compatibility.`;
   return base;
 }
+
+/** Wait in human terms for a Retry-After value in seconds ("" when absent or invalid). */
+export function retryWait(retryAfter: string | null | undefined): string {
+  const s = Number.parseInt((retryAfter ?? "").trim(), 10);
+  if (!Number.isFinite(s) || s <= 0 || String(s) !== (retryAfter ?? "").trim()) return "";
+  if (s < 90) return `${s} seconds`;
+  const m = Math.ceil(s / 60);
+  return m === 1 ? "1 minute" : `${m} minutes`;
+}
+
+/** Text shown when the server refused an upload because a quota is exhausted (HTTP 429), or "" for any
+ *  other answer. The server's detail (problem+json, a fixed message) is shown as text only, with the
+ *  Retry-After hint. A 503 "server busy" is not a quota: the upload queue retries those by itself. */
+export function quotaNotice(status: number, body: string, retryAfter: string | null | undefined): string {
+  if (status !== 429) return "";
+  let detail = "";
+  try {
+    const p = JSON.parse(body);
+    if (p && typeof p.detail === "string") detail = p.detail;
+  } catch { /* not JSON */ }
+  const wait = retryWait(retryAfter);
+  return `Upload limit reached${detail ? `: ${detail}` : "."}${wait ? ` Try again in about ${wait}.` : ""}`;
+}

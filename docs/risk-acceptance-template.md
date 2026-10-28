@@ -27,7 +27,7 @@ Vorlage für die oder den Informationssicherheitsbeauftragte(n) (ISB) der betrei
 
 ## 2. Deviation
 
-ConvertFlow has **no identity and access management**. There are no users, no roles, no sessions, no tokens and no API keys. Anyone with network access to the service port can upload media, list all jobs, download any result within the retention period, and cancel or delete any job. This is an explicit decision recorded in the design specification, not an oversight. It deviates from the following requirements of the IT-Grundschutz-Kompendium (Edition 2023); see [grundschutz-mapping.md](grundschutz-mapping.md) for the full list:
+ConvertFlow has **no identity and access management**. There are no users, no roles, no passwords and no API keys. With the default `CONVERTFLOW_SESSIONS=off` there are also no sessions or tokens: anyone with network access to the service port can upload media, list all jobs, download any result within the retention period, and cancel or delete any job. The optional `cookie` mode gives every browser an anonymous session and limits each to its own jobs; the optional `header` mode does the same per user name set by an authenticating reverse proxy. Neither mode authenticates anyone in ConvertFlow itself: in `cookie` mode anyone can obtain a session, and in `header` mode the identity is only as good as the proxy. Quotas (`CONVERTFLOW_QUOTA_ACTIVE_JOBS_PER_OWNER` and the related variables) limit abuse but are not a security boundary. State below which mode this acceptance covers. This is an explicit decision recorded in the design specification, not an oversight. It deviates from the following requirements of the IT-Grundschutz-Kompendium (Edition 2023); see [grundschutz-mapping.md](grundschutz-mapping.md) for the full list:
 
 - ORP.4 Identitäts- und Berechtigungsmanagement (in particular ORP.4.A1, A2, A6, A7, A9)
 - CON.10.A1 Authentisierung bei Webanwendungen, CON.10.A2 Zugriffskontrolle bei Webanwendungen, CON.10.A3 Sicheres Session-Management
@@ -47,7 +47,7 @@ Further deviations from the default expectations that the same decision should r
 | Capability | Endpoint | Note |
 |---|---|---|
 | Submit media for conversion | `POST /api/v1/jobs` | consumes CPU, memory and disk; bounded by the limits in section 4 |
-| List all jobs (latest 200) with ids, filenames, status | `GET /api/v1/jobs` | other users' filenames are visible |
+| List all jobs (latest 200) with ids, filenames, status | `GET /api/v1/jobs` | other users' filenames are visible (sessions `off`; with `cookie`/`header` only the caller's jobs are listed) |
 | Read status/metadata of a job | `GET /api/v1/jobs/{id}` | |
 | Download any finished result | `GET /api/v1/jobs/{id}/output` | within the retention period (default 24 h) |
 | Cancel or delete any job | `DELETE /api/v1/jobs/{id}` | |
@@ -61,7 +61,7 @@ No shell access; no arbitrary FFmpeg arguments (only a preset id and four valida
 
 | # | Scenario | Confidentiality | Integrity | Availability |
 |---|---|---|---|---|
-| T1 | A user of the segment reads another user's converted file or filename | affected: other users' files and filenames visible within retention (default 24 h) | | |
+| T1 | A user of the segment reads another user's converted file or filename (sessions `off`; with `cookie`/`header`: only by obtaining the other user's session cookie, or through a misconfigured proxy) | affected: other users' files and filenames visible within retention (default 24 h) | | |
 | T2 | A user cancels or deletes other users' jobs or submits uploads (any client with network access). **Browser variant:** a malicious web page open in an operator's browser sends a cross-origin `POST` (upload) or `DELETE` to `http://127.0.0.1:8080` or the internal host name, or uses **DNS rebinding** (its domain re-resolves to the service) to read job lists and downloads | | affected: loss of in-progress or finished results | affected: forced re-work |
 | T3 | Queue flooding / resource exhaustion by uploading many large files | | | affected: CPU exhaustion, disk fill, queue full (`503`/`507`) up to the configured caps |
 | T4 | Hostile media file exploits an FFmpeg/codec flaw in the worker | affected: files of the media volume and the credentials of the unprivileged database role `convertflow_app` are reachable by code running in the worker (no superuser credentials) | affected | affected |
@@ -110,7 +110,7 @@ Controls the **operator must provide** (the product cannot):
 
 ## 5. Residual risk assessment
 
-With the controls above the remaining risk is that **every party that can reach the service port can read, delete and cancel every job and can consume the capacity of the service**, and that a flaw in media parsing can expose the contents of the media volume (in-retention files) and the credentials of the application database role.
+With the controls above the remaining risk is that **every party that can reach the service port can read, delete and cancel every job and can consume the capacity of the service** (with `CONVERTFLOW_SESSIONS=cookie` or `header`: every party can still submit jobs and consume capacity up to the quotas and global caps, and can read, delete and cancel the jobs of any session whose cookie it obtains, or, in header mode, of any user it can make the proxy assert; clearing cookies loses access to one's own jobs), and that a flaw in media parsing can expose the contents of the media volume (in-retention files) and the credentials of the application database role.
 
 | Risk | Residual rating |
 |---|---|

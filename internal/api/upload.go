@@ -267,7 +267,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		s.reject(w, r, http.StatusRequestEntityTooLarge, "Upload too large", "The file exceeds the configured limit.", "upload too large")
 		return
 	}
-	if !s.checkCapacity(w, r, r.ContentLength) {
+	if !s.checkCapacity(w, r, r.ContentLength) || !s.ensureOwner(w, r, true) || !s.precheckQuota(w, r, r.ContentLength-multipartSlack) {
 		return
 	}
 
@@ -281,6 +281,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	var inLoc string       // set once the input exists in the blob store
 	var opts jobs.Options
 	var filename string
+	var size int64
 	haveOpts := false
 	created := false
 	defer func() {
@@ -366,6 +367,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			stored = true
+			size = n
 		default:
 			s.reject(w, r, http.StatusBadRequest, "Bad request", "unknown form field", "unknown form field")
 			return
@@ -379,8 +381,13 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	// disconnect racing the insert, so the DB work is detached from the request context.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
 	defer cancel()
-	j := &jobs.Job{ID: id, Filename: filename, InputPath: inLoc, Options: opts}
-	if err := s.store.Create(ctx, j); err != nil {
+	j := &jobs.Job{ID: id, Filename: filename, InputPath: inLoc, Options: opts, InputSize: size}
+	s.stamp(r, j)
+	var qe *jobs.QuotaError
+	if err := s.store.CreateWithQuota(ctx, j, s.limits()); errors.As(err, &qe) {
+		s.quotaReject(w, r, qe) // a parallel create used the quota meanwhile; the input is removed
+		return
+	} else if err != nil {
 		s.serverFault(w, r, id, "create_job", err)
 		return
 	}

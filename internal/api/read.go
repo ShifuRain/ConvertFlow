@@ -35,13 +35,20 @@ const (
 
 // lookup validates the {id} path value (404 for anything that is not a canonical UUID, so a
 // malformed id can never reach Postgres) and loads the job.
+//
+// With sessions on, a job of another owner is "not found" too (404, never 403: the answer must not
+// confirm that the id exists).
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (*jobs.Job, bool) {
 	id := r.PathValue("id")
 	if !validID(id) {
 		WriteProblem(w, http.StatusNotFound, "Not found", "no such job")
 		return nil, false
 	}
-	j, err := s.store.Get(r.Context(), id)
+	sc, ok := s.scope(w, r)
+	if !ok {
+		return nil, false
+	}
+	j, err := s.store.GetFor(r.Context(), id, sc)
 	if errors.Is(err, jobs.ErrNotFound) {
 		WriteProblem(w, http.StatusNotFound, "Not found", "no such job")
 		return nil, false
@@ -59,7 +66,11 @@ func (s *Server) readFault(w http.ResponseWriter, r *http.Request, class string,
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
-	js, err := s.store.List(r.Context(), 200)
+	sc, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	js, err := s.store.ListFor(r.Context(), sc, 200)
 	if err != nil {
 		s.readFault(w, r, "list_jobs", err)
 		return
@@ -87,6 +98,10 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		WriteProblem(w, http.StatusNotFound, "Not found", "no such job")
 		return
 	}
+	sc, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
 	select {
 	case s.sseSlots <- struct{}{}:
 		defer func() { <-s.sseSlots }()
@@ -100,7 +115,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		WriteProblem(w, http.StatusInternalServerError, "Internal error", "")
 		return
 	}
-	j, err := s.fetch(r.Context(), id)
+	j, err := s.fetch(r.Context(), id, sc)
 	if errors.Is(err, jobs.ErrNotFound) {
 		WriteProblem(w, http.StatusNotFound, "Not found", "no such job")
 		return
@@ -157,16 +172,16 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-tick.C:
 		}
-		if j, err = s.fetch(r.Context(), id); err != nil {
+		if j, err = s.fetch(r.Context(), id, sc); err != nil {
 			return // deleted, cancelled request or DB trouble: the client reconnects
 		}
 	}
 }
 
-func (s *Server) fetch(ctx context.Context, id string) (*jobs.Job, error) {
+func (s *Server) fetch(ctx context.Context, id string, sc jobs.Scope) (*jobs.Job, error) {
 	ctx, cancel := context.WithTimeout(ctx, sseQueryTimeout)
 	defer cancel()
-	return s.store.Get(ctx, id)
+	return s.store.GetFor(ctx, id, sc)
 }
 
 // outputContentType maps a preset's container to a fixed media type. It never depends on the
@@ -302,7 +317,11 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 		WriteProblem(w, http.StatusNotFound, "Not found", "no such job")
 		return
 	}
-	j, err := s.store.Delete(r.Context(), id)
+	sc, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	j, err := s.store.DeleteFor(r.Context(), id, sc)
 	switch {
 	case err == nil:
 		s.removeData(r.Context(), id, j.InputPath)
@@ -314,11 +333,11 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, jobs.ErrBusy):
 		// The job is probing or running: ask its worker to stop. The worker finalizes it as
 		// canceled; the client deletes it again afterwards.
-		if err := s.store.RequestCancel(r.Context(), id); err != nil {
+		if err := s.store.RequestCancelFor(r.Context(), id, sc); err != nil {
 			s.readFault(w, r, "request_cancel", err)
 			return
 		}
-		cur, err := s.store.Get(r.Context(), id)
+		cur, err := s.store.GetFor(r.Context(), id, sc)
 		switch {
 		case errors.Is(err, jobs.ErrNotFound):
 			WriteProblem(w, http.StatusNotFound, "Not found", "no such job")
@@ -341,6 +360,9 @@ func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
 const UploadModeHeader = "ConvertFlow-Upload-Mode"
 
 func (s *Server) listPresets(w http.ResponseWriter, r *http.Request) {
+	// The page's first API call: in cookie mode it starts the session here, so uploads started in
+	// parallel later share one session instead of racing to create several.
+	s.ensureOwner(w, r, false)
 	run, err := s.runnablePresets(r.Context())
 	if err != nil {
 		s.readFault(w, r, "live_encoders", err)

@@ -1,4 +1,4 @@
-import { av1Notice } from "./notice";
+import { av1Notice, quotaNotice } from "./notice";
 import {
   completeRetryable, parsePresigned, presignBody, problemText, storeErrorMessage, storeRetryable, uploadForm, uploadMode,
   UPLOAD_MODE_HEADER, type UploadMode,
@@ -315,7 +315,7 @@ function sendMultipart(item: Item): Promise<void> {
         resolve();
       } else if (xhr.status === 503 && item.tries < MAX_UPLOAD_RETRIES) {
         retryLater(item, r, resolve); // server busy (too many uploads / queue full)
-      } else fail(problemText(xhr.status, xhr.responseText));
+      } else fail(quotaNotice(xhr.status, xhr.responseText, xhr.getResponseHeader("Retry-After")) || problemText(xhr.status, xhr.responseText));
     };
     xhr.onerror = () => fail("network error");
     xhr.onabort = () => { announce(`${file.name}: upload canceled`); done(); };
@@ -384,7 +384,7 @@ async function sendDirect(item: Item): Promise<void> {
       await new Promise<void>((resolve) => retryLater(item, r, resolve));
       return;
     }
-    if (res.status !== 201) { fail(problemText(res.status, text)); return; }
+    if (res.status !== 201) { fail(quotaNotice(res.status, text, res.headers.get("Retry-After")) || problemText(res.status, text)); return; }
     const p = parsePresigned(text);
     if (!p) { fail("unexpected server response"); return; }
     id = p.id;
