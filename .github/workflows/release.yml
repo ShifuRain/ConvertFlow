@@ -64,7 +64,7 @@ jobs:
           [[ "$FFMPEG_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]
           [[ "$FFMPEG_SHA256" =~ ^[0-9a-f]{64}$ ]]
           { echo "ffmpeg_version=$FFMPEG_VERSION"; echo "ffmpeg_sha256=$FFMPEG_SHA256"; } >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
